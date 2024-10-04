@@ -1,0 +1,78 @@
+image: deepview/rust:1.81.0
+
+clone:
+  depth: full
+
+definitions:
+  caches:
+    cargo: /usr/local/cargo
+    rust-target: $BITBUCKET_CLONE_DIR/target
+  steps:
+    - step: &build
+        name: Build
+        runs-on:
+          - 'self.hosted'
+        caches:
+          - cargo
+          - rust-target
+        script:
+          - |
+            if [ -z "$BITBUCKET_TAG" ] ; then
+              export BRANCH=$(echo ${BITBUCKET_BRANCH} | sed 's,/,-,g')
+              export VERSION=0.0.0-${BRANCH}-${BITBUCKET_BUILD_NUMBER}
+            else
+              export VERSION=${BITBUCKET_TAG}
+            fi
+          - sed -i "s/0.0.0/$VERSION/g" Cargo.toml
+          - export CARGO_NET_GIT_FETCH_WITH_CLI=true
+          - cargo build --target=aarch64-unknown-linux-gnu --config target.aarch64-unknown-linux-gnu.linker=\"aarch64-linux-gnu-gcc\" --release
+          - cargo clippy --target=aarch64-unknown-linux-gnu --message-format=json > clippy.json || true
+          - cargo audit --json > audit.json || true
+          - cargo outdated --depth 1 --format json > outdated.json || true
+          - cargo sonar --clippy --audit --outdated
+        artifacts:
+          - target/aarch64-unknown-linux-gnu/release/maivin-websrv
+          - sonar-issues.json
+    - step: &sonar
+        name: Code Sonar
+        image: sonarsource/sonar-scanner-cli:11
+        runs-on:
+          - 'self.hosted'
+        script:
+          - sonar-scanner
+pipelines:
+  default:
+    - step: *build
+    - step: *sonar
+  pull-requests:
+    '**':
+      - step: *build
+      - step: *sonar
+      - step:
+          name: Deploy
+          deployment: Test
+          script:
+            - echo "Deploy Pull-Request"
+  tags:
+    '*.*.*':
+      - step: *build
+      - step: *sonar
+      - step:
+          name: Deploy to Production
+          deployment: Production
+          script:
+            - cp target/aarch64-unknown-linux-gnu/release/maivin-websrv maivin-websrv-$BITBUCKET_TAG
+            - cp assets/maivin-websrv-assets.tar maivin-websrv-assets-$BITBUCKET_TAG.tar
+            - pipe: atlassian/bitbucket-upload-file:0.7.3
+              variables:
+                BITBUCKET_USERNAME: au-zone-ci
+                BITBUCKET_APP_PASSWORD: $BITBUCKET_PASSWORD
+                FILENAME: "maivin-websrv-*$VERSION*"
+            - pipe: atlassian/aws-s3-deploy:1.6.1
+              variables:
+                AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
+                AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
+                AWS_DEFAULT_REGION: 'us-west-2'
+                S3_BUCKET: "maivin/services/maivin-websrv"
+                LOCAL_PATH: "."
+                EXTRA_ARGS: "--exclude=* --include=maivin-websrv-*${BITBUCKET_TAG}*"

@@ -12,6 +12,7 @@ definitions:
         name: Build
         runs-on:
           - 'self.hosted'
+        size: 2x
         caches:
           - cargo
           - rust-target

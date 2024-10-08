@@ -4,7 +4,6 @@ use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, Result, m
 use actix_web_actors::ws;
 use cdr::{CdrLe, Infinite};
 use clap::Parser;
-use local_ip_address::local_ip;
 use log::{debug, error, info};
 use openssl::{
     pkey::{PKey, Private},
@@ -55,9 +54,9 @@ use uuid::{
     Uuid,
     v1::{Context as uuidContex, Timestamp},
 };
-
 use regex::Regex;
 use serde_json::Value;
+use hostname;
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
@@ -1117,7 +1116,7 @@ async fn serve_settings_page(data: web::Data<ServerContext>) -> Result<NamedFile
     let base_path = PathBuf::from(&data.args.docroot);
 
     let file_path = if base_path.is_dir() {
-        base_path.join("config/settings.html")
+        base_path.join(format!("config/settings.html"))
     } else {
         base_path
     };
@@ -1159,8 +1158,8 @@ async fn main() -> std::io::Result<()> {
         .set_certificate(&certificate)
         .expect("Failed to set certificate");
 
-    let my_local_ip = local_ip().unwrap();
-    info!("To visualize navigate to https://{:?}", my_local_ip);
+    let hostname = hostname::get().unwrap_or_else(|_| "unknown".into()).to_string_lossy().into_owned();
+    info!("To visualize navigate to https://{} ", hostname);
     let state = web::Data::new(AppState {
         process: Mutex::new(None),
     });

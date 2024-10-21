@@ -1211,6 +1211,23 @@ async fn serve_config_page(
     Ok(NamedFile::open(file_path)?)
 }
 
+async fn mcap_downloader(
+    req: HttpRequest,
+) -> actix_web::Result<NamedFile> {
+    let path: String = req.match_info().query("file").parse().unwrap();
+    let base_path = Path::new("/");
+
+    let file_path = base_path.join(&path);
+    if file_path.exists() && file_path.is_file() {
+        return Ok(NamedFile::open(file_path)?);
+    }
+
+    Err(actix_web::error::ErrorNotFound(format!(
+        "File {:?} not found",
+        path
+    )))
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> std::io::Result<()> {
     let args = Args::parse();
@@ -1260,6 +1277,7 @@ async fn main() -> std::io::Result<()> {
                     .route("/start", web::post().to(start))
                     .route("/stop", web::post().to(stop))
                     .route("/delete", web::post().to(delete))
+                    .route("/download/{file:.*}", web::get().to(mcap_downloader))
                     .route(
                         "/get-upload-credentials",
                         web::get().to(get_upload_credentials),
@@ -1373,3 +1391,4 @@ fn read_mcap_info<P: AsRef<Utf8Path>>(path: P) -> res<(HashMap<String, TopicInfo
 
     Ok((topic_infos, average_duration))
 }
+

@@ -1218,6 +1218,11 @@ async fn mcap_downloader(
     let base_path = Path::new("/");
 
     let file_path = base_path.join(&path);
+
+    if !file_path.extension().map_or(false, |ext| ext == "mcap" || ext == "MCAP") {
+        return Err(actix_web::error::ErrorForbidden("Invalid file extension. Only .mcap or .MCAP files are allowed."));
+    }
+
     if file_path.exists() && file_path.is_file() {
         return Ok(NamedFile::open(file_path)?);
     }

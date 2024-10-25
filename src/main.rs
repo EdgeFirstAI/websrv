@@ -56,7 +56,6 @@ use uuid::{
 };
 use regex::Regex;
 use serde_json::Value;
-use hostname;
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
@@ -1187,7 +1186,7 @@ async fn serve_settings_page(data: web::Data<ServerContext>) -> Result<NamedFile
     let base_path = PathBuf::from(&data.args.docroot);
 
     let file_path = if base_path.is_dir() {
-        base_path.join(format!("config/settings.html"))
+        base_path.join("config/settings.html")
     } else {
         base_path
     };

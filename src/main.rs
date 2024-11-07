@@ -58,6 +58,8 @@ use regex::Regex;
 use serde_json::Value;
 use hostname;
 
+use percent_encoding::percent_decode;
+
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -578,38 +580,55 @@ async fn get_config(path: web::Path<ConfigPath>) -> impl Responder {
     HttpResponse::Ok().json(serde_json::Value::Object(config_map))
 }
 
-async fn get_all_services() -> impl Responder {
-    let output = Command::new("systemctl")
-        .arg("list-units")
-        .arg("--type=service")
-        .arg("--all")
-        .arg("--no-pager")
-        .output();
+async fn get_all_services(params: web::Json<Value>) -> impl Responder {
+    let services = match params["services"].as_array() {
+        Some(arr) => arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect::<Vec<String>>(),
+        None => Vec::new(),
+    };
+    let mut service_statuses = Vec::new();
 
-    match output {
-        Ok(output) => {
-            let services = String::from_utf8_lossy(&output.stdout);
-            let service_lines: Vec<&str> = services.lines().collect();
-            let mut service_list = Vec::new();
+    for service in services {
+        let decoded_service = percent_decode(service.as_bytes()).decode_utf8_lossy().to_string();
+        let status_output = Command::new("systemctl")
+            .arg("is-active")
+            .arg(&decoded_service)
+            .output();
 
-            for line in service_lines {
-                // Assuming the output format is: "service_name.service  loaded  active  running"
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() > 0 {
-                    service_list.push(json!({
-                        "name": parts[0],
-                        "status": parts.get(3).unwrap_or(&"unknown"), // Get status if available
-                    }));
+        let enabled_output = Command::new("systemctl")
+            .arg("is-enabled")
+            .arg(&decoded_service)
+            .output();
+
+        let status = match status_output {
+            Ok(output) => {
+                let status_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if status_str == "active" {
+                    "running".to_string()
+                } else {
+                    "not running".to_string()
                 }
             }
+            Err(_) => "unknown".to_string(),
+        };
 
-            HttpResponse::Ok().json(service_list) // Return JSON response
-        }
-        Err(e) => {
-            error!("Error fetching services: {:?}", e);
-            HttpResponse::InternalServerError().body("Error fetching services")
-        }
+        let enabled = match enabled_output {
+            Ok(output) => {
+                let enabled_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                match enabled_str.as_str() {
+                    "enabled" => "enabled".to_string(),
+                    "disabled" => "disabled".to_string(),
+                    _ => "unknown".to_string(),
+                }
+            }
+            Err(_) => "unknown".to_string(),
+        };
+        service_statuses.push(json!({
+            "service": decoded_service,
+            "status": status,
+            "enabled": enabled,
+        }));
     }
+    HttpResponse::Ok().json(service_statuses)
 }
 
 async fn update_service(params: web::Json<ServiceAction>) -> impl Responder {
@@ -622,6 +641,8 @@ async fn update_service(params: web::Json<ServiceAction>) -> impl Responder {
     match action.as_str() {
         "start" => command.arg("start").arg(service_name),
         "stop" => command.arg("stop").arg(service_name),
+        "enable" => command.arg("enable").arg(service_name),
+        "disable" => command.arg("disable").arg(service_name),
         _ => return HttpResponse::BadRequest().body("Invalid action"),
     };
 
@@ -1299,7 +1320,7 @@ async fn main() -> std::io::Result<()> {
                         web::resource("/rt/{tail:.*}")
                             .route(web::get().to(websocket_handler_low_priority)),
                     )
-                    .route("/config/service/status", web::get().to(get_all_services))
+                    .route("/config/service/status", web::post().to(get_all_services))
                     .route("/config/services/update", web::post().to(update_service))
                     .service(web::resource("/mcap/").route(web::get().to(mcap_websocket_handler)))
                     .route("/config/{service}", web::get().to(serve_config_page))

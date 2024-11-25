@@ -1280,7 +1280,7 @@ async fn main() -> std::io::Result<()> {
     let thread_state = web::Data::new(Arc::new(ThreadState {
         is_running: Mutex::new(false),
     }));
-
+    let addrs = ["0.0.0.0:443".parse().unwrap(), "[::]:443".parse().unwrap()];
     HttpServer::new(move || {
         let (tx, _) = channel();
         let server_ctx = ServerContext {
@@ -1334,7 +1334,7 @@ async fn main() -> std::io::Result<()> {
                     )
             )
     })
-    .bind_openssl(("0.0.0.0", 443), builder)?
+    .bind_openssl(&addrs[..], builder)?
     .workers(2)
     .run()
     .await

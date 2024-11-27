@@ -2,6 +2,7 @@ use actix::prelude::*;
 use actix_files::{self as fs, NamedFile};
 use actix_web::{middleware, web, App, HttpRequest, HttpResponse, HttpServer, Responder, Result};
 use actix_web_actors::ws;
+use actix_web_lab::middleware::RedirectHttps;
 use cdr::{CdrLe, Infinite};
 use clap::Parser;
 use log::{debug, error, info};
@@ -1298,6 +1299,7 @@ async fn main() -> std::io::Result<()> {
         is_running: Mutex::new(false),
     }));
     let addrs = ["0.0.0.0:443".parse().unwrap(), "[::]:443".parse().unwrap()];
+    let addrs_http = ["0.0.0.0:80".parse().unwrap(), "[::]:80".parse().unwrap()];
     HttpServer::new(move || {
         let (tx, _) = channel();
         let server_ctx = ServerContext {
@@ -1309,6 +1311,7 @@ async fn main() -> std::io::Result<()> {
         let thread_state_clone = thread_state.clone();
 
         App::new()
+            .wrap(RedirectHttps::default())
             .wrap(middleware::Compress::default())
             .app_data(state.clone())
             .app_data(web::Data::new(server_ctx))
@@ -1351,6 +1354,7 @@ async fn main() -> std::io::Result<()> {
                     ),
             )
     })
+    .bind(&addrs_http[..])?
     .bind_openssl(&addrs[..], builder)?
     .workers(2)
     .run()

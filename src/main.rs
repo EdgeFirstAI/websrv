@@ -1,7 +1,8 @@
 use actix::prelude::*;
 use actix_files::{self as fs, NamedFile};
-use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, Result, middleware, web};
+use actix_web::{middleware, web, App, HttpRequest, HttpResponse, HttpServer, Responder, Result};
 use actix_web_actors::ws;
+use actix_web_lab::middleware::RedirectHttps;
 use cdr::{CdrLe, Infinite};
 use clap::Parser;
 use log::{debug, error, info};
@@ -16,9 +17,9 @@ use std::{
     process::{Child, Command},
     str::FromStr,
     sync::{
-        Arc, Mutex,
         atomic::{AtomicI64, Ordering},
-        mpsc::{Receiver, Sender, channel},
+        mpsc::{channel, Receiver, Sender},
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -50,12 +51,12 @@ use tokio::runtime::Handle;
 
 use pnet::datalink;
 
-use uuid::{
-    Uuid,
-    v1::{Context as uuidContex, Timestamp},
-};
 use regex::Regex;
 use serde_json::Value;
+use uuid::{
+    v1::{Context as uuidContex, Timestamp},
+    Uuid,
+};
 
 use percent_encoding::percent_decode;
 
@@ -142,7 +143,6 @@ struct ServiceAction {
     service: String,
     action: String,
 }
-
 
 impl MessageStream {
     fn new(
@@ -581,13 +581,18 @@ async fn get_config(path: web::Path<ConfigPath>) -> impl Responder {
 
 async fn get_all_services(params: web::Json<Value>) -> impl Responder {
     let services = match params["services"].as_array() {
-        Some(arr) => arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect::<Vec<String>>(),
+        Some(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect::<Vec<String>>(),
         None => Vec::new(),
     };
     let mut service_statuses = Vec::new();
 
     for service in services {
-        let decoded_service = percent_decode(service.as_bytes()).decode_utf8_lossy().to_string();
+        let decoded_service = percent_decode(service.as_bytes())
+            .decode_utf8_lossy()
+            .to_string();
         let status_output = Command::new("systemctl")
             .arg("is-active")
             .arg(&decoded_service)
@@ -646,16 +651,23 @@ async fn update_service(params: web::Json<ServiceAction>) -> impl Responder {
     };
 
     match command.status() {
-        Ok(status) if status.success() => {
-            HttpResponse::Ok().body(format!("Service '{}' {}d successfully.", service_name, action))
-        }
+        Ok(status) if status.success() => HttpResponse::Ok().body(format!(
+            "Service '{}' {}d successfully.",
+            service_name, action
+        )),
         Ok(status) => {
-            let error_message = format!("Failed to {} service '{}': {:?}", action, service_name, status);
+            let error_message = format!(
+                "Failed to {} service '{}': {:?}",
+                action, service_name, status
+            );
             error!("{}", error_message);
             HttpResponse::InternalServerError().body(error_message)
         }
         Err(e) => {
-            let error_message = format!("Failed to run systemctl {} {}: {:?}", action, service_name, e);
+            let error_message = format!(
+                "Failed to run systemctl {} {}: {:?}",
+                action, service_name, e
+            );
             error!("{}", error_message);
             HttpResponse::InternalServerError().body(error_message)
         }
@@ -1231,16 +1243,19 @@ async fn serve_config_page(
     Ok(NamedFile::open(file_path)?)
 }
 
-async fn mcap_downloader(
-    req: HttpRequest,
-) -> actix_web::Result<NamedFile> {
+async fn mcap_downloader(req: HttpRequest) -> actix_web::Result<NamedFile> {
     let path: String = req.match_info().query("file").parse().unwrap();
     let base_path = Path::new("/");
 
     let file_path = base_path.join(&path);
 
-    if !file_path.extension().map_or(false, |ext| ext == "mcap" || ext == "MCAP") {
-        return Err(actix_web::error::ErrorForbidden("Invalid file extension. Only .mcap or .MCAP files are allowed."));
+    if !file_path
+        .extension()
+        .map_or(false, |ext| ext == "mcap" || ext == "MCAP")
+    {
+        return Err(actix_web::error::ErrorForbidden(
+            "Invalid file extension. Only .mcap or .MCAP files are allowed.",
+        ));
     }
 
     if file_path.exists() && file_path.is_file() {
@@ -1271,7 +1286,10 @@ async fn main() -> std::io::Result<()> {
         .set_certificate(&certificate)
         .expect("Failed to set certificate");
 
-    let hostname = hostname::get().unwrap_or_else(|_| "unknown".into()).to_string_lossy().into_owned();
+    let hostname = hostname::get()
+        .unwrap_or_else(|_| "unknown".into())
+        .to_string_lossy()
+        .into_owned();
     info!("To visualize navigate to https://{} ", hostname);
     let state = web::Data::new(AppState {
         process: Mutex::new(None),
@@ -1281,6 +1299,11 @@ async fn main() -> std::io::Result<()> {
         is_running: Mutex::new(false),
     }));
 
+    // binding to [::] will also bind to 0.0.0.0. We try to bind both ivp6 and ipv4
+    // with [::]. If that fails we will try just ivp4. If we do 0.0.0.0 first, the
+    // [::] bind won't happen
+    let addrs = ["[::]:443".parse().unwrap(), "0.0.0.0:443".parse().unwrap()];
+    let addrs_http = ["[::]:80".parse().unwrap(), "0.0.0.0:80".parse().unwrap()];
     HttpServer::new(move || {
         let (tx, _) = channel();
         let server_ctx = ServerContext {
@@ -1292,6 +1315,7 @@ async fn main() -> std::io::Result<()> {
         let thread_state_clone = thread_state.clone();
 
         App::new()
+            .wrap(RedirectHttps::default())
             .wrap(middleware::Compress::default())
             .app_data(state.clone())
             .app_data(web::Data::new(server_ctx))
@@ -1331,10 +1355,11 @@ async fn main() -> std::io::Result<()> {
                         web::post().to(move |params| {
                             upload(params, handle.clone(), thread_state_clone.clone())
                         }),
-                    )
+                    ),
             )
     })
-    .bind_openssl(("0.0.0.0", 443), builder)?
+    .bind(&addrs_http[..])?
+    .bind_openssl(&addrs[..], builder)?
     .workers(2)
     .run()
     .await
@@ -1395,11 +1420,14 @@ fn read_mcap_info<P: AsRef<Utf8Path>>(path: P) -> res<(HashMap<String, TopicInfo
                 } else {
                     0.0
                 };
-                topic_infos.insert(topic.clone(), TopicInfo {
-                    message_count: message_count.try_into().unwrap(),
-                    average_fps: fps,
-                    video_length: duration,
-                });
+                topic_infos.insert(
+                    topic.clone(),
+                    TopicInfo {
+                        message_count: message_count.try_into().unwrap(),
+                        average_fps: fps,
+                        video_length: duration,
+                    },
+                );
                 total_topic_duration += duration;
                 topic_count += 1;
             }
@@ -1416,4 +1444,3 @@ fn read_mcap_info<P: AsRef<Utf8Path>>(path: P) -> res<(HashMap<String, TopicInfo
 
     Ok((topic_infos, average_duration))
 }
-

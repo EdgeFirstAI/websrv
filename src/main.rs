@@ -262,13 +262,19 @@ async fn websocket_handler(
         is_high_priority,
     ));
     let video_stream_clone = video_stream.clone();
-    tokio::spawn(async move {
-        zenoh_listener(video_stream_clone, args, rx, cleaned_path.clone()).await;
-    });
 
-    debug!("Attempting to start WebSocket connection");
     let capacity = if is_high_priority { 16 } else { 1 };
-    ws::start(MyWebSocket::new(video_stream, capacity), &req, stream).map_err(|e| {
+    let ws_result = ws::start(MyWebSocket::new(video_stream, capacity), &req, stream);
+
+    if ws_result.is_ok() {
+        tokio::spawn(async move {
+            zenoh_listener(video_stream_clone, args, rx, cleaned_path.clone()).await;
+        });
+    } else {
+        drop(rx);
+    }
+
+    ws_result.map_err(|e| {
         error!("WebSocket connection failed: {:?}", e);
         e
     })
@@ -301,7 +307,6 @@ impl Actor for MyWebSocket {
 
 impl Drop for MyWebSocket {
     fn drop(&mut self) {
-        // tell the thread to stop
         let _ = self.video_stream.on_exit.send(STOP.to_string());
     }
 }
@@ -369,6 +374,17 @@ async fn zenoh_listener(
     loop {
         if let Ok(msg) = rx.recv_timeout(Duration::from_millis(0)) {
             if msg == STOP {
+                drop(video_stream);
+                subscriber
+                    .undeclare()
+                    .res_async()
+                    .await
+                    .expect("Failed to undeclare subscriber");
+                session
+                    .close()
+                    .res_async()
+                    .await
+                    .expect("Failed to close Zenoh session");
                 return;
             }
         }
@@ -448,8 +464,7 @@ async fn check_service_status(service_name: &str) -> Result<String, String> {
         .trim()
         .to_string();
     debug!("{:?} service is {:?}", service_name, status);
-
-    if status == "active" {
+    if status == "active" && service_name != "webui" {
         Command::new("systemctl")
             .arg("restart")
             .arg(service_name)
@@ -541,7 +556,7 @@ async fn set_config(params: web::Json<Value>) -> impl Responder {
 }
 
 async fn get_config(path: web::Path<ConfigPath>) -> impl Responder {
-    let service_name = &path.service; // Extract service name (e.g., "recorder")
+    let service_name = &path.service;
     let config_file_path = format!("/etc/default/{}", service_name);
 
     let config_content = std::fs::read_to_string(&config_file_path).unwrap_or_default();
@@ -1299,11 +1314,6 @@ async fn main() -> std::io::Result<()> {
         is_running: Mutex::new(false),
     }));
 
-    // binding to [::] will also bind to 0.0.0.0. We try to bind both ivp6 and ipv4
-    // with [::]. If that fails we will try just ivp4. If we do 0.0.0.0 first, the
-    // [::] bind won't happen
-    let addrs = ["[::]:443".parse().unwrap(), "0.0.0.0:443".parse().unwrap()];
-    let addrs_http = ["[::]:80".parse().unwrap(), "0.0.0.0:80".parse().unwrap()];
     HttpServer::new(move || {
         let (tx, _) = channel();
         let server_ctx = ServerContext {
@@ -1358,8 +1368,7 @@ async fn main() -> std::io::Result<()> {
                     ),
             )
     })
-    .bind(&addrs_http[..])?
-    .bind_openssl(&addrs[..], builder)?
+    .bind_openssl(("0.0.0.0", 443), builder)?
     .workers(2)
     .run()
     .await

@@ -1283,6 +1283,134 @@ async fn mcap_downloader(req: HttpRequest) -> actix_web::Result<NamedFile> {
     )))
 }
 
+#[derive(Serialize)]
+struct FormattedSize {
+    value: f64,
+    unit: String,
+}
+
+impl FormattedSize {
+    fn from_bytes(bytes: u64) -> Self {
+        if bytes >= 1024 * 1024 * 1024 {
+            // Convert to GB if >= 1GB
+            FormattedSize {
+                value: (bytes as f64) / (1024.0 * 1024.0 * 1024.0),
+                unit: "GB".to_string(),
+            }
+        } else {
+            // Convert to MB if < 1GB
+            FormattedSize {
+                value: (bytes as f64) / (1024.0 * 1024.0),
+                unit: "MB".to_string(),
+            }
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct StorageDetails {
+    path: String,
+    exists: bool,
+    available_space: Option<FormattedSize>,
+    total_space: Option<FormattedSize>,
+}
+
+#[derive(Serialize)]
+struct StorageInfo {
+    internal: StorageDetails,
+    external: StorageDetails,
+    sd_card_present: bool,
+    sd_card_mounted: bool,
+    sd_card_formatted: bool,
+}
+
+async fn check_storage_availability() -> impl Responder {
+    let internal_path = Path::new("/");
+    let external_path = Path::new("/media/DATA");
+
+    let sd_card_present = std::fs::read_dir("/sys/block")
+        .map(|entries| {
+            entries.filter_map(Result::ok).any(|entry| {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                name_str == "mmcblk1"
+            })
+        })
+        .unwrap_or(false);
+
+    let sd_card_mounted = std::fs::read_to_string("/proc/mounts")
+        .map(|contents| {
+            contents.lines().any(|line| {
+                line.contains("/dev/mmcblk1p1")
+                    && (line.contains("/media/DATA") || line.contains("/var/rootdirs/media/DATA"))
+            })
+        })
+        .unwrap_or(false);
+
+    let sd_card_formatted = if sd_card_present {
+        std::fs::read_to_string("/proc/partitions")
+            .map(|contents| contents.contains("mmcblk1p1"))
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    let internal_details = StorageDetails {
+        path: "/home/torizon/recordings".to_string(),
+        exists: true,
+        available_space: std::fs::metadata(internal_path)
+            .and_then(|_| fs2::available_space(internal_path))
+            .ok()
+            .map(FormattedSize::from_bytes),
+        total_space: std::fs::metadata(internal_path)
+            .and_then(|_| fs2::total_space(internal_path))
+            .ok()
+            .map(FormattedSize::from_bytes),
+    };
+
+    let external_details = StorageDetails {
+        path: external_path.to_string_lossy().to_string(),
+        exists: external_path.exists() && sd_card_mounted,
+        available_space: if sd_card_mounted {
+            let mount_path = Path::new("/var/rootdirs/media/DATA");
+            std::fs::metadata(mount_path)
+                .and_then(|_| fs2::available_space(mount_path))
+                .ok()
+                .map(FormattedSize::from_bytes)
+        } else {
+            None
+        },
+        total_space: if sd_card_mounted {
+            let mount_path = Path::new("/var/rootdirs/media/DATA");
+            std::fs::metadata(mount_path)
+                .and_then(|_| fs2::total_space(mount_path))
+                .ok()
+                .map(FormattedSize::from_bytes)
+        } else {
+            None
+        },
+    };
+
+    let storage_info = StorageInfo {
+        internal: internal_details,
+        external: external_details,
+        sd_card_present,
+        sd_card_mounted,
+        sd_card_formatted,
+    };
+
+    debug!(
+        "Storage info: internal={:?} external={:?} sd_present={:?} mounted={:?} formatted={:?}",
+        storage_info.internal.exists,
+        storage_info.external.exists,
+        storage_info.sd_card_present,
+        storage_info.sd_card_mounted,
+        storage_info.sd_card_formatted
+    );
+
+    HttpResponse::Ok().json(storage_info)
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> std::io::Result<()> {
     let args = Args::parse();
@@ -1333,6 +1461,7 @@ async fn main() -> std::io::Result<()> {
                 web::scope("")
                     .route("/", web::get().to(index))
                     .route("/settings", web::get().to(serve_settings_page))
+                    .route("/check-storage", web::get().to(check_storage_availability))
                     .route("/start", web::post().to(start))
                     .route("/stop", web::post().to(stop))
                     .route("/delete", web::post().to(delete))

@@ -262,13 +262,19 @@ async fn websocket_handler(
         is_high_priority,
     ));
     let video_stream_clone = video_stream.clone();
-    tokio::spawn(async move {
-        zenoh_listener(video_stream_clone, args, rx, cleaned_path.clone()).await;
-    });
 
-    debug!("Attempting to start WebSocket connection");
     let capacity = if is_high_priority { 16 } else { 1 };
-    ws::start(MyWebSocket::new(video_stream, capacity), &req, stream).map_err(|e| {
+    let ws_result = ws::start(MyWebSocket::new(video_stream, capacity), &req, stream);
+
+    if ws_result.is_ok() {
+        tokio::spawn(async move {
+            zenoh_listener(video_stream_clone, args, rx, cleaned_path.clone()).await;
+        });
+    } else {
+        drop(rx);
+    }
+
+    ws_result.map_err(|e| {
         error!("WebSocket connection failed: {:?}", e);
         e
     })
@@ -301,7 +307,6 @@ impl Actor for MyWebSocket {
 
 impl Drop for MyWebSocket {
     fn drop(&mut self) {
-        // tell the thread to stop
         let _ = self.video_stream.on_exit.send(STOP.to_string());
     }
 }
@@ -369,6 +374,17 @@ async fn zenoh_listener(
     loop {
         if let Ok(msg) = rx.recv_timeout(Duration::from_millis(0)) {
             if msg == STOP {
+                drop(video_stream);
+                subscriber
+                    .undeclare()
+                    .res_async()
+                    .await
+                    .expect("Failed to undeclare subscriber");
+                session
+                    .close()
+                    .res_async()
+                    .await
+                    .expect("Failed to close Zenoh session");
                 return;
             }
         }
@@ -437,6 +453,27 @@ async fn check_recorder_status() -> impl Responder {
     }
 }
 
+async fn check_replay_status() -> impl Responder {
+    let service_status = Command::new("systemctl")
+        .arg("is-active")
+        .arg("replay")
+        .output();
+
+    match service_status {
+        Ok(output) => {
+            let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+            if status == "active" {
+                HttpResponse::Ok().body("Replay is running")
+            } else {
+                HttpResponse::Ok().body("Replay is not running")
+            }
+        }
+        Err(e) => HttpResponse::InternalServerError()
+            .body(format!("Error checking service status: {:?}", e)),
+    }
+}
+
 async fn check_service_status(service_name: &str) -> Result<String, String> {
     let service_status = Command::new("systemctl")
         .arg("is-active")
@@ -448,8 +485,7 @@ async fn check_service_status(service_name: &str) -> Result<String, String> {
         .trim()
         .to_string();
     debug!("{:?} service is {:?}", service_name, status);
-
-    if status == "active" {
+    if status == "active" && service_name != "webui" {
         Command::new("systemctl")
             .arg("restart")
             .arg(service_name)
@@ -541,7 +577,7 @@ async fn set_config(params: web::Json<Value>) -> impl Responder {
 }
 
 async fn get_config(path: web::Path<ConfigPath>) -> impl Responder {
-    let service_name = &path.service; // Extract service name (e.g., "recorder")
+    let service_name = &path.service;
     let config_file_path = format!("/etc/default/{}", service_name);
 
     let config_content = std::fs::read_to_string(&config_file_path).unwrap_or_default();
@@ -1268,6 +1304,300 @@ async fn mcap_downloader(req: HttpRequest) -> actix_web::Result<NamedFile> {
     )))
 }
 
+#[derive(Serialize)]
+struct FormattedSize {
+    value: f64,
+    unit: String,
+}
+
+impl FormattedSize {
+    fn from_bytes(bytes: u64) -> Self {
+        if bytes >= 1024 * 1024 * 1024 {
+            // Convert to GB if >= 1GB
+            FormattedSize {
+                value: (bytes as f64) / (1024.0 * 1024.0 * 1024.0),
+                unit: "GB".to_string(),
+            }
+        } else {
+            // Convert to MB if < 1GB
+            FormattedSize {
+                value: (bytes as f64) / (1024.0 * 1024.0),
+                unit: "MB".to_string(),
+            }
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct StorageDetails {
+    path: String,
+    exists: bool,
+    available_space: Option<FormattedSize>,
+    total_space: Option<FormattedSize>,
+}
+
+#[derive(Serialize)]
+struct StorageInfo {
+    internal: StorageDetails,
+    external: StorageDetails,
+    sd_card_present: bool,
+    sd_card_mounted: bool,
+    sd_card_formatted: bool,
+}
+
+async fn check_storage_availability() -> impl Responder {
+    let internal_path = Path::new("/");
+    let external_path = Path::new("/media/DATA");
+
+    let sd_card_present = std::fs::read_dir("/sys/block")
+        .map(|entries| {
+            entries.filter_map(Result::ok).any(|entry| {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                name_str == "mmcblk1"
+            })
+        })
+        .unwrap_or(false);
+
+    let sd_card_mounted = std::fs::read_to_string("/proc/mounts")
+        .map(|contents| {
+            contents.lines().any(|line| {
+                line.contains("/dev/mmcblk1p1")
+                    && (line.contains("/media/DATA") || line.contains("/var/rootdirs/media/DATA"))
+            })
+        })
+        .unwrap_or(false);
+
+    let sd_card_formatted = if sd_card_present {
+        std::fs::read_to_string("/proc/partitions")
+            .map(|contents| contents.contains("mmcblk1p1"))
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    let internal_details = StorageDetails {
+        path: "/home/torizon/recordings".to_string(),
+        exists: true,
+        available_space: std::fs::metadata(internal_path)
+            .and_then(|_| fs2::available_space(internal_path))
+            .ok()
+            .map(FormattedSize::from_bytes),
+        total_space: std::fs::metadata(internal_path)
+            .and_then(|_| fs2::total_space(internal_path))
+            .ok()
+            .map(FormattedSize::from_bytes),
+    };
+
+    let external_details = StorageDetails {
+        path: external_path.to_string_lossy().to_string(),
+        exists: external_path.exists() && sd_card_mounted,
+        available_space: if sd_card_mounted {
+            let mount_path = Path::new("/var/rootdirs/media/DATA");
+            std::fs::metadata(mount_path)
+                .and_then(|_| fs2::available_space(mount_path))
+                .ok()
+                .map(FormattedSize::from_bytes)
+        } else {
+            None
+        },
+        total_space: if sd_card_mounted {
+            let mount_path = Path::new("/var/rootdirs/media/DATA");
+            std::fs::metadata(mount_path)
+                .and_then(|_| fs2::total_space(mount_path))
+                .ok()
+                .map(FormattedSize::from_bytes)
+        } else {
+            None
+        },
+    };
+
+    let storage_info = StorageInfo {
+        internal: internal_details,
+        external: external_details,
+        sd_card_present,
+        sd_card_mounted,
+        sd_card_formatted,
+    };
+
+    debug!(
+        "Storage info: internal={:?} external={:?} sd_present={:?} mounted={:?} formatted={:?}",
+        storage_info.internal.exists,
+        storage_info.external.exists,
+        storage_info.sd_card_present,
+        storage_info.sd_card_mounted,
+        storage_info.sd_card_formatted
+    );
+
+    HttpResponse::Ok().json(storage_info)
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct PlaybackParams {
+    directory: String,
+    file: String,
+}
+
+#[derive(Serialize)]
+struct PlaybackResponse {
+    status: String,
+    message: String,
+    current_file: Option<String>,
+}
+
+async fn start_replay(params: web::Json<PlaybackParams>) -> impl Responder {
+    let file_path = format!("{}/{}", params.directory, params.file);
+    debug!("Attempting to play MCAP file: {}", file_path);
+
+    if !Path::new(&file_path).exists() {
+        return HttpResponse::NotFound().json(PlaybackResponse {
+            status: "error".to_string(),
+            message: "File not found".to_string(),
+            current_file: None,
+        });
+    }
+
+    let status = Command::new("systemctl")
+        .arg("is-active")
+        .arg("replay")
+        .output();
+
+    match status {
+        Ok(output) => {
+            let status_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if status_str == "active" {
+                return HttpResponse::BadRequest().json(PlaybackResponse {
+                    status: "error".to_string(),
+                    message: "Replay service is already running".to_string(),
+                    current_file: None,
+                });
+            }
+        }
+        Err(e) => {
+            error!("Error checking replay service status: {}", e);
+            return HttpResponse::InternalServerError().json(PlaybackResponse {
+                status: "error".to_string(),
+                message: format!("Error checking service status: {}", e),
+                current_file: None,
+            });
+        }
+    }
+
+    std::env::set_var("MCAP_FILE", &file_path);
+
+    let result = Command::new("sudo")
+        .arg("systemctl")
+        .arg("start")
+        .arg("replay")
+        .status();
+
+    match result {
+        Ok(status) if status.success() => {
+            info!(
+                "Replay service started successfully with file: {}",
+                file_path
+            );
+            HttpResponse::Ok().json(PlaybackResponse {
+                status: "success".to_string(),
+                message: "Replay service started successfully".to_string(),
+                current_file: Some(params.file.clone()),
+            })
+        }
+        Ok(status) => {
+            error!("Failed to start replay service: {:?}", status);
+            HttpResponse::InternalServerError().json(PlaybackResponse {
+                status: "error".to_string(),
+                message: "Failed to start replay service".to_string(),
+                current_file: None,
+            })
+        }
+        Err(e) => {
+            error!("Error starting replay service: {}", e);
+            HttpResponse::InternalServerError().json(PlaybackResponse {
+                status: "error".to_string(),
+                message: format!("Error starting replay service: {}", e),
+                current_file: None,
+            })
+        }
+    }
+}
+
+async fn stop_replay() -> impl Responder {
+    // Stop fusion service
+    let result = Command::new("sudo")
+        .arg("systemctl")
+        .arg("stop")
+        .arg("replay")
+        .status();
+
+    match result {
+        Ok(status) if status.success() => {
+            info!("Replay service stopped successfully");
+            HttpResponse::Ok().json(PlaybackResponse {
+                status: "success".to_string(),
+                message: "Replay service stopped successfully".to_string(),
+                current_file: None,
+            })
+        }
+        Ok(status) => {
+            error!("Failed to stop replay service: {:?}", status);
+            HttpResponse::InternalServerError().json(PlaybackResponse {
+                status: "error".to_string(),
+                message: "Failed to stop replay service".to_string(),
+                current_file: None,
+            })
+        }
+        Err(e) => {
+            error!("Error stopping replay service: {}", e);
+            HttpResponse::InternalServerError().json(PlaybackResponse {
+                status: "error".to_string(),
+                message: format!("Error stopping replay service: {}", e),
+                current_file: None,
+            })
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct IsolateParams {
+    target: String,
+}
+
+async fn isolate_system(params: web::Json<IsolateParams>) -> impl Responder {
+    let target = format!("{}.target", params.target);
+    debug!("Attempting to isolate system to target: {}", target);
+
+    let result = Command::new("sudo")
+        .arg("systemctl")
+        .arg("isolate")
+        .arg(&target)
+        .status();
+
+    match result {
+        Ok(status) if status.success() => {
+            info!("System successfully isolated to {}", target);
+            HttpResponse::Ok().json(json!({
+                "status": "success",
+                "message": format!("System isolated to {}", target)
+            }))
+        }
+        Ok(status) => {
+            error!("Failed to isolate system: {:?}", status);
+            HttpResponse::InternalServerError().json(json!({
+                "status": "error",
+                "message": format!("Failed to isolate system to {}", target)
+            }))
+        }
+        Err(e) => {
+            error!("Error isolating system: {}", e);
+            HttpResponse::InternalServerError().json(json!({
+                "status": "error",
+                "message": format!("Error isolating system: {}", e)
+            }))
+        }
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> std::io::Result<()> {
     let args = Args::parse();
@@ -1323,9 +1653,14 @@ async fn main() -> std::io::Result<()> {
                 web::scope("")
                     .route("/", web::get().to(index))
                     .route("/settings", web::get().to(serve_settings_page))
+                    .route("/check-storage", web::get().to(check_storage_availability))
                     .route("/start", web::post().to(start))
                     .route("/stop", web::post().to(stop))
                     .route("/delete", web::post().to(delete))
+                    .route("/replay", web::post().to(start_replay))
+                    .route("/replay-end", web::post().to(stop_replay))
+                    .route("/replay-status", web::get().to(check_replay_status))
+                    .route("/live-run", web::post().to(isolate_system))
                     .route("/download/{file:.*}", web::get().to(mcap_downloader))
                     .route(
                         "/get-upload-credentials",

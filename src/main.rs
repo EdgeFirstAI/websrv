@@ -1629,11 +1629,6 @@ async fn main() -> std::io::Result<()> {
         is_running: Mutex::new(false),
     }));
 
-    // binding to [::] will also bind to 0.0.0.0. We try to bind both ivp6 and ipv4
-    // with [::]. If that fails we will try just ivp4. If we do 0.0.0.0 first, the
-    // [::] bind won't happen
-    let addrs = ["[::]:443".parse().unwrap(), "0.0.0.0:443".parse().unwrap()];
-    let addrs_http = ["[::]:80".parse().unwrap(), "0.0.0.0:80".parse().unwrap()];
     HttpServer::new(move || {
         let (tx, _) = channel();
         let server_ctx = ServerContext {
@@ -1693,8 +1688,7 @@ async fn main() -> std::io::Result<()> {
                     ),
             )
     })
-    .bind(&addrs_http[..])?
-    .bind_openssl(&addrs[..], builder)?
+    .bind_openssl(("0.0.0.0", 443), builder)?
     .workers(2)
     .run()
     .await

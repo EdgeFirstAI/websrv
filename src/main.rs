@@ -1598,6 +1598,51 @@ async fn isolate_system(params: web::Json<IsolateParams>) -> impl Responder {
     }
 }
 
+fn extract_recording_filename(status_output: &str) -> Option<String> {
+    for line in status_output.lines() {
+        if line.contains("Recording to") {
+            let parts: Vec<&str> = line.split("Recording to ").collect();
+            if parts.len() > 1 {
+                let path = parts[1].trim();
+                if let Some(filename) = path.split('/').last() {
+                    return Some(filename.replace("…", "").trim().to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn get_current_recording() -> impl Responder {
+    let status = Command::new("systemctl")
+        .arg("status")
+        .arg("recorder")
+        .output();
+
+    match status {
+        Ok(output) => {
+            let status_str = String::from_utf8_lossy(&output.stdout);
+            match extract_recording_filename(&status_str) {
+                Some(filename) => HttpResponse::Ok().json(json!({
+                    "status": "recording",
+                    "filename": filename
+                })),
+                None => HttpResponse::Ok().json(json!({
+                    "status": "not_recording",
+                    "filename": null
+                })),
+            }
+        }
+        Err(e) => {
+            error!("Error checking recorder status: {}", e);
+            HttpResponse::InternalServerError().json(json!({
+                "status": "error",
+                "message": format!("Error checking recorder status: {}", e)
+            }))
+        }
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> std::io::Result<()> {
     let args = Args::parse();
@@ -1628,6 +1673,11 @@ async fn main() -> std::io::Result<()> {
     let thread_state = web::Data::new(Arc::new(ThreadState {
         is_running: Mutex::new(false),
     }));
+    // binding to [::] will also bind to 0.0.0.0. We try to bind both ivp6 and ipv4
+    // with [::]. If that fails we will try just ivp4. If we do 0.0.0.0 first, the
+    // [::] bind won't happen
+    let addrs = ["[::]:443".parse().unwrap(), "0.0.0.0:443".parse().unwrap()];
+    let addrs_http = ["[::]:80".parse().unwrap(), "0.0.0.0:80".parse().unwrap()];
 
     HttpServer::new(move || {
         let (tx, _) = channel();
@@ -1662,6 +1712,7 @@ async fn main() -> std::io::Result<()> {
                         web::get().to(get_upload_credentials),
                     )
                     .route("/recorder-status", web::get().to(check_recorder_status))
+                    .route("/current-recording", web::get().to(get_current_recording))
                     .service(
                         web::resource("/ws/dropped").route(web::get().to(websocket_handler_errors)),
                     )
@@ -1688,7 +1739,8 @@ async fn main() -> std::io::Result<()> {
                     ),
             )
     })
-    .bind_openssl(("0.0.0.0", 443), builder)?
+    .bind(&addrs_http[..])?
+    .bind_openssl(&addrs[..], builder)?
     .workers(2)
     .run()
     .await

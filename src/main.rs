@@ -1191,6 +1191,7 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WebSocketSession 
                                             size: size / (1024 * 1024),
                                             created: DateTime::from_timestamp(created as i64, 0)
                                                 .unwrap()
+                                                .with_timezone(&chrono::Local)
                                                 .format("%Y-%m-%d %H:%M:%S")
                                                 .to_string(),
                                             topics: topics_info,

@@ -1,2 +1,7 @@
 /target
+
 .vscode
+.debug
+
+kallsyms
+perf.data*

@@ -1,61 +1,62 @@
 use actix::prelude::*;
 use actix_files::{self as fs, NamedFile};
-use actix_web::{middleware, web, App, HttpRequest, HttpResponse, HttpServer, Responder, Result};
+use actix_web::{
+    App, HttpRequest, HttpResponse, HttpServer, Responder, Result,
+    http::header::ContentLength,
+    web::{self, Bytes},
+};
 use actix_web_actors::ws;
 use actix_web_lab::middleware::RedirectHttps;
+use anyhow::{Context, Result as res};
+use async_stream::stream;
+use camino::Utf8Path;
 use cdr::{CdrLe, Infinite};
+use chrono::DateTime;
 use clap::Parser;
 use log::{debug, error, info};
+use maivin_publisher::{
+    client::{self, Metrics},
+    mcap::{self as pub_mcap},
+};
+use mcap::Summary;
+use memmap::Mmap;
+use mime::Mime;
 use openssl::{
     pkey::{PKey, Private},
     ssl::{SslAcceptor, SslMethod},
 };
+use pnet::datalink;
+use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use serde_json::json;
+use std::ops::Deref;
+use std::{collections::HashMap, time::UNIX_EPOCH};
+use std::{
+    fs::{File, OpenOptions},
+    io::{self, BufRead, Write},
+};
 use std::{
     net::Ipv4Addr,
     path::{Path, PathBuf},
     process::{Child, Command},
     str::FromStr,
     sync::{
-        atomic::{AtomicI64, Ordering},
-        mpsc::{channel, Receiver, Sender},
         Arc, Mutex,
+        atomic::{AtomicI64, Ordering},
+        mpsc::{Receiver, Sender, channel},
     },
     time::Duration,
+};
+use tokio::{io::AsyncReadExt as _, runtime::Handle};
+use uuid::{
+    Uuid,
+    v1::{Context as uuidContex, Timestamp},
 };
 use zenoh::{
     buffers::SplitBuffer,
     config::{Config, WhatAmI},
     prelude::r#async::AsyncResolve,
-};
-
-use anyhow::{Context, Result as res};
-use camino::Utf8Path;
-use chrono::DateTime;
-use mcap::Summary;
-use memmap::Mmap;
-use serde_json::json;
-use std::{collections::HashMap, time::UNIX_EPOCH};
-
-use std::{
-    fs::{File, OpenOptions},
-    io::{self, BufRead, Write},
-};
-
-use maivin_publisher::{
-    client::{self, Metrics},
-    mcap::{self as pub_mcap},
-};
-use std::ops::Deref;
-use tokio::runtime::Handle;
-
-use pnet::datalink;
-
-use regex::Regex;
-use serde_json::Value;
-use uuid::{
-    v1::{Context as uuidContex, Timestamp},
-    Uuid,
 };
 
 use percent_encoding::percent_decode;
@@ -1280,7 +1281,7 @@ async fn serve_config_page(
     Ok(NamedFile::open(file_path)?)
 }
 
-async fn mcap_downloader(req: HttpRequest) -> actix_web::Result<NamedFile> {
+async fn mcap_downloader(req: HttpRequest) -> impl Responder {
     let path: String = req.match_info().query("file").parse().unwrap();
     let base_path = Path::new("/");
 
@@ -1288,21 +1289,41 @@ async fn mcap_downloader(req: HttpRequest) -> actix_web::Result<NamedFile> {
 
     if !file_path
         .extension()
-        .map_or(false, |ext| ext == "mcap" || ext == "MCAP")
+        .is_some_and(|ext| ext.to_ascii_uppercase() == "MCAP")
     {
         return Err(actix_web::error::ErrorForbidden(
-            "Invalid file extension. Only .mcap or .MCAP files are allowed.",
+            "Invalid file extension. Only .mcap files are allowed.",
         ));
     }
 
-    if file_path.exists() && file_path.is_file() {
-        return Ok(NamedFile::open(file_path)?);
+    if !file_path.exists() || !file_path.is_file() {
+        return Err(actix_web::error::ErrorNotFound(format!(
+            "File {:?} not found",
+            path
+        )));
     }
 
-    Err(actix_web::error::ErrorNotFound(format!(
-        "File {:?} not found",
-        path
-    )))
+    let mut file = tokio::fs::File::open(file_path).await?;
+    let file_size = file.metadata().await?.len() as usize;
+
+    let mcap_stream = stream! {
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            let bytes_read = file.read(&mut buffer).await?;
+            if bytes_read == 0 {
+                break;
+            }
+
+            yield Result::<Bytes, std::io::Error>::Ok(Bytes::copy_from_slice(&buffer[..bytes_read]));
+        }
+    };
+
+    let mime_type = Mime::from_str("application/octet-stream").unwrap();
+
+    Ok(HttpResponse::Ok()
+        .content_type(mime_type)
+        .insert_header(ContentLength(file_size))
+        .streaming(mcap_stream))
 }
 
 #[derive(Serialize)]
@@ -1644,7 +1665,7 @@ async fn get_current_recording() -> impl Responder {
     }
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
+#[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() -> std::io::Result<()> {
     let args = Args::parse();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -1692,7 +1713,7 @@ async fn main() -> std::io::Result<()> {
 
         App::new()
             .wrap(RedirectHttps::default())
-            .wrap(middleware::Compress::default())
+            // .wrap(middleware::Compress::default())
             .app_data(state.clone())
             .app_data(web::Data::new(server_ctx))
             .service(
@@ -1742,7 +1763,7 @@ async fn main() -> std::io::Result<()> {
     })
     .bind(&addrs_http[..])?
     .bind_openssl(&addrs[..], builder)?
-    .workers(2)
+    .workers(8)
     .run()
     .await
 }
@@ -1802,14 +1823,11 @@ fn read_mcap_info<P: AsRef<Utf8Path>>(path: P) -> res<(HashMap<String, TopicInfo
                 } else {
                     0.0
                 };
-                topic_infos.insert(
-                    topic.clone(),
-                    TopicInfo {
-                        message_count: message_count.try_into().unwrap(),
-                        average_fps: fps,
-                        video_length: duration,
-                    },
-                );
+                topic_infos.insert(topic.clone(), TopicInfo {
+                    message_count: message_count.try_into().unwrap(),
+                    average_fps: fps,
+                    video_length: duration,
+                });
                 total_topic_duration += duration;
                 topic_count += 1;
             }

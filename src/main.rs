@@ -1,13 +1,16 @@
+mod args;
+
 use actix::prelude::*;
 use actix_files::{self as fs, NamedFile};
 use actix_web::{
-    App, HttpRequest, HttpResponse, HttpServer, Responder, Result,
     http::header::ContentLength,
     web::{self, Bytes},
+    App, HttpRequest, HttpResponse, HttpServer, Responder, Result,
 };
 use actix_web_actors::ws;
 use actix_web_lab::middleware::RedirectHttps;
 use anyhow::{Context, Result as res};
+use args::Args;
 use async_stream::stream;
 use camino::Utf8Path;
 use cdr::{CdrLe, Infinite};
@@ -25,57 +28,32 @@ use openssl::{
     pkey::{PKey, Private},
     ssl::{SslAcceptor, SslMethod},
 };
+use percent_encoding::percent_decode;
 use pnet::datalink;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use serde_json::json;
-use std::ops::Deref;
-use std::{collections::HashMap, time::UNIX_EPOCH};
+use serde_json::{json, Value};
 use std::{
+    collections::HashMap,
     fs::{File, OpenOptions},
     io::{self, BufRead, Write},
-};
-use std::{
-    net::Ipv4Addr,
+    ops::Deref,
     path::{Path, PathBuf},
     process::{Child, Command},
     str::FromStr,
     sync::{
-        Arc, Mutex,
         atomic::{AtomicI64, Ordering},
-        mpsc::{Receiver, Sender, channel},
+        mpsc::{channel, Receiver, Sender},
+        Arc, Mutex,
     },
-    time::Duration,
+    thread,
+    time::{Duration, UNIX_EPOCH},
 };
 use tokio::{io::AsyncReadExt as _, runtime::Handle};
 use uuid::{
-    Uuid,
     v1::{Context as uuidContex, Timestamp},
+    Uuid,
 };
-use zenoh::{
-    buffers::SplitBuffer,
-    config::{Config, WhatAmI},
-    prelude::r#async::AsyncResolve,
-};
-
-use percent_encoding::percent_decode;
-
-#[derive(Parser, Debug, Clone)]
-#[command(author, version, about, long_about = None)]
-struct Args {
-    #[arg(short, long)]
-    connect: Option<Ipv4Addr>,
-
-    #[arg(short, long, default_value = "peer")]
-    mode: String,
-
-    #[arg(short, long, default_value = "tcp/127.0.0.1:7447")]
-    endpoint: Vec<String>,
-
-    #[arg(short, long, env, default_value = "/usr/share/maivin-ui")]
-    docroot: String,
-}
 
 #[derive(Serialize)]
 struct FileInfo {
@@ -268,9 +246,9 @@ async fn websocket_handler(
     let ws_result = ws::start(MyWebSocket::new(video_stream, capacity), &req, stream);
 
     if ws_result.is_ok() {
-        tokio::spawn(async move {
-            zenoh_listener(video_stream_clone, args, rx, cleaned_path.clone()).await;
-        });
+        thread::Builder::new()
+            .name("zenoh".to_string())
+            .spawn(move || zenoh_listener(video_stream_clone, args, rx, cleaned_path))?;
     } else {
         drop(rx);
     }
@@ -344,32 +322,16 @@ impl Handler<BroadcastMessage> for MyWebSocket {
     }
 }
 
+#[tokio::main]
 async fn zenoh_listener(
     video_stream: Arc<MessageStream>,
     args: Args,
     rx: Receiver<String>,
     topic: String,
 ) {
-    let mut config = Config::default();
-    let mode = WhatAmI::from_str(&args.mode).expect("Invalid mode");
-    config.set_mode(Some(mode)).expect("Failed to set mode");
-
-    for endpoint in &args.endpoint {
-        config
-            .connect
-            .endpoints
-            .push(endpoint.parse().expect("Invalid endpoint"));
-    }
-
-    let _ = config.scouting.multicast.set_enabled(Some(false));
-
-    let session = zenoh::open(config.clone())
-        .res_async()
-        .await
-        .expect("Failed to open Zenoh session");
+    let session = zenoh::open(args.clone()).await.unwrap();
     let subscriber = session
         .declare_subscriber(topic.clone())
-        .res_async()
         .await
         .expect("Failed to declare Zenoh subscriber");
     loop {
@@ -378,12 +340,10 @@ async fn zenoh_listener(
                 drop(video_stream);
                 subscriber
                     .undeclare()
-                    .res_async()
                     .await
                     .expect("Failed to undeclare subscriber");
                 session
                     .close()
-                    .res_async()
                     .await
                     .expect("Failed to close Zenoh session");
                 return;
@@ -397,12 +357,12 @@ async fn zenoh_listener(
         match msgs.last() {
             None => {
                 if let Ok(sample) = subscriber.recv_async().await {
-                    let data = sample.value.payload.contiguous().to_vec();
+                    let data = sample.payload().to_bytes().to_vec();
                     video_stream.broadcast(BroadcastMessage(data));
                 }
             }
             Some(sample) => {
-                let data = sample.value.payload.contiguous().to_vec();
+                let data = sample.payload().to_bytes().to_vec();
                 video_stream.broadcast(BroadcastMessage(data));
             }
         }
@@ -1289,7 +1249,7 @@ async fn mcap_downloader(req: HttpRequest) -> impl Responder {
 
     if !file_path
         .extension()
-        .is_some_and(|ext| ext.to_ascii_uppercase() == "MCAP")
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("MCAP"))
     {
         return Err(actix_web::error::ErrorForbidden(
             "Invalid file extension. Only .mcap files are allowed.",
@@ -1823,11 +1783,14 @@ fn read_mcap_info<P: AsRef<Utf8Path>>(path: P) -> res<(HashMap<String, TopicInfo
                 } else {
                     0.0
                 };
-                topic_infos.insert(topic.clone(), TopicInfo {
-                    message_count: message_count.try_into().unwrap(),
-                    average_fps: fps,
-                    video_length: duration,
-                });
+                topic_infos.insert(
+                    topic.clone(),
+                    TopicInfo {
+                        message_count: message_count.try_into().unwrap(),
+                        average_fps: fps,
+                        video_length: duration,
+                    },
+                );
                 total_topic_duration += duration;
                 topic_count += 1;
             }

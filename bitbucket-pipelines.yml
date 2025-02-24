@@ -1,11 +1,10 @@
-image: deepview/rust:1.84.0-6
+image: deepview/rust:1.84.1
 
 clone:
   depth: full
 
 definitions:
   caches:
-    cargo: /usr/local/cargo
     rust-target: $BITBUCKET_CLONE_DIR/target
   steps:
     - step: &build
@@ -14,7 +13,6 @@ definitions:
           - 'self.hosted'
         size: 2x
         caches:
-          - cargo
           - rust-target
         script:
           - |
@@ -26,17 +24,17 @@ definitions:
             fi
           - sed -i "s/0.0.0/$VERSION/g" Cargo.toml
           - export CARGO_NET_GIT_FETCH_WITH_CLI=true
-          - cargo build --target=aarch64-unknown-linux-gnu --config target.aarch64-unknown-linux-gnu.linker=\"aarch64-linux-gnu-gcc\" --release
-          - cargo clippy --target=aarch64-unknown-linux-gnu --message-format=json > clippy.json || true
+          - cargo clippy --message-format=json > clippy.json || true
           - cargo audit --json > audit.json || true
           - cargo outdated --depth 1 --format json > outdated.json || true
-          - cargo sonar --clippy --outdated
+          - cargo sonar --clippy --outdated --audit
+          - cargo build --target=aarch64-unknown-linux-gnu --config target.aarch64-unknown-linux-gnu.linker=\"aarch64-linux-gnu-gcc\" --release
         artifacts:
           - target/aarch64-unknown-linux-gnu/release/maivin-websrv
           - sonar-issues.json
     - step: &sonar
         name: Code Sonar
-        image: sonarsource/sonar-scanner-cli:11
+        image: sonarsource/sonar-scanner-cli:11.2
         runs-on:
           - 'self.hosted'
         script:
@@ -63,12 +61,12 @@ pipelines:
           deployment: Production
           script:
             - cp target/aarch64-unknown-linux-gnu/release/maivin-websrv maivin-websrv-$BITBUCKET_TAG
-            - pipe: atlassian/bitbucket-upload-file:0.7.3
+            - pipe: atlassian/bitbucket-upload-file:0.7.4
               variables:
                 BITBUCKET_USERNAME: au-zone-ci
                 BITBUCKET_APP_PASSWORD: $BITBUCKET_PASSWORD
                 FILENAME: "maivin-websrv-*$VERSION*"
-            - pipe: atlassian/aws-s3-deploy:1.6.1
+            - pipe: atlassian/aws-s3-deploy:2.0.0
               variables:
                 AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
                 AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY

@@ -16,7 +16,7 @@ use camino::Utf8Path;
 use cdr::{CdrLe, Infinite};
 use chrono::DateTime;
 use clap::Parser;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use maivin_publisher::{
     client::{self, Metrics},
     mcap::{self as pub_mcap},
@@ -163,7 +163,7 @@ async fn index(data: web::Data<ServerContext>) -> Result<fs::NamedFile> {
     let base_path = PathBuf::from(&data.args.docroot);
 
     let data_path = if base_path.is_dir() {
-        base_path.join("index.html")
+        base_path.join("segmentation.html")
     } else {
         base_path
     };
@@ -173,8 +173,10 @@ async fn index(data: web::Data<ServerContext>) -> Result<fs::NamedFile> {
     match fs::NamedFile::open(data_path) {
         Ok(file) => Ok(file),
         Err(_) => {
-            error!("Index file not found");
-            Err(actix_web::error::ErrorNotFound("Index file not found"))
+            error!("Segmentation page not found");
+            Err(actix_web::error::ErrorNotFound(
+                "Segmentation page not found",
+            ))
         }
     }
 }
@@ -393,280 +395,173 @@ async fn custom_file_handler(
     )))
 }
 
-async fn check_recorder_status() -> impl Responder {
-    let service_status = Command::new("systemctl")
-        .arg("is-active")
-        .arg("recorder")
-        .output();
-
-    match service_status {
-        Ok(output) => {
-            let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-            if status == "active" {
-                HttpResponse::Ok().body("Recorder is running")
-            } else {
-                HttpResponse::Ok().body("Recorder is not running")
-            }
-        }
-        Err(e) => HttpResponse::InternalServerError()
-            .body(format!("Error checking service status: {:?}", e)),
-    }
+#[derive(Debug)]
+struct RecorderConfig {
+    flags: Vec<String>,
+    storage_path: String,
 }
 
-async fn check_replay_status() -> impl Responder {
-    let service_status = Command::new("systemctl")
-        .arg("is-active")
-        .arg("replay")
-        .output();
+fn read_recorder_config() -> std::io::Result<RecorderConfig> {
+    let config_path = "/etc/default/recorder";
+    let file = std::fs::File::open(config_path)?;
+    let reader = std::io::BufReader::new(file);
+    let mut flags = Vec::new();
+    let mut has_compression = false;
+    let mut has_topics = false;
+    let mut has_cube_fps = false;
+    let mut has_storage = false;
+    let mut storage_path = String::new();
 
-    match service_status {
-        Ok(output) => {
-            let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-            if status == "active" {
-                HttpResponse::Ok().body("Replay is running")
-            } else {
-                HttpResponse::Ok().body("Replay is not running")
-            }
-        }
-        Err(e) => HttpResponse::InternalServerError()
-            .body(format!("Error checking service status: {:?}", e)),
-    }
-}
-
-async fn check_service_status(service_name: &str) -> Result<String, String> {
-    let service_status = Command::new("systemctl")
-        .arg("is-active")
-        .arg(service_name)
-        .output()
-        .map_err(|e| format!("Error checking service status: {:?}", e))?;
-
-    let status = String::from_utf8_lossy(&service_status.stdout)
-        .trim()
-        .to_string();
-    debug!("{:?} service is {:?}", service_name, status);
-    if status == "active" && service_name != "webui" {
-        Command::new("systemctl")
-            .arg("restart")
-            .arg(service_name)
-            .output()
-            .map_err(|e| format!("Error restarting service: {:?}", e))?;
-        Ok(format!(
-            "Service '{}' restarted successfully.",
-            service_name
-        ))
-    } else {
-        Ok(format!(
-            "Service '{}' is not running. No action taken.",
-            service_name
-        ))
-    }
-}
-
-async fn set_config(params: web::Json<Value>) -> impl Responder {
-    let file_name = if let Some(file_name_value) = params.get("fileName") {
-        if let Some(file_name) = file_name_value.as_str() {
-            file_name
-        } else {
-            error!("fileName is not a string");
-            return HttpResponse::BadRequest().body("Invalid fileName");
-        }
-    } else {
-        error!("fileName not found in JSON");
-        return HttpResponse::BadRequest().body("Missing fileName");
-    };
-
-    let service_name = file_name;
-
-    let config_file_path = format!("/etc/default/{}", file_name);
-    debug!("Configuration file path: {}", config_file_path.clone());
-    debug!("{:?}", params);
-
-    let config_content = match std::fs::read_to_string(config_file_path.clone()) {
-        Ok(content) => content,
-        Err(e) => {
-            error!("Error reading configuration file: {:?}", e);
-            return HttpResponse::InternalServerError().body("Error reading configuration file");
-        }
-    };
-
-    let config_map = if let Some(map) = params.as_object() {
-        map.clone()
-    } else {
-        serde_json::Map::new()
-    };
-    let mut updated_config = String::new();
-
-    for line in config_content.lines() {
-        let mut found = false;
-
-        for (key, value) in &config_map {
-            let escaped_key = regex::escape(key);
-            let pattern = format!(r"(?i)^\s*{}\s*=\s*.*", escaped_key);
-            let re = Regex::new(&pattern).unwrap();
-
-            if re.is_match(line) {
-                updated_config.push_str(&format!(
-                    "{} = \"{}\"\n",
-                    key.to_uppercase(),
-                    value.as_str().unwrap_or("")
-                ));
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            updated_config.push_str(&format!("{}\n", line)); // Preserve original line
-        }
-    }
-
-    match std::fs::write(config_file_path.clone(), updated_config) {
-        Ok(_) => match check_service_status(service_name).await {
-            Ok(_) => HttpResponse::Ok()
-                .body("Configuration saved successfully and service status checked."),
-            Err(e) => {
-                error!("{}", e);
-                HttpResponse::InternalServerError().body("Error handling service status")
-            }
-        },
-        Err(e) => {
-            error!("Error saving configuration: {:?}", e);
-            HttpResponse::InternalServerError().body("Error saving configuration")
-        }
-    }
-}
-
-async fn get_config(path: web::Path<ConfigPath>) -> impl Responder {
-    let service_name = &path.service;
-    let config_file_path = format!("/etc/default/{}", service_name);
-
-    let config_content = std::fs::read_to_string(&config_file_path).unwrap_or_default();
-    let mut config_map = serde_json::Map::new();
-
-    for line in config_content.lines() {
+    for line in reader.lines() {
+        let line = line?;
         let line = line.trim();
+
+        // Skip comments and empty lines
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
+
+        // Parse key=value pairs
         if let Some((key, value)) = line.split_once('=') {
-            let clean_key = key.trim();
-            let clean_value = value.trim().replace("\"", "");
-            let parts: Vec<&str> = clean_value.split_whitespace().collect();
+            let key = key.trim();
+            let value = value.trim().trim_matches('"');
 
-            if parts.len() > 1 {
-                config_map.insert(
-                    clean_key.to_string(),
-                    serde_json::Value::Array(
-                        parts
-                            .iter()
-                            .map(|s| serde_json::Value::String(s.to_string()))
-                            .collect(),
-                    ),
-                );
+            // Skip empty values
+            if value.is_empty() {
+                warn!("Empty value for configuration key: {}", key);
+                continue;
+            }
+
+            // Convert configuration to command line flags
+            match key {
+                "COMPRESSION" => {
+                    has_compression = true;
+                    match value.to_lowercase().as_str() {
+                        "none" => flags.push("--compression=none".to_string()),
+                        "lz4" => flags.push("--compression=lz4".to_string()),
+                        "zstd" => flags.push("--compression=zstd".to_string()),
+                        _ => {
+                            error!("Invalid compression value: {}", value);
+                            continue;
+                        }
+                    }
+                }
+                "TOPICS" => {
+                    has_topics = true;
+                    // Split topics by whitespace and add each as a separate argument
+                    let topics: Vec<&str> = value.split_whitespace().collect();
+                    if topics.is_empty() {
+                        warn!("No topics specified in configuration");
+                        continue;
+                    }
+                    for topic in topics {
+                        flags.push(topic.to_string());
+                    }
+                }
+                "CUBE_FPS" => {
+                    has_cube_fps = true;
+                    if let Ok(fps) = value.parse::<u32>() {
+                        flags.push(format!("--cube-fps={}", fps));
+                    } else {
+                        error!("Invalid CUBE_FPS value: {}", value);
+                        continue;
+                    }
+                }
+                "STORAGE" => {
+                    has_storage = true;
+                    storage_path = value.to_string();
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    // Log warnings for missing required configurations
+    if !has_compression {
+        warn!("COMPRESSION not specified in configuration, using default");
+        flags.push("--compression=lz4".to_string());
+    }
+    if !has_topics {
+        warn!("TOPICS not specified in configuration, using default topics");
+        flags.push("/tf_static".to_string());
+        flags.push("/imu".to_string());
+        flags.push("/gps".to_string());
+    }
+    if !has_cube_fps {
+        warn!("CUBE_FPS not specified in configuration, using default value");
+        flags.push("--cube-fps=1".to_string());
+    }
+    if !has_storage {
+        warn!("STORAGE not specified in configuration, using default location");
+        storage_path = "/media/DATA".to_string();
+    }
+
+    Ok(RecorderConfig {
+        flags,
+        storage_path,
+    })
+}
+
+async fn check_recorder_status() -> String {
+    let pid_file = Path::new("/var/run/recorder.pid");
+
+    if !pid_file.exists() {
+        // Even if PID file doesn't exist, check if process is running
+        let ps_output = Command::new("ps").arg("aux").output();
+
+        match ps_output {
+            Ok(output) => {
+                let processes = String::from_utf8_lossy(&output.stdout);
+                let recorder_running = processes
+                    .lines()
+                    .any(|line| line.contains("recorder") && !line.contains("grep"));
+
+                if recorder_running {
+                    // Process is running but PID file is missing
+                    return "Recorder is running".to_string();
+                }
+            }
+            Err(e) => {
+                error!("Failed to execute ps command: {:?}", e);
+            }
+        }
+        return "Recorder is not running".to_string();
+    }
+
+    match std::fs::read_to_string(pid_file) {
+        Ok(pid_str) => {
+            if let Ok(_pid) = pid_str.trim().parse::<i32>() {
+                // Check both the PID file process and ps output
+                let ps_output = Command::new("ps").arg("aux").output();
+
+                match ps_output {
+                    Ok(output) => {
+                        let processes = String::from_utf8_lossy(&output.stdout);
+                        let recorder_running = processes
+                            .lines()
+                            .any(|line| line.contains("recorder") && !line.contains("grep"));
+
+                        if recorder_running {
+                            "Recorder is running".to_string()
+                        } else {
+                            // Process not found, clean up PID file
+                            let _ = std::fs::remove_file(pid_file);
+                            "Recorder is not running".to_string()
+                        }
+                    }
+                    Err(_) => {
+                        let _ = std::fs::remove_file(pid_file);
+                        "Error checking process status".to_string()
+                    }
+                }
             } else {
-                config_map.insert(
-                    clean_key.to_string(),
-                    serde_json::Value::String(clean_value.to_string()),
-                );
+                let _ = std::fs::remove_file(pid_file);
+                "Invalid PID in PID file".to_string()
             }
         }
-    }
-
-    HttpResponse::Ok().json(serde_json::Value::Object(config_map))
-}
-
-async fn get_all_services(params: web::Json<Value>) -> impl Responder {
-    let services = match params["services"].as_array() {
-        Some(arr) => arr
-            .iter()
-            .filter_map(|v| v.as_str().map(|s| s.to_string()))
-            .collect::<Vec<String>>(),
-        None => Vec::new(),
-    };
-    let mut service_statuses = Vec::new();
-
-    for service in services {
-        let decoded_service = percent_decode(service.as_bytes())
-            .decode_utf8_lossy()
-            .to_string();
-        let status_output = Command::new("systemctl")
-            .arg("is-active")
-            .arg(&decoded_service)
-            .output();
-
-        let enabled_output = Command::new("systemctl")
-            .arg("is-enabled")
-            .arg(&decoded_service)
-            .output();
-
-        let status = match status_output {
-            Ok(output) => {
-                let status_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if status_str == "active" {
-                    "running".to_string()
-                } else {
-                    "not running".to_string()
-                }
-            }
-            Err(_) => "unknown".to_string(),
-        };
-
-        let enabled = match enabled_output {
-            Ok(output) => {
-                let enabled_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                match enabled_str.as_str() {
-                    "enabled" => "enabled".to_string(),
-                    "disabled" => "disabled".to_string(),
-                    _ => "unknown".to_string(),
-                }
-            }
-            Err(_) => "unknown".to_string(),
-        };
-        service_statuses.push(json!({
-            "service": decoded_service,
-            "status": status,
-            "enabled": enabled,
-        }));
-    }
-    HttpResponse::Ok().json(service_statuses)
-}
-
-async fn update_service(params: web::Json<ServiceAction>) -> impl Responder {
-    let service_name = &params.service;
-    let action = &params.action;
-
-    let mut command = Command::new("sudo");
-    command.arg("systemctl");
-
-    match action.as_str() {
-        "start" => command.arg("start").arg(service_name),
-        "stop" => command.arg("stop").arg(service_name),
-        "enable" => command.arg("enable").arg(service_name),
-        "disable" => command.arg("disable").arg(service_name),
-        _ => return HttpResponse::BadRequest().body("Invalid action"),
-    };
-
-    match command.status() {
-        Ok(status) if status.success() => HttpResponse::Ok().body(format!(
-            "Service '{}' {}d successfully.",
-            service_name, action
-        )),
-        Ok(status) => {
-            let error_message = format!(
-                "Failed to {} service '{}': {:?}",
-                action, service_name, status
-            );
-            error!("{}", error_message);
-            HttpResponse::InternalServerError().body(error_message)
-        }
-        Err(e) => {
-            let error_message = format!(
-                "Failed to run systemctl {} {}: {:?}",
-                action, service_name, e
-            );
-            error!("{}", error_message);
-            HttpResponse::InternalServerError().body(error_message)
+        Err(_) => {
+            let _ = std::fs::remove_file(pid_file);
+            "Error reading PID file".to_string()
         }
     }
 }
@@ -674,51 +569,222 @@ async fn update_service(params: web::Json<ServiceAction>) -> impl Responder {
 async fn start(data: web::Data<AppState>) -> impl Responder {
     let mut process_guard = data.process.lock().unwrap();
 
+    // Check if already running
+    let status_str = check_recorder_status().await;
+    debug!("Current recorder status: {}", status_str);
+
+    if status_str == "Recorder is running" {
+        return HttpResponse::BadRequest().json(json!({
+            "status": "error",
+            "message": "Recorder is already running"
+        }));
+    }
+
+    // Read configuration and get flags
+    let config = match read_recorder_config() {
+        Ok(config) => {
+            debug!("Recorder configuration flags: {:?}", config.flags);
+            debug!("Storage path: {}", config.storage_path);
+            config
+        }
+        Err(e) => {
+            let error_message = format!("Failed to read recorder configuration: {:?}", e);
+            error!("{}", error_message);
+            return HttpResponse::InternalServerError().json(json!({
+                "status": "error",
+                "message": error_message
+            }));
+        }
+    };
+
     let mut command = Command::new("sudo");
-    command.arg("systemctl").arg("start").arg("recorder");
+    command
+        .env("STORAGE", &config.storage_path) // Set STORAGE environment variable
+        .arg("-E") // Preserve environment variables
+        .arg("/home/root/saksham/recorder");
+
+    // Add all flags from configuration
+    for flag in config.flags {
+        command.arg(flag);
+    }
+
+    debug!("Starting recorder with command: {:?}", command);
 
     let process = match command.spawn() {
-        Ok(p) => p,
+        Ok(p) => {
+            debug!("Recorder process started with PID: {:?}", p.id());
+            p
+        }
         Err(e) => {
             let error_message = format!("Failed to start recorder: {:?}", e);
-            info!("{}", error_message);
+            error!("{}", error_message);
+            return HttpResponse::InternalServerError().json(json!({
+                "status": "error",
+                "message": error_message
+            }));
+        }
+    };
+
+    let pid = process.id();
+    *process_guard = Some(process);
+
+    // Wait a bit for the process to start and create PID file
+    for _ in 0..10 {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let status = check_recorder_status().await;
+        if status == "Recorder is running" {
             return HttpResponse::Ok().json(json!({
                 "status": "started",
                 "message": "Recording started successfully"
             }));
         }
-    };
+    }
 
-    *process_guard = Some(process);
+    // If we get here, the process started but PID file wasn't created
+    // Let's create it ourselves
+    if let Some(process) = process_guard.as_mut() {
+        match process.try_wait() {
+            Ok(Some(status)) => {
+                let error_message = format!("Recorder process exited with status: {:?}", status);
+                error!("{}", error_message);
+                *process_guard = None;
+                return HttpResponse::InternalServerError().json(json!({
+                    "status": "error",
+                    "message": error_message
+                }));
+            }
+            Ok(None) => {
+                // Process is still running, create PID file
+                debug!("Creating PID file manually");
+                if let Err(e) = std::fs::write("/var/run/recorder.pid", pid.to_string()) {
+                    let error_message = format!("Failed to create PID file: {:?}", e);
+                    error!("{}", error_message);
+                    if let Some(mut process) = process_guard.take() {
+                        let _ = process.kill();
+                    }
+                    return HttpResponse::InternalServerError().json(json!({
+                        "status": "error",
+                        "message": error_message
+                    }));
+                }
+                return HttpResponse::Ok().json(json!({
+                    "status": "started",
+                    "message": "Recording started successfully"
+                }));
+            }
+            Err(e) => {
+                let error_message = format!("Error checking process status: {:?}", e);
+                error!("{}", error_message);
+                *process_guard = None;
+                return HttpResponse::InternalServerError().json(json!({
+                    "status": "error",
+                    "message": error_message
+                }));
+            }
+        }
+    }
 
-    HttpResponse::Ok().body("Recorder started")
+    let error_message = "Failed to verify recorder started";
+    error!("{}", error_message);
+    if let Some(mut process) = process_guard.take() {
+        let _ = process.kill();
+    }
+    HttpResponse::InternalServerError().json(json!({
+        "status": "error",
+        "message": error_message
+    }))
 }
 
 async fn stop(data: web::Data<AppState>) -> impl Responder {
     let mut process_guard = data.process.lock().unwrap();
-    let mut command = Command::new("sudo");
-    command.arg("systemctl").arg("stop").arg("recorder");
+    let pid_file = Path::new("/var/run/recorder.pid");
 
-    match command.status() {
-        Ok(status) if status.success() => {
-            *process_guard = None;
-            info!("Recorder service stopped");
-            HttpResponse::Ok().json(json!({
-                "status": "stopped",
-                "message": "Recording stopped successfully"
-            }))
-        }
-        Ok(status) => {
-            let error_message = format!("Failed to stop recorder service: {:?}", status);
-            error!("{}", error_message);
-            HttpResponse::InternalServerError().body(error_message)
-        }
-        Err(e) => {
-            let error_message = format!("Failed to run systemctl stop recorder: {:?}", e);
-            error!("{}", error_message);
-            HttpResponse::InternalServerError().body(error_message)
+    // First try to stop the process if we have it in our guard
+    if let Some(mut process) = process_guard.take() {
+        debug!(
+            "Attempting to stop recorder process with PID: {:?}",
+            process.id()
+        );
+        // Try to terminate gracefully first
+        if let Err(e) = process.kill() {
+            error!("Failed to kill process directly: {:?}", e);
+            // Process might have already terminated
         }
     }
+
+    // Find and kill all recorder processes gracefully
+    let ps_output = Command::new("ps").arg("aux").output().map_err(|e| {
+        error!("Failed to execute ps command: {:?}", e);
+        e
+    });
+
+    if let Ok(output) = ps_output {
+        let processes = String::from_utf8_lossy(&output.stdout);
+        for line in processes.lines() {
+            if line.contains("recorder") && !line.contains("grep") {
+                if let Some(pid) = line.split_whitespace().nth(1) {
+                    debug!("Found recorder process: {}", line);
+                    // First try SIGTERM (15) for graceful shutdown
+                    let term_result = Command::new("sudo")
+                        .arg("kill")
+                        .arg("-15") // SIGTERM
+                        .arg(pid)
+                        .status();
+
+                    if let Ok(status) = term_result {
+                        if !status.success() {
+                            warn!("Failed to send SIGTERM to process {}, trying SIGKILL", pid);
+                            // If SIGTERM fails, wait a bit and then try SIGKILL
+                            std::thread::sleep(std::time::Duration::from_secs(2));
+                            let _ = Command::new("sudo")
+                                .arg("kill")
+                                .arg("-9") // SIGKILL
+                                .arg(pid)
+                                .status();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Clean up PID file if it exists
+    if pid_file.exists() {
+        if let Err(e) = std::fs::remove_file(pid_file) {
+            error!("Failed to remove PID file: {:?}", e);
+        }
+    }
+
+    // Wait a moment for processes to terminate
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Double check if any recorder processes are still running
+    let ps_check = Command::new("ps").arg("aux").output().map_err(|e| {
+        error!("Failed to execute ps check command: {:?}", e);
+        e
+    });
+
+    if let Ok(output) = ps_check {
+        let processes = String::from_utf8_lossy(&output.stdout);
+        let still_running = processes
+            .lines()
+            .any(|line| line.contains("recorder") && !line.contains("grep"));
+
+        if still_running {
+            let error_message = "Failed to stop all recorder processes";
+            error!("{}", error_message);
+            return HttpResponse::InternalServerError().json(json!({
+                "status": "error",
+                "message": error_message
+            }));
+        }
+    }
+
+    debug!("All recorder processes stopped successfully");
+    HttpResponse::Ok().json(json!({
+        "status": "stopped",
+        "message": "Recording stopped successfully"
+    }))
 }
 
 async fn delete(params: web::Json<DeleteParams>) -> impl Responder {
@@ -1620,6 +1686,295 @@ async fn get_current_recording() -> impl Responder {
             HttpResponse::InternalServerError().json(json!({
                 "status": "error",
                 "message": format!("Error checking recorder status: {}", e)
+            }))
+        }
+    }
+}
+
+async fn check_replay_status() -> impl Responder {
+    let pid_file = Path::new("/var/run/replay.pid");
+
+    if !pid_file.exists() {
+        return HttpResponse::Ok().json(json!({
+            "status": "not_running",
+            "message": "Replay is not running"
+        }));
+    }
+
+    match std::fs::read_to_string(pid_file) {
+        Ok(pid_str) => {
+            if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                let status = Command::new("ps").arg("-p").arg(pid.to_string()).output();
+
+                match status {
+                    Ok(output) => {
+                        if output.status.success() {
+                            HttpResponse::Ok().json(json!({
+                                "status": "running",
+                                "message": "Replay is running"
+                            }))
+                        } else {
+                            // Process exists but not running, clean up PID file
+                            let _ = std::fs::remove_file(pid_file);
+                            HttpResponse::Ok().json(json!({
+                                "status": "not_running",
+                                "message": "Replay is not running"
+                            }))
+                        }
+                    }
+                    Err(e) => HttpResponse::InternalServerError().json(json!({
+                        "status": "error",
+                        "message": format!("Error checking process status: {:?}", e)
+                    })),
+                }
+            } else {
+                HttpResponse::InternalServerError().json(json!({
+                    "status": "error",
+                    "message": "Invalid PID in PID file"
+                }))
+            }
+        }
+        Err(e) => HttpResponse::InternalServerError().json(json!({
+            "status": "error",
+            "message": format!("Error reading PID file: {:?}", e)
+        })),
+    }
+}
+
+async fn get_all_services(params: web::Json<Value>) -> impl Responder {
+    let services = match params["services"].as_array() {
+        Some(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect::<Vec<String>>(),
+        None => Vec::new(),
+    };
+    let mut service_statuses = Vec::new();
+
+    for service in services {
+        let pid_file_path = format!("/var/run/{}.pid", service);
+        let pid_file = Path::new(&pid_file_path);
+        let status = if pid_file.exists() {
+            match std::fs::read_to_string(pid_file) {
+                Ok(pid_str) => {
+                    if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                        let status = Command::new("ps").arg("-p").arg(pid.to_string()).output();
+
+                        match status {
+                            Ok(output) if output.status.success() => "running".to_string(),
+                            _ => "not_running".to_string(),
+                        }
+                    } else {
+                        "not_running".to_string()
+                    }
+                }
+                Err(_) => "not_running".to_string(),
+            }
+        } else {
+            "not_running".to_string()
+        };
+
+        service_statuses.push(json!({
+            "service": service,
+            "status": status,
+            "enabled": "unknown" // We don't track enabled status anymore
+        }));
+    }
+    HttpResponse::Ok().json(service_statuses)
+}
+
+async fn update_service(params: web::Json<ServiceAction>) -> impl Responder {
+    let service_name = &params.service;
+    let action = &params.action;
+    let pid_file_path = format!("/var/run/{}.pid", service_name);
+    let pid_file = Path::new(&pid_file_path);
+
+    match action.as_str() {
+        "start" => {
+            let mut command = Command::new("sudo");
+            command
+                .arg(format!("/usr/local/bin/{}", service_name))
+                .arg("--daemon");
+
+            match command.status() {
+                Ok(status) if status.success() => HttpResponse::Ok().json(json!({
+                    "status": "success",
+                    "message": format!("Service '{}' started successfully", service_name)
+                })),
+                Ok(_) => HttpResponse::InternalServerError().json(json!({
+                    "status": "error",
+                    "message": format!("Failed to start service '{}'", service_name)
+                })),
+                Err(e) => HttpResponse::InternalServerError().json(json!({
+                    "status": "error",
+                    "message": format!("Error starting service: {:?}", e)
+                })),
+            }
+        }
+        "stop" => {
+            if !pid_file.exists() {
+                return HttpResponse::Ok().json(json!({
+                    "status": "success",
+                    "message": format!("Service '{}' is not running", service_name)
+                }));
+            }
+
+            match std::fs::read_to_string(pid_file) {
+                Ok(pid_str) => {
+                    if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                        let mut command = Command::new("sudo");
+                        command.arg("kill").arg(pid.to_string());
+
+                        match command.status() {
+                            Ok(status) if status.success() => {
+                                let _ = std::fs::remove_file(pid_file);
+                                HttpResponse::Ok().json(json!({
+                                    "status": "success",
+                                    "message": format!("Service '{}' stopped successfully", service_name)
+                                }))
+                            }
+                            Ok(_) => HttpResponse::InternalServerError().json(json!({
+                                "status": "error",
+                                "message": format!("Failed to stop service '{}'", service_name)
+                            })),
+                            Err(e) => HttpResponse::InternalServerError().json(json!({
+                                "status": "error",
+                                "message": format!("Error stopping service: {:?}", e)
+                            })),
+                        }
+                    } else {
+                        HttpResponse::InternalServerError().json(json!({
+                            "status": "error",
+                            "message": "Invalid PID in PID file"
+                        }))
+                    }
+                }
+                Err(e) => HttpResponse::InternalServerError().json(json!({
+                    "status": "error",
+                    "message": format!("Error reading PID file: {:?}", e)
+                })),
+            }
+        }
+        _ => HttpResponse::BadRequest().json(json!({
+            "status": "error",
+            "message": "Invalid action"
+        })),
+    }
+}
+
+async fn get_config(path: web::Path<ConfigPath>) -> impl Responder {
+    let service_name = &path.service;
+    let config_file_path = format!("/etc/default/{}", service_name);
+
+    let config_content = std::fs::read_to_string(&config_file_path).unwrap_or_default();
+    let mut config_map = serde_json::Map::new();
+
+    for line in config_content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            let clean_key = key.trim();
+            let clean_value = value.trim().replace("\"", "");
+            let parts: Vec<&str> = clean_value.split_whitespace().collect();
+
+            if parts.len() > 1 {
+                config_map.insert(
+                    clean_key.to_string(),
+                    serde_json::Value::Array(
+                        parts
+                            .iter()
+                            .map(|s| serde_json::Value::String(s.to_string()))
+                            .collect(),
+                    ),
+                );
+            } else {
+                config_map.insert(
+                    clean_key.to_string(),
+                    serde_json::Value::String(clean_value.to_string()),
+                );
+            }
+        }
+    }
+
+    HttpResponse::Ok().json(serde_json::Value::Object(config_map))
+}
+
+async fn set_config(params: web::Json<Value>) -> impl Responder {
+    let file_name = if let Some(file_name_value) = params.get("fileName") {
+        if let Some(file_name) = file_name_value.as_str() {
+            file_name
+        } else {
+            error!("fileName is not a string");
+            return HttpResponse::BadRequest().json(json!({
+                "status": "error",
+                "message": "Invalid fileName"
+            }));
+        }
+    } else {
+        error!("fileName not found in JSON");
+        return HttpResponse::BadRequest().json(json!({
+            "status": "error",
+            "message": "Missing fileName"
+        }));
+    };
+
+    let config_file_path = format!("/etc/default/{}", file_name);
+    debug!("Configuration file path: {}", config_file_path.clone());
+    debug!("{:?}", params);
+
+    let config_content = match std::fs::read_to_string(config_file_path.clone()) {
+        Ok(content) => content,
+        Err(e) => {
+            error!("Error reading configuration file: {:?}", e);
+            return HttpResponse::InternalServerError().json(json!({
+                "status": "error",
+                "message": "Error reading configuration file"
+            }));
+        }
+    };
+
+    let config_map = if let Some(map) = params.as_object() {
+        map.clone()
+    } else {
+        serde_json::Map::new()
+    };
+    let mut updated_config = String::new();
+
+    for line in config_content.lines() {
+        let mut found = false;
+
+        for (key, value) in &config_map {
+            let escaped_key = regex::escape(key);
+            let pattern = format!(r"(?i)^\s*{}\s*=\s*.*", escaped_key);
+            let re = Regex::new(&pattern).unwrap();
+
+            if re.is_match(line) {
+                updated_config.push_str(&format!(
+                    "{} = \"{}\"\n",
+                    key.to_uppercase(),
+                    value.as_str().unwrap_or("")
+                ));
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            updated_config.push_str(&format!("{}\n", line)); // Preserve original line
+        }
+    }
+
+    match std::fs::write(config_file_path.clone(), updated_config) {
+        Ok(_) => HttpResponse::Ok().json(json!({
+            "status": "success",
+            "message": "Configuration saved successfully"
+        })),
+        Err(e) => {
+            error!("Error saving configuration: {:?}", e);
+            HttpResponse::InternalServerError().json(json!({
+                "status": "error",
+                "message": "Error saving configuration"
             }))
         }
     }

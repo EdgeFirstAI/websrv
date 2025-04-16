@@ -9,6 +9,10 @@ pub struct Args {
     #[arg(short, long, env, default_value = "/usr/share/webui")]
     pub docroot: String,
 
+    /// Use 3D visualization (combined_lidar.html) instead of segmentation
+    #[arg(short, long)]
+    pub lidar: bool,
+
     /// zenoh connection mode
     #[arg(long, env, default_value = "peer")]
     mode: WhatAmI,

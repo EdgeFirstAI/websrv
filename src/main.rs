@@ -28,7 +28,6 @@ use openssl::{
     pkey::{PKey, Private},
     ssl::{SslAcceptor, SslMethod},
 };
-use percent_encoding::percent_decode;
 use pnet::datalink;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -163,20 +162,22 @@ async fn index(data: web::Data<ServerContext>) -> Result<fs::NamedFile> {
     let base_path = PathBuf::from(&data.args.docroot);
 
     let data_path = if base_path.is_dir() {
-        base_path.join("segmentation.html")
+        if data.args.lidar {
+            base_path.join("combined_lidar.html")
+        } else {
+            base_path.join("segmentation.html")
+        }
     } else {
         base_path
     };
 
-    debug!("{:?}", data_path);
+    debug!("Serving index file: {:?}", data_path);
 
     match fs::NamedFile::open(data_path) {
         Ok(file) => Ok(file),
         Err(_) => {
-            error!("Segmentation page not found");
-            Err(actix_web::error::ErrorNotFound(
-                "Segmentation page not found",
-            ))
+            error!("Index page not found");
+            Err(actix_web::error::ErrorNotFound("Index page not found"))
         }
     }
 }

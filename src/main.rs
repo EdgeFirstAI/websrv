@@ -1,5 +1,5 @@
 mod args;
-
+use crate::args::WebUISettings;
 use actix::prelude::*;
 use actix_files::{self as fs, NamedFile};
 use actix_web::{
@@ -94,10 +94,10 @@ struct ThreadState {
     is_running: Mutex<bool>,
 }
 
-#[derive(Deserialize)]
-struct ConfigPath {
-    service: String,
-}
+// #[derive(Deserialize)]
+// struct ConfigPath {
+//     service: String,
+// }
 
 const SERVER_PEM: &[u8] = include_bytes!("../server.pem");
 const STOP: &str = "STOP";
@@ -1863,44 +1863,44 @@ async fn update_service(params: web::Json<ServiceAction>) -> impl Responder {
     }
 }
 
-async fn get_config(path: web::Path<ConfigPath>) -> impl Responder {
-    let service_name = &path.service;
-    let config_file_path = format!("/etc/default/{}", service_name);
+// async fn get_config(path: web::Path<ConfigPath>) -> impl Responder {
+//     let service_name = &path.service;
+//     let config_file_path = format!("/etc/default/{}", service_name);
 
-    let config_content = std::fs::read_to_string(&config_file_path).unwrap_or_default();
-    let mut config_map = serde_json::Map::new();
+//     let config_content = std::fs::read_to_string(&config_file_path).unwrap_or_default();
+//     let mut config_map = serde_json::Map::new();
 
-    for line in config_content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((key, value)) = line.split_once('=') {
-            let clean_key = key.trim();
-            let clean_value = value.trim().replace("\"", "");
-            let parts: Vec<&str> = clean_value.split_whitespace().collect();
+//     for line in config_content.lines() {
+//         let line = line.trim();
+//         if line.is_empty() || line.starts_with('#') {
+//             continue;
+//         }
+//         if let Some((key, value)) = line.split_once('=') {
+//             let clean_key = key.trim();
+//             let clean_value = value.trim().replace("\"", "");
+//             let parts: Vec<&str> = clean_value.split_whitespace().collect();
 
-            if parts.len() > 1 {
-                config_map.insert(
-                    clean_key.to_string(),
-                    serde_json::Value::Array(
-                        parts
-                            .iter()
-                            .map(|s| serde_json::Value::String(s.to_string()))
-                            .collect(),
-                    ),
-                );
-            } else {
-                config_map.insert(
-                    clean_key.to_string(),
-                    serde_json::Value::String(clean_value.to_string()),
-                );
-            }
-        }
-    }
+//             if parts.len() > 1 {
+//                 config_map.insert(
+//                     clean_key.to_string(),
+//                     serde_json::Value::Array(
+//                         parts
+//                             .iter()
+//                             .map(|s| serde_json::Value::String(s.to_string()))
+//                             .collect(),
+//                     ),
+//                 );
+//             } else {
+//                 config_map.insert(
+//                     clean_key.to_string(),
+//                     serde_json::Value::String(clean_value.to_string()),
+//                 );
+//             }
+//         }
+//     }
 
-    HttpResponse::Ok().json(serde_json::Value::Object(config_map))
-}
+//     HttpResponse::Ok().json(serde_json::Value::Object(config_map))
+// }
 
 async fn set_config(params: web::Json<Value>) -> impl Responder {
     let file_name = if let Some(file_name_value) = params.get("fileName") {
@@ -1979,6 +1979,10 @@ async fn set_config(params: web::Json<Value>) -> impl Responder {
             }))
         }
     }
+}
+
+async fn send_config(data: web::Data<ServerContext>) -> HttpResponse {
+    HttpResponse::Ok().json(WebUISettings::from(data.args.clone()))
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
@@ -2066,7 +2070,7 @@ async fn main() -> std::io::Result<()> {
                     .route("/config/services/update", web::post().to(update_service))
                     .service(web::resource("/mcap/").route(web::get().to(mcap_websocket_handler)))
                     .route("/config/{service}", web::get().to(serve_config_page))
-                    .route("/config/{service}/details", web::get().to(get_config))
+                    .route("/config/{service}/details", web::get().to(send_config))
                     .route("/config/{service}", web::post().to(set_config))
                     .route("/{file:.*}", web::get().to(custom_file_handler))
                     .route(

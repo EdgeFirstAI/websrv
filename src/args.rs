@@ -1,6 +1,9 @@
 use clap::Parser;
+use serde::Serialize;
 use serde_json::json;
 use zenoh::config::{Config, WhatAmI};
+
+type Boolean = bool;
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
@@ -28,6 +31,48 @@ pub struct Args {
     /// disable zenoh multicast scouting
     #[arg(long, env)]
     no_multicast_scouting: bool,
+
+    #[arg(long, env, default_value = "/rt/model/mask_compressed")]
+    mask_topic: String,
+
+    #[arg(long, env, default_value = "/rt/model/boxes2d/")]
+    detect_topic: String,
+
+    #[arg(long, env, default_value = "/rt/camera/h264/")]
+    h264_topic: String,
+
+    #[arg(long, env, default_value = "true")]
+    draw_box: Boolean,
+
+    #[arg(long, env, default_value = "true")]
+    draw_box_text: Boolean,
+
+    #[arg(long, env, default_value = "true")]
+    mirror: Boolean,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub struct WebUISettings {
+    mask_topic: String,
+    detect_topic: String,
+    h264_topic: String,
+    draw_box: bool,
+    draw_box_text: bool,
+    mirror: bool,
+}
+
+impl From<Args> for WebUISettings {
+    fn from(value: Args) -> Self {
+        Self {
+            mask_topic: value.mask_topic,
+            detect_topic: value.detect_topic,
+            h264_topic: value.h264_topic,
+            draw_box: value.draw_box,
+            draw_box_text: value.draw_box_text,
+            mirror: value.mirror,
+        }
+    }
 }
 
 impl From<Args> for Config {

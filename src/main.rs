@@ -1089,7 +1089,7 @@ fn read_storage_directory() -> io::Result<String> {
                     "MCAP Directory: {:?}",
                     parts[1].trim().trim_matches('"').to_string()
                 );
-                return Ok("/home/root/saksham/recordings".to_string());
+                return Ok(parts[1].trim().trim_matches('"').to_string());
             }
         }
     }
@@ -1099,40 +1099,34 @@ fn read_storage_directory() -> io::Result<String> {
     ))
 }
 
-fn user_mode_read_storage_directory(arg_data: web::Data<ServerContext>) -> io::Result<String> {
-    return Ok(arg_data.args.storage_path.to_string());
+// Below function will be needed when we start working on the DVE Uploader integration
+// fn read_topics_from_config() -> io::Result<Vec<String>> {
+//     let file_path = "/etc/default/recorder";
+//     let file = File::open(file_path)?;
+//     let reader = io::BufReader::new(file);
 
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        "STORAGE directory not found",
-    ))
+//     let topics;
+
+//     for line in reader.lines() {
+//         let line = line?;
+//         if line.starts_with("TOPICS") {
+//             let parts: Vec<&str> = line.split('=').collect();
+//             if parts.len() == 2 {
+//                 topics = parts[1].split_whitespace().map(|s| s.to_string()).collect();
+//                 return Ok(topics);
+//             }
+//         }
+//     }
+
+//     Err(io::Error::new(
+//         io::ErrorKind::NotFound,
+//         "TOPICS not found in the config file",
+//     ))
+// }
+
+struct WebSocketSession {
+    context: Option<web::Data<ServerContext>>,
 }
-
-fn read_topics_from_config() -> io::Result<Vec<String>> {
-    let file_path = "/etc/default/recorder";
-    let file = File::open(file_path)?;
-    let reader = io::BufReader::new(file);
-
-    let topics;
-
-    for line in reader.lines() {
-        let line = line?;
-        if line.starts_with("TOPICS") {
-            let parts: Vec<&str> = line.split('=').collect();
-            if parts.len() == 2 {
-                topics = parts[1].split_whitespace().map(|s| s.to_string()).collect();
-                return Ok(topics);
-            }
-        }
-    }
-
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        "TOPICS not found in the config file",
-    ))
-}
-
-struct WebSocketSession;
 
 impl Actor for WebSocketSession {
     type Context = ws::WebsocketContext<Self>;
@@ -1140,33 +1134,46 @@ impl Actor for WebSocketSession {
 
 impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WebSocketSession {
     fn handle(&mut self, msg: Result<ws::Message, ws::ProtocolError>, ctx: &mut Self::Context) {
+        let arg_data = match &self.context {
+            Some(data) => data,
+            None => {
+                error!("ServerContext not initialized");
+                return;
+            }
+        };
+
         match msg {
             Ok(ws::Message::Text(text)) => {
                 debug!("Received message: {}", text);
-                let directory = match read_storage_directory() {
-                    Ok(dir) => dir,
-                    Err(e) => {
-                        error!("Error reading directory from config: {}", e);
-                        let response = serde_json::to_string(
-                            &json!({"error": "Error reading directory from config"}),
-                        )
-                        .unwrap();
-                        ctx.text(response);
-                        return;
-                    }
-                };
-                let topics = match read_topics_from_config() {
-                    Ok(topics) => topics,
-                    Err(e) => {
-                        error!("Error reading topics from config: {}", e);
-                        let response = serde_json::to_string(
-                            &json!({"error": "Error reading topics from config"}),
-                        )
-                        .unwrap();
-                        ctx.text(response);
-                        return;
-                    }
-                };
+                let mut directory: String = arg_data.args.storage_path.to_string();
+                // let mut topics: Option<Vec<String>> = Some(vec!["".to_string()]);
+                if !arg_data.args.user_mode {
+                    directory = match read_storage_directory() {
+                        Ok(dir) => dir,
+                        Err(e) => {
+                            error!("Error reading directory from config: {}", e);
+                            let response = serde_json::to_string(
+                                &json!({"error": "Error reading directory from config"}),
+                            )
+                            .unwrap();
+                            ctx.text(response);
+                            return;
+                        }
+                    };
+
+                    // let topics = match read_topics_from_config() {
+                    //     Ok(topics) => topics,
+                    //     Err(e) => {
+                    //         error!("Error reading topics from config: {}", e);
+                    //         let response = serde_json::to_string(
+                    //             &json!({"error": "Error reading topics from config"}),
+                    //         )
+                    //         .unwrap();
+                    //         ctx.text(response);
+                    //         return;
+                    //     }
+                    // };
+                }
 
                 debug!("Listing files in directory: {}", directory.clone());
 
@@ -1213,20 +1220,19 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WebSocketSession 
                                 }
                             })
                             .collect();
-
                         let response = if files.is_empty() {
                             DirectoryResponse {
                                 dir_name: directory.clone(),
                                 files: None,
                                 message: Some("No MCAP files found".to_string()),
-                                topics: Some(topics),
+                                topics: None,
                             }
                         } else {
                             DirectoryResponse {
                                 dir_name: directory.clone(),
                                 files: Some(files),
                                 message: None,
-                                topics: Some(topics),
+                                topics: None,
                             }
                         };
 
@@ -1251,7 +1257,14 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WebSocketSession 
 }
 
 async fn mcap_websocket_handler(req: HttpRequest, stream: web::Payload) -> impl Responder {
-    ws::start(WebSocketSession {}, &req, stream)
+    let data = req.app_data::<web::Data<ServerContext>>().unwrap().clone();
+    ws::start(
+        WebSocketSession {
+            context: Some(data),
+        },
+        &req,
+        stream,
+    )
 }
 
 struct ServerContext {

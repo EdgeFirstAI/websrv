@@ -551,7 +551,7 @@ async fn user_mode_start(
     command
         .env("STORAGE", &arg_data.args.storage_path) // Set STORAGE environment variable
         .arg("-E") // Preserve environment variables
-        .arg("/home/root/recorder")
+        .arg("edgefirst-recorder")
         .arg("--all-topics"); // Add --all-topics flag to recorder command
 
     debug!("Starting recorder with command: {:?}", command);
@@ -1147,7 +1147,7 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WebSocketSession 
                 debug!("Received message: {}", text);
                 let mut directory: String = arg_data.args.storage_path.to_string();
                 // let mut topics: Option<Vec<String>> = Some(vec!["".to_string()]);
-                if !arg_data.args.user_mode {
+                if arg_data.args.system_mode {
                     directory = match read_storage_directory() {
                         Ok(dir) => dir,
                         Err(e) => {
@@ -2013,7 +2013,60 @@ async fn main() -> std::io::Result<()> {
         let handle = handle.clone();
         let thread_state_clone = thread_state.clone();
 
-        if args.user_mode {
+        if args.system_mode {
+            App::new()
+                .wrap(RedirectHttps::default())
+                // .wrap(middleware::Compress::default())
+                .app_data(state.clone())
+                .app_data(web::Data::new(server_ctx))
+                .service(
+                    web::scope("")
+                        .route("/", web::get().to(index))
+                        .route("/settings", web::get().to(serve_settings_page))
+                        .route("/check-storage", web::get().to(check_storage_availability))
+                        .route("/start", web::post().to(start))
+                        .route("/stop", web::post().to(stop))
+                        .route("/delete", web::post().to(delete))
+                        .route("/replay", web::post().to(start_replay))
+                        .route("/replay-end", web::post().to(stop_replay))
+                        .route("/replay-status", web::get().to(check_replay_status))
+                        .route("/live-run", web::post().to(isolate_system))
+                        .route("/download/{file:.*}", web::get().to(mcap_downloader))
+                        .route(
+                            "/get-upload-credentials",
+                            web::get().to(get_upload_credentials),
+                        )
+                        .route("/recorder-status", web::get().to(check_recorder_status))
+                        .route("/current-recording", web::get().to(get_current_recording))
+                        .service(
+                            web::resource("/ws/dropped")
+                                .route(web::get().to(websocket_handler_errors)),
+                        )
+                        .service(
+                            web::resource("/rt/detect/mask")
+                                .route(web::get().to(websocket_handler_high_priority)),
+                        )
+                        .service(
+                            web::resource("/rt/{tail:.*}")
+                                .route(web::get().to(websocket_handler_low_priority)),
+                        )
+                        .route("/config/service/status", web::post().to(get_all_services))
+                        .route("/config/services/update", web::post().to(update_service))
+                        .service(
+                            web::resource("/mcap/").route(web::get().to(mcap_websocket_handler)),
+                        )
+                        .route("/config/{service}", web::get().to(serve_config_page))
+                        .route("/config/{service}/details", web::get().to(get_config))
+                        .route("/config/{service}", web::post().to(set_config))
+                        .route("/{file:.*}", web::get().to(custom_file_handler))
+                        .route(
+                            "/upload",
+                            web::post().to(move |params| {
+                                upload(params, handle.clone(), thread_state_clone.clone())
+                            }),
+                        ),
+                )
+        } else {
             App::new()
                 .wrap(RedirectHttps::default())
                 // .wrap(middleware::Compress::default())
@@ -2066,59 +2119,6 @@ async fn main() -> std::io::Result<()> {
                             "/config/{service}/details",
                             web::get().to(user_mode_get_config),
                         )
-                        .route("/config/{service}", web::post().to(set_config))
-                        .route("/{file:.*}", web::get().to(custom_file_handler))
-                        .route(
-                            "/upload",
-                            web::post().to(move |params| {
-                                upload(params, handle.clone(), thread_state_clone.clone())
-                            }),
-                        ),
-                )
-        } else {
-            App::new()
-                .wrap(RedirectHttps::default())
-                // .wrap(middleware::Compress::default())
-                .app_data(state.clone())
-                .app_data(web::Data::new(server_ctx))
-                .service(
-                    web::scope("")
-                        .route("/", web::get().to(index))
-                        .route("/settings", web::get().to(serve_settings_page))
-                        .route("/check-storage", web::get().to(check_storage_availability))
-                        .route("/start", web::post().to(start))
-                        .route("/stop", web::post().to(stop))
-                        .route("/delete", web::post().to(delete))
-                        .route("/replay", web::post().to(start_replay))
-                        .route("/replay-end", web::post().to(stop_replay))
-                        .route("/replay-status", web::get().to(check_replay_status))
-                        .route("/live-run", web::post().to(isolate_system))
-                        .route("/download/{file:.*}", web::get().to(mcap_downloader))
-                        .route(
-                            "/get-upload-credentials",
-                            web::get().to(get_upload_credentials),
-                        )
-                        .route("/recorder-status", web::get().to(check_recorder_status))
-                        .route("/current-recording", web::get().to(get_current_recording))
-                        .service(
-                            web::resource("/ws/dropped")
-                                .route(web::get().to(websocket_handler_errors)),
-                        )
-                        .service(
-                            web::resource("/rt/detect/mask")
-                                .route(web::get().to(websocket_handler_high_priority)),
-                        )
-                        .service(
-                            web::resource("/rt/{tail:.*}")
-                                .route(web::get().to(websocket_handler_low_priority)),
-                        )
-                        .route("/config/service/status", web::post().to(get_all_services))
-                        .route("/config/services/update", web::post().to(update_service))
-                        .service(
-                            web::resource("/mcap/").route(web::get().to(mcap_websocket_handler)),
-                        )
-                        .route("/config/{service}", web::get().to(serve_config_page))
-                        .route("/config/{service}/details", web::get().to(get_config))
                         .route("/config/{service}", web::post().to(set_config))
                         .route("/{file:.*}", web::get().to(custom_file_handler))
                         .route(

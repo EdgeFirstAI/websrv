@@ -14,7 +14,7 @@ pub struct Args {
 
     /// Run the applitation in user mode
     #[arg(long, env)]
-    pub user_mode: bool,
+    pub system_mode: bool,
 
     /// zenoh connection mode
     #[arg(long, env, default_value = "peer")]
@@ -36,7 +36,7 @@ pub struct Args {
         long,
         env,
         default_value = "/rt/model/mask_compressed",
-        requires = "user_mode"
+        conflicts_with = "system_mode"
     )]
     mask_topic: String,
 
@@ -44,27 +44,32 @@ pub struct Args {
         long,
         env,
         default_value = "/rt/model/boxes2d/",
-        requires = "user_mode"
+        conflicts_with = "system_mode"
     )]
     detect_topic: String,
 
-    #[arg(long, env, default_value = "/rt/camera/h264/", requires = "user_mode")]
+    #[arg(
+        long,
+        env,
+        default_value = "/rt/camera/h264/",
+        conflicts_with = "system_mode"
+    )]
     h264_topic: String,
 
-    #[arg(long, env, default_value = "true", requires = "user_mode")]
+    #[arg(long, env, default_value = "true", conflicts_with = "system_mode")]
     draw_box: Boolean,
 
-    #[arg(long, env, default_value = "true", requires = "user_mode")]
+    #[arg(long, env, default_value = "true", conflicts_with = "system_mode")]
     draw_box_text: Boolean,
 
-    #[arg(long, env, default_value = "true", requires = "user_mode")]
+    #[arg(long, env, default_value = "true", conflicts_with = "system_mode")]
     mirror: Boolean,
 
     #[arg(
         long,
         env,
         default_value = "/home/root/recordings",
-        requires = "user_mode"
+        conflicts_with = "system_mode"
     )]
     pub storage_path: String,
 }

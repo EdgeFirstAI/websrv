@@ -28,6 +28,7 @@ use openssl::{
     pkey::{PKey, Private},
     ssl::{SslAcceptor, SslMethod},
 };
+use percent_encoding::percent_decode;
 use pnet::datalink;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -94,10 +95,10 @@ struct ThreadState {
     is_running: Mutex<bool>,
 }
 
-// #[derive(Deserialize)]
-// struct ConfigPath {
-//     service: String,
-// }
+#[derive(Deserialize)]
+struct ConfigPath {
+    service: String,
+}
 
 const SERVER_PEM: &[u8] = include_bytes!("../server.pem");
 const STOP: &str = "STOP";
@@ -162,22 +163,18 @@ async fn index(data: web::Data<ServerContext>) -> Result<fs::NamedFile> {
     let base_path = PathBuf::from(&data.args.docroot);
 
     let data_path = if base_path.is_dir() {
-        if data.args.lidar {
-            base_path.join("combined_lidar.html")
-        } else {
-            base_path.join("segmentation.html")
-        }
+        base_path.join("index.html")
     } else {
         base_path
     };
 
-    debug!("Serving index file: {:?}", data_path);
+    debug!("{:?}", data_path);
 
     match fs::NamedFile::open(data_path) {
         Ok(file) => Ok(file),
         Err(_) => {
-            error!("Index page not found");
-            Err(actix_web::error::ErrorNotFound("Index page not found"))
+            error!("Index file not found");
+            Err(actix_web::error::ErrorNotFound("Index file not found"))
         }
     }
 }
@@ -396,114 +393,7 @@ async fn custom_file_handler(
     )))
 }
 
-#[derive(Debug)]
-struct RecorderConfig {
-    flags: Vec<String>,
-    storage_path: String,
-}
-
-fn read_recorder_config() -> std::io::Result<RecorderConfig> {
-    let config_path = "/etc/default/recorder";
-    let file = std::fs::File::open(config_path)?;
-    let reader = std::io::BufReader::new(file);
-    let mut flags = Vec::new();
-    let mut has_compression = false;
-    let mut has_topics = false;
-    let mut has_cube_fps = false;
-    let mut has_storage = false;
-    let mut storage_path = String::new();
-
-    for line in reader.lines() {
-        let line = line?;
-        let line = line.trim();
-
-        // Skip comments and empty lines
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        // Parse key=value pairs
-        if let Some((key, value)) = line.split_once('=') {
-            let key = key.trim();
-            let value = value.trim().trim_matches('"');
-
-            // Skip empty values
-            if value.is_empty() {
-                warn!("Empty value for configuration key: {}", key);
-                continue;
-            }
-
-            // Convert configuration to command line flags
-            match key {
-                "COMPRESSION" => {
-                    has_compression = true;
-                    match value.to_lowercase().as_str() {
-                        "none" => flags.push("--compression=none".to_string()),
-                        "lz4" => flags.push("--compression=lz4".to_string()),
-                        "zstd" => flags.push("--compression=zstd".to_string()),
-                        _ => {
-                            error!("Invalid compression value: {}", value);
-                            continue;
-                        }
-                    }
-                }
-                "TOPICS" => {
-                    has_topics = true;
-                    // Split topics by whitespace and add each as a separate argument
-                    let topics: Vec<&str> = value.split_whitespace().collect();
-                    if topics.is_empty() {
-                        warn!("No topics specified in configuration");
-                        continue;
-                    }
-                    for topic in topics {
-                        flags.push(topic.to_string());
-                    }
-                }
-                "CUBE_FPS" => {
-                    has_cube_fps = true;
-                    if let Ok(fps) = value.parse::<u32>() {
-                        flags.push(format!("--cube-fps={}", fps));
-                    } else {
-                        error!("Invalid CUBE_FPS value: {}", value);
-                        continue;
-                    }
-                }
-                "STORAGE" => {
-                    has_storage = true;
-                    storage_path = value.to_string();
-                }
-                _ => continue,
-            }
-        }
-    }
-
-    // Log warnings for missing required configurations
-    if !has_compression {
-        warn!("COMPRESSION not specified in configuration, using default");
-        flags.push("--compression=lz4".to_string());
-    }
-    if !has_topics {
-        warn!("TOPICS not specified in configuration, using default topics");
-        flags.push("/tf_static".to_string());
-        flags.push("/imu".to_string());
-        flags.push("/gps".to_string());
-    }
-    if !has_cube_fps {
-        warn!("CUBE_FPS not specified in configuration, using default value");
-        flags.push("--cube-fps=1".to_string());
-    }
-    if !has_storage {
-        warn!("STORAGE not specified in configuration, using default location");
-        storage_path = "/media/DATA".to_string();
-    }
-
-    Ok(RecorderConfig {
-        flags,
-        storage_path,
-    })
-}
-
-async fn check_recorder_status() -> String {
+async fn user_mode_check_recorder_status() -> String {
     let pid_file = Path::new("/var/run/recorder.pid");
 
     if !pid_file.exists() {
@@ -567,11 +457,87 @@ async fn check_recorder_status() -> String {
     }
 }
 
+async fn check_recorder_status() -> impl Responder {
+    let service_status = Command::new("systemctl")
+        .arg("is-active")
+        .arg("recorder")
+        .output();
+
+    match service_status {
+        Ok(output) => {
+            let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+            if status == "active" {
+                HttpResponse::Ok().body("Recorder is running")
+            } else {
+                HttpResponse::Ok().body("Recorder is not running")
+            }
+        }
+        Err(e) => HttpResponse::InternalServerError()
+            .body(format!("Error checking service status: {:?}", e)),
+    }
+}
+
+async fn check_service_status(service_name: &str) -> Result<String, String> {
+    let service_status = Command::new("systemctl")
+        .arg("is-active")
+        .arg(service_name)
+        .output()
+        .map_err(|e| format!("Error checking service status: {:?}", e))?;
+
+    let status = String::from_utf8_lossy(&service_status.stdout)
+        .trim()
+        .to_string();
+    debug!("{:?} service is {:?}", service_name, status);
+    if status == "active" && service_name != "webui" {
+        Command::new("systemctl")
+            .arg("restart")
+            .arg(service_name)
+            .output()
+            .map_err(|e| format!("Error restarting service: {:?}", e))?;
+        Ok(format!(
+            "Service '{}' restarted successfully.",
+            service_name
+        ))
+    } else {
+        Ok(format!(
+            "Service '{}' is not running. No action taken.",
+            service_name
+        ))
+    }
+}
+
 async fn start(data: web::Data<AppState>) -> impl Responder {
     let mut process_guard = data.process.lock().unwrap();
 
+    let mut command = Command::new("sudo");
+    command.arg("systemctl").arg("start").arg("recorder");
+
+    let process = match command.spawn() {
+        Ok(p) => p,
+        Err(e) => {
+            let error_message = format!("Failed to start recorder: {:?}", e);
+            info!("{}", error_message);
+            return HttpResponse::Ok().json(json!({
+                "status": "started",
+                "message": "Recording started successfully"
+            }));
+        }
+    };
+
+    *process_guard = Some(process);
+
+    HttpResponse::Ok().body("Recorder started")
+}
+
+async fn user_mode_start(
+    data: web::Data<AppState>,
+    arg_data: web::Data<ServerContext>,
+) -> impl Responder {
+    let mut process_guard = data.process.lock().unwrap();
+
     // Check if already running
-    let status_str = check_recorder_status().await;
+    let status_str = user_mode_check_recorder_status().await;
     debug!("Current recorder status: {}", status_str);
 
     if status_str == "Recorder is running" {
@@ -581,33 +547,12 @@ async fn start(data: web::Data<AppState>) -> impl Responder {
         }));
     }
 
-    // Read configuration and get flags
-    let config = match read_recorder_config() {
-        Ok(config) => {
-            debug!("Recorder configuration flags: {:?}", config.flags);
-            debug!("Storage path: {}", config.storage_path);
-            config
-        }
-        Err(e) => {
-            let error_message = format!("Failed to read recorder configuration: {:?}", e);
-            error!("{}", error_message);
-            return HttpResponse::InternalServerError().json(json!({
-                "status": "error",
-                "message": error_message
-            }));
-        }
-    };
-
     let mut command = Command::new("sudo");
     command
-        .env("STORAGE", &config.storage_path) // Set STORAGE environment variable
+        .env("STORAGE", &arg_data.args.storage_path) // Set STORAGE environment variable
         .arg("-E") // Preserve environment variables
-        .arg("/home/root/saksham/recorder");
-
-    // Add all flags from configuration
-    for flag in config.flags {
-        command.arg(flag);
-    }
+        .arg("/home/root/recorder")
+        .arg("--all-topics"); // Add --all-topics flag to recorder command
 
     debug!("Starting recorder with command: {:?}", command);
 
@@ -632,7 +577,7 @@ async fn start(data: web::Data<AppState>) -> impl Responder {
     // Wait a bit for the process to start and create PID file
     for _ in 0..10 {
         std::thread::sleep(std::time::Duration::from_millis(200));
-        let status = check_recorder_status().await;
+        let status = user_mode_check_recorder_status().await;
         if status == "Recorder is running" {
             return HttpResponse::Ok().json(json!({
                 "status": "started",
@@ -697,6 +642,33 @@ async fn start(data: web::Data<AppState>) -> impl Responder {
 }
 
 async fn stop(data: web::Data<AppState>) -> impl Responder {
+    let mut process_guard = data.process.lock().unwrap();
+    let mut command = Command::new("sudo");
+    command.arg("systemctl").arg("stop").arg("recorder");
+
+    match command.status() {
+        Ok(status) if status.success() => {
+            *process_guard = None;
+            info!("Recorder service stopped");
+            HttpResponse::Ok().json(json!({
+                "status": "stopped",
+                "message": "Recording stopped successfully"
+            }))
+        }
+        Ok(status) => {
+            let error_message = format!("Failed to stop recorder service: {:?}", status);
+            error!("{}", error_message);
+            HttpResponse::InternalServerError().body(error_message)
+        }
+        Err(e) => {
+            let error_message = format!("Failed to run systemctl stop recorder: {:?}", e);
+            error!("{}", error_message);
+            HttpResponse::InternalServerError().body(error_message)
+        }
+    }
+}
+
+async fn user_mode_stop(data: web::Data<AppState>) -> impl Responder {
     let mut process_guard = data.process.lock().unwrap();
     let pid_file = Path::new("/var/run/recorder.pid");
 
@@ -1117,10 +1089,18 @@ fn read_storage_directory() -> io::Result<String> {
                     "MCAP Directory: {:?}",
                     parts[1].trim().trim_matches('"').to_string()
                 );
-                return Ok(parts[1].trim().trim_matches('"').to_string());
+                return Ok("/home/root/saksham/recordings".to_string());
             }
         }
     }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "STORAGE directory not found",
+    ))
+}
+
+fn user_mode_read_storage_directory(arg_data: web::Data<ServerContext>) -> io::Result<String> {
+    return Ok(arg_data.args.storage_path.to_string());
 
     Err(io::Error::new(
         io::ErrorKind::NotFound,
@@ -1692,7 +1672,7 @@ async fn get_current_recording() -> impl Responder {
     }
 }
 
-async fn check_replay_status() -> impl Responder {
+async fn user_mode_check_replay_status() -> impl Responder {
     let pid_file = Path::new("/var/run/replay.pid");
 
     if !pid_file.exists() {
@@ -1742,6 +1722,27 @@ async fn check_replay_status() -> impl Responder {
     }
 }
 
+async fn check_replay_status() -> impl Responder {
+    let service_status = Command::new("systemctl")
+        .arg("is-active")
+        .arg("replay")
+        .output();
+
+    match service_status {
+        Ok(output) => {
+            let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+            if status == "active" {
+                HttpResponse::Ok().body("Replay is running")
+            } else {
+                HttpResponse::Ok().body("Replay is not running")
+            }
+        }
+        Err(e) => HttpResponse::InternalServerError()
+            .body(format!("Error checking service status: {:?}", e)),
+    }
+}
+
 async fn get_all_services(params: web::Json<Value>) -> impl Responder {
     let services = match params["services"].as_array() {
         Some(arr) => arr
@@ -1753,32 +1754,46 @@ async fn get_all_services(params: web::Json<Value>) -> impl Responder {
     let mut service_statuses = Vec::new();
 
     for service in services {
-        let pid_file_path = format!("/var/run/{}.pid", service);
-        let pid_file = Path::new(&pid_file_path);
-        let status = if pid_file.exists() {
-            match std::fs::read_to_string(pid_file) {
-                Ok(pid_str) => {
-                    if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                        let status = Command::new("ps").arg("-p").arg(pid.to_string()).output();
+        let decoded_service = percent_decode(service.as_bytes())
+            .decode_utf8_lossy()
+            .to_string();
+        let status_output = Command::new("systemctl")
+            .arg("is-active")
+            .arg(&decoded_service)
+            .output();
 
-                        match status {
-                            Ok(output) if output.status.success() => "running".to_string(),
-                            _ => "not_running".to_string(),
-                        }
-                    } else {
-                        "not_running".to_string()
-                    }
+        let enabled_output = Command::new("systemctl")
+            .arg("is-enabled")
+            .arg(&decoded_service)
+            .output();
+
+        let status = match status_output {
+            Ok(output) => {
+                let status_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if status_str == "active" {
+                    "running".to_string()
+                } else {
+                    "not running".to_string()
                 }
-                Err(_) => "not_running".to_string(),
             }
-        } else {
-            "not_running".to_string()
+            Err(_) => "unknown".to_string(),
         };
 
+        let enabled = match enabled_output {
+            Ok(output) => {
+                let enabled_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                match enabled_str.as_str() {
+                    "enabled" => "enabled".to_string(),
+                    "disabled" => "disabled".to_string(),
+                    _ => "unknown".to_string(),
+                }
+            }
+            Err(_) => "unknown".to_string(),
+        };
         service_statuses.push(json!({
-            "service": service,
+            "service": decoded_service,
             "status": status,
-            "enabled": "unknown" // We don't track enabled status anymore
+            "enabled": enabled,
         }));
     }
     HttpResponse::Ok().json(service_statuses)
@@ -1787,120 +1802,80 @@ async fn get_all_services(params: web::Json<Value>) -> impl Responder {
 async fn update_service(params: web::Json<ServiceAction>) -> impl Responder {
     let service_name = &params.service;
     let action = &params.action;
-    let pid_file_path = format!("/var/run/{}.pid", service_name);
-    let pid_file = Path::new(&pid_file_path);
+
+    let mut command = Command::new("sudo");
+    command.arg("systemctl");
 
     match action.as_str() {
-        "start" => {
-            let mut command = Command::new("sudo");
-            command
-                .arg(format!("/usr/local/bin/{}", service_name))
-                .arg("--daemon");
+        "start" => command.arg("start").arg(service_name),
+        "stop" => command.arg("stop").arg(service_name),
+        "enable" => command.arg("enable").arg(service_name),
+        "disable" => command.arg("disable").arg(service_name),
+        _ => return HttpResponse::BadRequest().body("Invalid action"),
+    };
 
-            match command.status() {
-                Ok(status) if status.success() => HttpResponse::Ok().json(json!({
-                    "status": "success",
-                    "message": format!("Service '{}' started successfully", service_name)
-                })),
-                Ok(_) => HttpResponse::InternalServerError().json(json!({
-                    "status": "error",
-                    "message": format!("Failed to start service '{}'", service_name)
-                })),
-                Err(e) => HttpResponse::InternalServerError().json(json!({
-                    "status": "error",
-                    "message": format!("Error starting service: {:?}", e)
-                })),
-            }
+    match command.status() {
+        Ok(status) if status.success() => HttpResponse::Ok().body(format!(
+            "Service '{}' {}d successfully.",
+            service_name, action
+        )),
+        Ok(status) => {
+            let error_message = format!(
+                "Failed to {} service '{}': {:?}",
+                action, service_name, status
+            );
+            error!("{}", error_message);
+            HttpResponse::InternalServerError().body(error_message)
         }
-        "stop" => {
-            if !pid_file.exists() {
-                return HttpResponse::Ok().json(json!({
-                    "status": "success",
-                    "message": format!("Service '{}' is not running", service_name)
-                }));
-            }
-
-            match std::fs::read_to_string(pid_file) {
-                Ok(pid_str) => {
-                    if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                        let mut command = Command::new("sudo");
-                        command.arg("kill").arg(pid.to_string());
-
-                        match command.status() {
-                            Ok(status) if status.success() => {
-                                let _ = std::fs::remove_file(pid_file);
-                                HttpResponse::Ok().json(json!({
-                                    "status": "success",
-                                    "message": format!("Service '{}' stopped successfully", service_name)
-                                }))
-                            }
-                            Ok(_) => HttpResponse::InternalServerError().json(json!({
-                                "status": "error",
-                                "message": format!("Failed to stop service '{}'", service_name)
-                            })),
-                            Err(e) => HttpResponse::InternalServerError().json(json!({
-                                "status": "error",
-                                "message": format!("Error stopping service: {:?}", e)
-                            })),
-                        }
-                    } else {
-                        HttpResponse::InternalServerError().json(json!({
-                            "status": "error",
-                            "message": "Invalid PID in PID file"
-                        }))
-                    }
-                }
-                Err(e) => HttpResponse::InternalServerError().json(json!({
-                    "status": "error",
-                    "message": format!("Error reading PID file: {:?}", e)
-                })),
-            }
+        Err(e) => {
+            let error_message = format!(
+                "Failed to run systemctl {} {}: {:?}",
+                action, service_name, e
+            );
+            error!("{}", error_message);
+            HttpResponse::InternalServerError().body(error_message)
         }
-        _ => HttpResponse::BadRequest().json(json!({
-            "status": "error",
-            "message": "Invalid action"
-        })),
     }
 }
 
-// async fn get_config(path: web::Path<ConfigPath>) -> impl Responder {
-//     let service_name = &path.service;
-//     let config_file_path = format!("/etc/default/{}", service_name);
+async fn get_config(path: web::Path<ConfigPath>) -> impl Responder {
+    let service_name = &path.service;
+    let config_file_path = format!("/etc/default/{}", service_name);
 
-//     let config_content = std::fs::read_to_string(&config_file_path).unwrap_or_default();
-//     let mut config_map = serde_json::Map::new();
+    let config_content = std::fs::read_to_string(&config_file_path).unwrap_or_default();
+    let mut config_map = serde_json::Map::new();
 
-//     for line in config_content.lines() {
-//         let line = line.trim();
-//         if line.is_empty() || line.starts_with('#') {
-//             continue;
-//         }
-//         if let Some((key, value)) = line.split_once('=') {
-//             let clean_key = key.trim();
-//             let clean_value = value.trim().replace("\"", "");
-//             let parts: Vec<&str> = clean_value.split_whitespace().collect();
+    for line in config_content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            let clean_key = key.trim();
+            let clean_value = value.trim().replace("\"", "");
+            let parts: Vec<&str> = clean_value.split_whitespace().collect();
 
-//             if parts.len() > 1 {
-//                 config_map.insert(
-//                     clean_key.to_string(),
-//                     serde_json::Value::Array(
-//                         parts
-//                             .iter()
-//                             .map(|s| serde_json::Value::String(s.to_string()))
-//                             .collect(),
-//                     ),
-//                 );
-//             } else {
-//                 config_map.insert(
-//                     clean_key.to_string(),
-//                     serde_json::Value::String(clean_value.to_string()),
-//                 );
-//             }
-//         }
-//     }
+            if parts.len() > 1 {
+                config_map.insert(
+                    clean_key.to_string(),
+                    serde_json::Value::Array(
+                        parts
+                            .iter()
+                            .map(|s| serde_json::Value::String(s.to_string()))
+                            .collect(),
+                    ),
+                );
+            } else {
+                config_map.insert(
+                    clean_key.to_string(),
+                    serde_json::Value::String(clean_value.to_string()),
+                );
+            }
+        }
+    }
 
-//     HttpResponse::Ok().json(serde_json::Value::Object(config_map))
-// }
+    HttpResponse::Ok().json(serde_json::Value::Object(config_map))
+}
 
 async fn set_config(params: web::Json<Value>) -> impl Responder {
     let file_name = if let Some(file_name_value) = params.get("fileName") {
@@ -1908,18 +1883,14 @@ async fn set_config(params: web::Json<Value>) -> impl Responder {
             file_name
         } else {
             error!("fileName is not a string");
-            return HttpResponse::BadRequest().json(json!({
-                "status": "error",
-                "message": "Invalid fileName"
-            }));
+            return HttpResponse::BadRequest().body("Invalid fileName");
         }
     } else {
         error!("fileName not found in JSON");
-        return HttpResponse::BadRequest().json(json!({
-            "status": "error",
-            "message": "Missing fileName"
-        }));
+        return HttpResponse::BadRequest().body("Missing fileName");
     };
+
+    let service_name = file_name;
 
     let config_file_path = format!("/etc/default/{}", file_name);
     debug!("Configuration file path: {}", config_file_path.clone());
@@ -1929,10 +1900,7 @@ async fn set_config(params: web::Json<Value>) -> impl Responder {
         Ok(content) => content,
         Err(e) => {
             error!("Error reading configuration file: {:?}", e);
-            return HttpResponse::InternalServerError().json(json!({
-                "status": "error",
-                "message": "Error reading configuration file"
-            }));
+            return HttpResponse::InternalServerError().body("Error reading configuration file");
         }
     };
 
@@ -1967,21 +1935,22 @@ async fn set_config(params: web::Json<Value>) -> impl Responder {
     }
 
     match std::fs::write(config_file_path.clone(), updated_config) {
-        Ok(_) => HttpResponse::Ok().json(json!({
-            "status": "success",
-            "message": "Configuration saved successfully"
-        })),
+        Ok(_) => match check_service_status(service_name).await {
+            Ok(_) => HttpResponse::Ok()
+                .body("Configuration saved successfully and service status checked."),
+            Err(e) => {
+                error!("{}", e);
+                HttpResponse::InternalServerError().body("Error handling service status")
+            }
+        },
         Err(e) => {
             error!("Error saving configuration: {:?}", e);
-            HttpResponse::InternalServerError().json(json!({
-                "status": "error",
-                "message": "Error saving configuration"
-            }))
+            HttpResponse::InternalServerError().body("Error saving configuration")
         }
     }
 }
 
-async fn send_config(data: web::Data<ServerContext>) -> HttpResponse {
+async fn user_mode_get_config(data: web::Data<ServerContext>) -> HttpResponse {
     HttpResponse::Ok().json(WebUISettings::from(data.args.clone()))
 }
 
@@ -2031,55 +2000,122 @@ async fn main() -> std::io::Result<()> {
         let handle = handle.clone();
         let thread_state_clone = thread_state.clone();
 
-        App::new()
-            .wrap(RedirectHttps::default())
-            // .wrap(middleware::Compress::default())
-            .app_data(state.clone())
-            .app_data(web::Data::new(server_ctx))
-            .service(
-                web::scope("")
-                    .route("/", web::get().to(index))
-                    .route("/settings", web::get().to(serve_settings_page))
-                    .route("/check-storage", web::get().to(check_storage_availability))
-                    .route("/start", web::post().to(start))
-                    .route("/stop", web::post().to(stop))
-                    .route("/delete", web::post().to(delete))
-                    .route("/replay", web::post().to(start_replay))
-                    .route("/replay-end", web::post().to(stop_replay))
-                    .route("/replay-status", web::get().to(check_replay_status))
-                    .route("/live-run", web::post().to(isolate_system))
-                    .route("/download/{file:.*}", web::get().to(mcap_downloader))
-                    .route(
-                        "/get-upload-credentials",
-                        web::get().to(get_upload_credentials),
-                    )
-                    .route("/recorder-status", web::get().to(check_recorder_status))
-                    .route("/current-recording", web::get().to(get_current_recording))
-                    .service(
-                        web::resource("/ws/dropped").route(web::get().to(websocket_handler_errors)),
-                    )
-                    .service(
-                        web::resource("/rt/detect/mask")
-                            .route(web::get().to(websocket_handler_high_priority)),
-                    )
-                    .service(
-                        web::resource("/rt/{tail:.*}")
-                            .route(web::get().to(websocket_handler_low_priority)),
-                    )
-                    .route("/config/service/status", web::post().to(get_all_services))
-                    .route("/config/services/update", web::post().to(update_service))
-                    .service(web::resource("/mcap/").route(web::get().to(mcap_websocket_handler)))
-                    .route("/config/{service}", web::get().to(serve_config_page))
-                    .route("/config/{service}/details", web::get().to(send_config))
-                    .route("/config/{service}", web::post().to(set_config))
-                    .route("/{file:.*}", web::get().to(custom_file_handler))
-                    .route(
-                        "/upload",
-                        web::post().to(move |params| {
-                            upload(params, handle.clone(), thread_state_clone.clone())
-                        }),
-                    ),
-            )
+        if args.user_mode {
+            App::new()
+                .wrap(RedirectHttps::default())
+                // .wrap(middleware::Compress::default())
+                .app_data(state.clone())
+                .app_data(web::Data::new(server_ctx))
+                .service(
+                    web::scope("")
+                        .route("/", web::get().to(index))
+                        .route("/settings", web::get().to(serve_settings_page))
+                        .route("/check-storage", web::get().to(check_storage_availability))
+                        .route("/start", web::post().to(user_mode_start))
+                        .route("/stop", web::post().to(user_mode_stop))
+                        .route("/delete", web::post().to(delete))
+                        .route("/replay", web::post().to(start_replay))
+                        .route("/replay-end", web::post().to(stop_replay))
+                        .route(
+                            "/replay-status",
+                            web::get().to(user_mode_check_replay_status),
+                        )
+                        .route("/live-run", web::post().to(isolate_system))
+                        .route("/download/{file:.*}", web::get().to(mcap_downloader))
+                        .route(
+                            "/get-upload-credentials",
+                            web::get().to(get_upload_credentials),
+                        )
+                        .route(
+                            "/recorder-status",
+                            web::get().to(user_mode_check_recorder_status),
+                        )
+                        .route("/current-recording", web::get().to(get_current_recording))
+                        .service(
+                            web::resource("/ws/dropped")
+                                .route(web::get().to(websocket_handler_errors)),
+                        )
+                        .service(
+                            web::resource("/rt/detect/mask")
+                                .route(web::get().to(websocket_handler_high_priority)),
+                        )
+                        .service(
+                            web::resource("/rt/{tail:.*}")
+                                .route(web::get().to(websocket_handler_low_priority)),
+                        )
+                        .route("/config/service/status", web::post().to(get_all_services))
+                        .route("/config/services/update", web::post().to(update_service))
+                        .service(
+                            web::resource("/mcap/").route(web::get().to(mcap_websocket_handler)),
+                        )
+                        .route("/config/{service}", web::get().to(serve_config_page))
+                        .route(
+                            "/config/{service}/details",
+                            web::get().to(user_mode_get_config),
+                        )
+                        .route("/config/{service}", web::post().to(set_config))
+                        .route("/{file:.*}", web::get().to(custom_file_handler))
+                        .route(
+                            "/upload",
+                            web::post().to(move |params| {
+                                upload(params, handle.clone(), thread_state_clone.clone())
+                            }),
+                        ),
+                )
+        } else {
+            App::new()
+                .wrap(RedirectHttps::default())
+                // .wrap(middleware::Compress::default())
+                .app_data(state.clone())
+                .app_data(web::Data::new(server_ctx))
+                .service(
+                    web::scope("")
+                        .route("/", web::get().to(index))
+                        .route("/settings", web::get().to(serve_settings_page))
+                        .route("/check-storage", web::get().to(check_storage_availability))
+                        .route("/start", web::post().to(start))
+                        .route("/stop", web::post().to(stop))
+                        .route("/delete", web::post().to(delete))
+                        .route("/replay", web::post().to(start_replay))
+                        .route("/replay-end", web::post().to(stop_replay))
+                        .route("/replay-status", web::get().to(check_replay_status))
+                        .route("/live-run", web::post().to(isolate_system))
+                        .route("/download/{file:.*}", web::get().to(mcap_downloader))
+                        .route(
+                            "/get-upload-credentials",
+                            web::get().to(get_upload_credentials),
+                        )
+                        .route("/recorder-status", web::get().to(check_recorder_status))
+                        .route("/current-recording", web::get().to(get_current_recording))
+                        .service(
+                            web::resource("/ws/dropped")
+                                .route(web::get().to(websocket_handler_errors)),
+                        )
+                        .service(
+                            web::resource("/rt/detect/mask")
+                                .route(web::get().to(websocket_handler_high_priority)),
+                        )
+                        .service(
+                            web::resource("/rt/{tail:.*}")
+                                .route(web::get().to(websocket_handler_low_priority)),
+                        )
+                        .route("/config/service/status", web::post().to(get_all_services))
+                        .route("/config/services/update", web::post().to(update_service))
+                        .service(
+                            web::resource("/mcap/").route(web::get().to(mcap_websocket_handler)),
+                        )
+                        .route("/config/{service}", web::get().to(serve_config_page))
+                        .route("/config/{service}/details", web::get().to(get_config))
+                        .route("/config/{service}", web::post().to(set_config))
+                        .route("/{file:.*}", web::get().to(custom_file_handler))
+                        .route(
+                            "/upload",
+                            web::post().to(move |params| {
+                                upload(params, handle.clone(), thread_state_clone.clone())
+                            }),
+                        ),
+                )
+        }
     })
     .bind(&addrs_http[..])?
     .bind_openssl(&addrs[..], builder)?

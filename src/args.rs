@@ -12,9 +12,9 @@ pub struct Args {
     #[arg(short, long, env, default_value = "/usr/share/webui")]
     pub docroot: String,
 
-    /// Use 3D visualization (combined_lidar.html) instead of segmentation
-    #[arg(short, long)]
-    pub lidar: bool,
+    /// Run the applitation in user mode
+    #[arg(long, env)]
+    pub user_mode: bool,
 
     /// zenoh connection mode
     #[arg(long, env, default_value = "peer")]
@@ -49,6 +49,9 @@ pub struct Args {
 
     #[arg(long, env, default_value = "true")]
     mirror: Boolean,
+
+    #[arg(long, env, default_value = "/home/root/recordings")]
+    pub storage_path: String,
 }
 
 #[derive(Serialize)]

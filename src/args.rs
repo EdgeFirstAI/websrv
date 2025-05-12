@@ -3,8 +3,6 @@ use serde::Serialize;
 use serde_json::json;
 use zenoh::config::{Config, WhatAmI};
 
-type Boolean = bool;
-
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
 pub struct Args {
@@ -14,7 +12,7 @@ pub struct Args {
 
     /// Run the applitation in user mode
     #[arg(long, env)]
-    pub system_mode: bool,
+    pub system: bool,
 
     /// zenoh connection mode
     #[arg(long, env, default_value = "peer")]
@@ -36,40 +34,40 @@ pub struct Args {
         long,
         env,
         default_value = "/rt/model/mask_compressed",
-        conflicts_with = "system_mode"
+        conflicts_with = "system"
     )]
-    mask_topic: String,
+    mask: String,
 
     #[arg(
         long,
         env,
-        default_value = "/rt/model/boxes2d/",
-        conflicts_with = "system_mode"
+        default_value = "/rt/model/boxes2d",
+        conflicts_with = "system"
     )]
-    detect_topic: String,
+    detect: String,
 
     #[arg(
         long,
         env,
-        default_value = "/rt/camera/h264/",
-        conflicts_with = "system_mode"
+        default_value = "/rt/camera/h264",
+        conflicts_with = "system"
     )]
-    h264_topic: String,
+    h264: String,
 
-    #[arg(long, env, default_value = "true", conflicts_with = "system_mode")]
-    draw_box: Boolean,
+    #[arg(long, env, default_value = "true", conflicts_with = "system")]
+    draw_box: bool,
 
-    #[arg(long, env, default_value = "true", conflicts_with = "system_mode")]
-    draw_box_text: Boolean,
+    #[arg(long, env, default_value = "true", conflicts_with = "system")]
+    draw_labels: bool,
 
-    #[arg(long, env, default_value = "true", conflicts_with = "system_mode")]
-    mirror: Boolean,
+    #[arg(long, env, default_value = "true", conflicts_with = "system")]
+    mirror: bool,
 
     #[arg(
         long,
         env,
         default_value = "/home/root/recordings",
-        conflicts_with = "system_mode"
+        conflicts_with = "system"
     )]
     pub storage_path: String,
 }
@@ -88,11 +86,11 @@ pub struct WebUISettings {
 impl From<Args> for WebUISettings {
     fn from(value: Args) -> Self {
         Self {
-            mask_topic: value.mask_topic,
-            detect_topic: value.detect_topic,
-            h264_topic: value.h264_topic,
+            mask_topic: value.mask,
+            detect_topic: value.detect,
+            h264_topic: value.h264,
             draw_box: value.draw_box,
-            draw_box_text: value.draw_box_text,
+            draw_box_text: value.draw_labels,
             mirror: value.mirror,
         }
     }

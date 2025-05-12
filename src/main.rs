@@ -1147,7 +1147,7 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WebSocketSession 
                 debug!("Received message: {}", text);
                 let mut directory: String = arg_data.args.storage_path.to_string();
                 // let mut topics: Option<Vec<String>> = Some(vec!["".to_string()]);
-                if arg_data.args.system_mode {
+                if arg_data.args.system {
                     directory = match read_storage_directory() {
                         Ok(dir) => dir,
                         Err(e) => {
@@ -2013,7 +2013,7 @@ async fn main() -> std::io::Result<()> {
         let handle = handle.clone();
         let thread_state_clone = thread_state.clone();
 
-        if args.system_mode {
+        if args.system {
             App::new()
                 .wrap(RedirectHttps::default())
                 // .wrap(middleware::Compress::default())

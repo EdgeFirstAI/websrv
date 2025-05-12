@@ -32,25 +32,40 @@ pub struct Args {
     #[arg(long, env)]
     no_multicast_scouting: bool,
 
-    #[arg(long, env, default_value = "/rt/model/mask_compressed")]
+    #[arg(
+        long,
+        env,
+        default_value = "/rt/model/mask_compressed",
+        requires = "user_mode"
+    )]
     mask_topic: String,
 
-    #[arg(long, env, default_value = "/rt/model/boxes2d/")]
+    #[arg(
+        long,
+        env,
+        default_value = "/rt/model/boxes2d/",
+        requires = "user_mode"
+    )]
     detect_topic: String,
 
-    #[arg(long, env, default_value = "/rt/camera/h264/")]
+    #[arg(long, env, default_value = "/rt/camera/h264/", requires = "user_mode")]
     h264_topic: String,
 
-    #[arg(long, env, default_value = "true")]
+    #[arg(long, env, default_value = "true", requires = "user_mode")]
     draw_box: Boolean,
 
-    #[arg(long, env, default_value = "true")]
+    #[arg(long, env, default_value = "true", requires = "user_mode")]
     draw_box_text: Boolean,
 
-    #[arg(long, env, default_value = "true")]
+    #[arg(long, env, default_value = "true", requires = "user_mode")]
     mirror: Boolean,
 
-    #[arg(long, env, default_value = "/home/root/recordings")]
+    #[arg(
+        long,
+        env,
+        default_value = "/home/root/recordings",
+        requires = "user_mode"
+    )]
     pub storage_path: String,
 }
 

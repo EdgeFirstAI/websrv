@@ -395,56 +395,39 @@ async fn custom_file_handler(
 }
 
 async fn user_mode_check_recorder_status() -> String {
-    let pid_file = Path::new("/var/run/recorder.pid");
+    let pid_file = Path::new("/var/run/edgefirst-recorder.pid");
 
     if !pid_file.exists() {
-        // Even if PID file doesn't exist, check if process is running
-        let ps_output = Command::new("ps").arg("aux").output();
+        let mut sys = System::new_all();
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
 
-        match ps_output {
-            Ok(output) => {
-                let processes = String::from_utf8_lossy(&output.stdout);
-                let recorder_running = processes
-                    .lines()
-                    .any(|line| line.contains("recorder") && !line.contains("grep"));
+        let recorder_running = sys.processes().values().any(|process| {
+            let name = process.name().to_string_lossy();
+            name.contains("edgefirst-recorder")
+        });
 
-                if recorder_running {
-                    // Process is running but PID file is missing
-                    return "Recorder is running".to_string();
-                }
-            }
-            Err(e) => {
-                error!("Failed to execute ps command: {:?}", e);
-            }
+        if recorder_running {
+            return "Recorder is running".to_string();
         }
         return "Recorder is not running".to_string();
     }
 
     match std::fs::read_to_string(pid_file) {
         Ok(pid_str) => {
-            if let Ok(_pid) = pid_str.trim().parse::<i32>() {
-                // Check both the PID file process and ps output
-                let ps_output = Command::new("ps").arg("aux").output();
+            if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                let mut sys = System::new_all();
+                sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
 
-                match ps_output {
-                    Ok(output) => {
-                        let processes = String::from_utf8_lossy(&output.stdout);
-                        let recorder_running = processes
-                            .lines()
-                            .any(|line| line.contains("recorder") && !line.contains("grep"));
+                let recorder_running = sys.processes().values().any(|process| {
+                    let name = process.name().to_string_lossy();
+                    name.contains("edgefirst-recorder")
+                });
 
-                        if recorder_running {
-                            "Recorder is running".to_string()
-                        } else {
-                            // Process not found, clean up PID file
-                            let _ = std::fs::remove_file(pid_file);
-                            "Recorder is not running".to_string()
-                        }
-                    }
-                    Err(_) => {
-                        let _ = std::fs::remove_file(pid_file);
-                        "Error checking process status".to_string()
-                    }
+                if recorder_running {
+                    "Recorder is running".to_string()
+                } else {
+                    let _ = std::fs::remove_file(pid_file);
+                    "Recorder is not running".to_string()
                 }
             } else {
                 let _ = std::fs::remove_file(pid_file);

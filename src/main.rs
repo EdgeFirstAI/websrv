@@ -395,50 +395,30 @@ async fn custom_file_handler(
 }
 
 async fn user_mode_check_recorder_status() -> String {
-    let pid_file = Path::new("/var/run/edgefirst-recorder.pid");
+    let mut sys = System::new_all();
+    sys.refresh_all();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
 
-    if !pid_file.exists() {
-        let mut sys = System::new_all();
-        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-
-        let recorder_running = sys.processes().values().any(|process| {
-            let name = process.name().to_string_lossy();
-            name.contains("edgefirst-recorder")
-        });
-
-        if recorder_running {
-            return "Recorder is running".to_string();
-        }
-        return "Recorder is not running".to_string();
-    }
-
-    match std::fs::read_to_string(pid_file) {
-        Ok(pid_str) => {
-            if let Ok(pid) = pid_str.trim().parse::<i32>() {
-                let mut sys = System::new_all();
-                sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-
-                let recorder_running = sys.processes().values().any(|process| {
-                    let name = process.name().to_string_lossy();
-                    name.contains("edgefirst-recorder")
-                });
-
-                if recorder_running {
-                    "Recorder is running".to_string()
-                } else {
-                    let _ = std::fs::remove_file(pid_file);
-                    "Recorder is not running".to_string()
+    if let Some(process) = sys.processes().values().find(|process| {
+        let name = process.name().to_string_lossy();
+        name.contains("edgefirst-recor")
+    }) {
+        match process.status() {
+            sysinfo::ProcessStatus::Run | sysinfo::ProcessStatus::Sleep => {
+                // Store the PID for future checks
+                if let Err(e) =
+                    std::fs::write("/var/run/edgefirst-recorder.pid", process.pid().to_string())
+                {
+                    debug!("Failed to write PID file: {}", e);
                 }
-            } else {
-                let _ = std::fs::remove_file(pid_file);
-                "Invalid PID in PID file".to_string()
+                return "Recorder is running".to_string();
+            }
+            _ => {
+                let _ = std::fs::remove_file("/var/run/edgefirst-recorder.pid");
             }
         }
-        Err(_) => {
-            let _ = std::fs::remove_file(pid_file);
-            "Error reading PID file".to_string()
-        }
     }
+    "Recorder is not running".to_string()
 }
 
 async fn check_recorder_status() -> impl Responder {

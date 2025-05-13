@@ -3,9 +3,9 @@ use crate::args::WebUISettings;
 use actix::prelude::*;
 use actix_files::{self as fs, NamedFile};
 use actix_web::{
+    App, HttpRequest, HttpResponse, HttpServer, Responder, Result,
     http::header::ContentLength,
     web::{self, Bytes},
-    App, HttpRequest, HttpResponse, HttpServer, Responder, Result,
 };
 use actix_web_actors::ws;
 use actix_web_lab::middleware::RedirectHttps;
@@ -32,7 +32,7 @@ use percent_encoding::percent_decode;
 use pnet::datalink;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
@@ -42,9 +42,9 @@ use std::{
     process::{Child, Command},
     str::FromStr,
     sync::{
-        atomic::{AtomicI64, Ordering},
-        mpsc::{channel, Receiver, Sender},
         Arc, Mutex,
+        atomic::{AtomicI64, Ordering},
+        mpsc::{Receiver, Sender, channel},
     },
     thread,
     time::{Duration, UNIX_EPOCH},
@@ -52,8 +52,8 @@ use std::{
 use sysinfo::System;
 use tokio::{io::AsyncReadExt as _, runtime::Handle};
 use uuid::{
-    v1::{Context as uuidContex, Timestamp},
     Uuid,
+    v1::{Context as uuidContex, Timestamp},
 };
 
 #[derive(Serialize)]
@@ -1040,8 +1040,8 @@ fn read_storage_directory() -> io::Result<String> {
     ))
 }
 
-// Below function will be needed when we start working on the DVE Uploader integration
-// fn read_topics_from_config() -> io::Result<Vec<String>> {
+// Below function will be needed when we start working on the DVE Uploader
+// integration fn read_topics_from_config() -> io::Result<Vec<String>> {
 //     let file_path = "/etc/default/recorder";
 //     let file = File::open(file_path)?;
 //     let reader = io::BufReader::new(file);
@@ -1053,8 +1053,8 @@ fn read_storage_directory() -> io::Result<String> {
 //         if line.starts_with("TOPICS") {
 //             let parts: Vec<&str> = line.split('=').collect();
 //             if parts.len() == 2 {
-//                 topics = parts[1].split_whitespace().map(|s| s.to_string()).collect();
-//                 return Ok(topics);
+//                 topics = parts[1].split_whitespace().map(|s|
+// s.to_string()).collect();                 return Ok(topics);
 //             }
 //         }
 //     }
@@ -1105,9 +1105,10 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WebSocketSession 
                     // let topics = match read_topics_from_config() {
                     //     Ok(topics) => topics,
                     //     Err(e) => {
-                    //         error!("Error reading topics from config: {}", e);
-                    //         let response = serde_json::to_string(
-                    //             &json!({"error": "Error reading topics from config"}),
+                    //         error!("Error reading topics from config: {}",
+                    // e);         let response =
+                    // serde_json::to_string(
+                    // &json!({"error": "Error reading topics from config"}),
                     //         )
                     //         .unwrap();
                     //         ctx.text(response);
@@ -1466,7 +1467,7 @@ async fn start_replay(params: web::Json<PlaybackParams>) -> impl Responder {
         }
     }
 
-    std::env::set_var("MCAP_FILE", &file_path);
+    unsafe { std::env::set_var("MCAP_FILE", &file_path) }
 
     let result = Command::new("sudo")
         .arg("systemctl")

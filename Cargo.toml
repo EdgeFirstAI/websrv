@@ -4,7 +4,7 @@ description = "Maivin Web UI Server"
 repository = "https://bitbucket.org/au-zone/maivin-websrv"
 license = "CLOSED"
 version = "0.0.0"
-edition = "2021"
+edition = "2024"
 
 [profile.release]
 opt-level = 3

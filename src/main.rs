@@ -601,10 +601,10 @@ async fn user_mode_start(
                 let mut process_guard = data.process.lock().unwrap();
                 *process_guard = None;
             }
-            return HttpResponse::InternalServerError().json(json!({
+            HttpResponse::InternalServerError().json(json!({
                 "status": "error",
                 "message": error_message
-            }));
+            }))
         }
         Ok(None) => {
             // Process is still running, create PID file
@@ -623,10 +623,10 @@ async fn user_mode_start(
                     "message": error_message
                 }));
             }
-            return HttpResponse::Ok().json(json!({
+            HttpResponse::Ok().json(json!({
                 "status": "started",
                 "message": "Recording started successfully"
-            }));
+            }))
         }
         Err(e) => {
             let error_message = format!("Error checking process status: {:?}", e);
@@ -635,10 +635,10 @@ async fn user_mode_start(
                 let mut process_guard = data.process.lock().unwrap();
                 *process_guard = None;
             }
-            return HttpResponse::InternalServerError().json(json!({
+            HttpResponse::InternalServerError().json(json!({
                 "status": "error",
                 "message": error_message
-            }));
+            }))
         }
     }
 }
@@ -917,7 +917,7 @@ async fn upload(
     let mat = Arc::new(Mutex::new(Metrics::default()));
     let mat_clone = Arc::clone(&mat);
 
-    let _result = handle
+    handle
         .clone()
         .spawn_blocking(move || {
             let handle_ref = &handle;
@@ -1603,7 +1603,7 @@ fn extract_recording_filename(status_output: &str) -> Option<String> {
             let parts: Vec<&str> = line.split("Recording to ").collect();
             if parts.len() > 1 {
                 let path = parts[1].trim();
-                if let Some(filename) = path.split('/').last() {
+                if let Some(filename) = path.split('/').next_back() {
                     return Some(filename.replace("…", "").trim().to_string());
                 }
             }

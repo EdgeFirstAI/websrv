@@ -1099,8 +1099,8 @@ fn read_storage_directory() -> io::Result<String> {
     ))
 }
 
-// Below function will be needed when we start working on the DVE Uploader integration
-// fn read_topics_from_config() -> io::Result<Vec<String>> {
+// Below function will be needed when we start working on the DVE Uploader
+// integration fn read_topics_from_config() -> io::Result<Vec<String>> {
 //     let file_path = "/etc/default/recorder";
 //     let file = File::open(file_path)?;
 //     let reader = io::BufReader::new(file);
@@ -1112,8 +1112,8 @@ fn read_storage_directory() -> io::Result<String> {
 //         if line.starts_with("TOPICS") {
 //             let parts: Vec<&str> = line.split('=').collect();
 //             if parts.len() == 2 {
-//                 topics = parts[1].split_whitespace().map(|s| s.to_string()).collect();
-//                 return Ok(topics);
+//                 topics = parts[1].split_whitespace().map(|s|
+// s.to_string()).collect();                 return Ok(topics);
 //             }
 //         }
 //     }
@@ -1164,9 +1164,10 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WebSocketSession 
                     // let topics = match read_topics_from_config() {
                     //     Ok(topics) => topics,
                     //     Err(e) => {
-                    //         error!("Error reading topics from config: {}", e);
-                    //         let response = serde_json::to_string(
-                    //             &json!({"error": "Error reading topics from config"}),
+                    //         error!("Error reading topics from config: {}",
+                    // e);         let response =
+                    // serde_json::to_string(             
+                    // &json!({"error": "Error reading topics from config"}),
                     //         )
                     //         .unwrap();
                     //         ctx.text(response);

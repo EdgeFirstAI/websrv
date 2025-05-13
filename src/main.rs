@@ -16,7 +16,7 @@ use camino::Utf8Path;
 use cdr::{CdrLe, Infinite};
 use chrono::DateTime;
 use clap::Parser;
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use maivin_publisher::{
     client::{self, Metrics},
     mcap::{self as pub_mcap},
@@ -49,6 +49,7 @@ use std::{
     thread,
     time::{Duration, UNIX_EPOCH},
 };
+use sysinfo::System;
 use tokio::{io::AsyncReadExt as _, runtime::Handle};
 use uuid::{
     v1::{Context as uuidContex, Timestamp},
@@ -546,12 +547,9 @@ async fn user_mode_start(
             "message": "Recorder is already running"
         }));
     }
-
-    let mut command = Command::new("sudo");
+    let mut command = Command::new("edgefirst-recorder");
     command
         .env("STORAGE", &arg_data.args.storage_path) // Set STORAGE environment variable
-        .arg("-E") // Preserve environment variables
-        .arg("edgefirst-recorder")
         .arg("--all-topics"); // Add --all-topics flag to recorder command
 
     debug!("Starting recorder with command: {:?}", command);
@@ -670,88 +668,31 @@ async fn stop(data: web::Data<AppState>) -> impl Responder {
 
 async fn user_mode_stop(data: web::Data<AppState>) -> impl Responder {
     let mut process_guard = data.process.lock().unwrap();
-    let pid_file = Path::new("/var/run/recorder.pid");
+    let pid_file = Path::new("/var/run/edgefirst-recorder.pid");
 
-    // First try to stop the process if we have it in our guard
-    if let Some(mut process) = process_guard.take() {
+    if let Some(process) = process_guard.take() {
         debug!(
             "Attempting to stop recorder process with PID: {:?}",
             process.id()
         );
-        // Try to terminate gracefully first
-        if let Err(e) = process.kill() {
-            error!("Failed to kill process directly: {:?}", e);
-            // Process might have already terminated
-        }
-    }
-
-    // Find and kill all recorder processes gracefully
-    let ps_output = Command::new("ps").arg("aux").output().map_err(|e| {
-        error!("Failed to execute ps command: {:?}", e);
-        e
-    });
-
-    if let Ok(output) = ps_output {
-        let processes = String::from_utf8_lossy(&output.stdout);
-        for line in processes.lines() {
-            if line.contains("recorder") && !line.contains("grep") {
-                if let Some(pid) = line.split_whitespace().nth(1) {
-                    debug!("Found recorder process: {}", line);
-                    // First try SIGTERM (15) for graceful shutdown
-                    let term_result = Command::new("sudo")
-                        .arg("kill")
-                        .arg("-15") // SIGTERM
-                        .arg(pid)
-                        .status();
-
-                    if let Ok(status) = term_result {
-                        if !status.success() {
-                            warn!("Failed to send SIGTERM to process {}, trying SIGKILL", pid);
-                            // If SIGTERM fails, wait a bit and then try SIGKILL
-                            std::thread::sleep(std::time::Duration::from_secs(2));
-                            let _ = Command::new("sudo")
-                                .arg("kill")
-                                .arg("-9") // SIGKILL
-                                .arg(pid)
-                                .status();
-                        }
-                    }
-                }
+        let mut sys = System::new_all();
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        if let Some(process_info) = sys.process(sysinfo::Pid::from(process.id() as usize)) {
+            if process_info.kill_with(sysinfo::Signal::Interrupt).is_none() {
+                error!("Failed to send SIGINT to process: {:?}", process.id());
             }
         }
     }
 
-    // Clean up PID file if it exists
+    let mut sys = System::new_all();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+
     if pid_file.exists() {
         if let Err(e) = std::fs::remove_file(pid_file) {
             error!("Failed to remove PID file: {:?}", e);
         }
     }
-
-    // Wait a moment for processes to terminate
     std::thread::sleep(std::time::Duration::from_secs(2));
-
-    // Double check if any recorder processes are still running
-    let ps_check = Command::new("ps").arg("aux").output().map_err(|e| {
-        error!("Failed to execute ps check command: {:?}", e);
-        e
-    });
-
-    if let Ok(output) = ps_check {
-        let processes = String::from_utf8_lossy(&output.stdout);
-        let still_running = processes
-            .lines()
-            .any(|line| line.contains("recorder") && !line.contains("grep"));
-
-        if still_running {
-            let error_message = "Failed to stop all recorder processes";
-            error!("{}", error_message);
-            return HttpResponse::InternalServerError().json(json!({
-                "status": "error",
-                "message": error_message
-            }));
-        }
-    }
 
     debug!("All recorder processes stopped successfully");
     HttpResponse::Ok().json(json!({

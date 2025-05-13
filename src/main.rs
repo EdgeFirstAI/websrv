@@ -472,8 +472,6 @@ async fn check_service_status(service_name: &str) -> Result<String, String> {
 }
 
 async fn start(data: web::Data<AppState>) -> impl Responder {
-    let mut process_guard = data.process.lock().unwrap();
-
     let mut command = Command::new("sudo");
     command.arg("systemctl").arg("start").arg("recorder");
 
@@ -489,18 +487,47 @@ async fn start(data: web::Data<AppState>) -> impl Responder {
         }
     };
 
-    *process_guard = Some(process);
+    // Store the process ID before taking the mutex lock
+    let pid = process.id();
 
-    HttpResponse::Ok().body("Recorder started")
+    // Update the process in the mutex
+    {
+        let mut process_guard = data.process.lock().unwrap();
+        *process_guard = Some(process);
+    }
+
+    // Verify the process is running
+    if let Err(e) = Command::new("systemctl")
+        .arg("is-active")
+        .arg("recorder")
+        .status()
+    {
+        let error_message = format!("Failed to verify recorder status: {:?}", e);
+        error!("{}", error_message);
+        // Clean up the process if verification fails
+        {
+            let mut process_guard = data.process.lock().unwrap();
+            if let Some(mut process) = process_guard.take() {
+                let _ = process.kill();
+            }
+        }
+        return HttpResponse::InternalServerError().json(json!({
+            "status": "error",
+            "message": error_message
+        }));
+    }
+
+    info!("Recorder started with PID: {}", pid);
+    HttpResponse::Ok().json(json!({
+        "status": "started",
+        "message": "Recording started successfully"
+    }))
 }
 
 async fn user_mode_start(
     data: web::Data<AppState>,
     arg_data: web::Data<ServerContext>,
 ) -> impl Responder {
-    let mut process_guard = data.process.lock().unwrap();
-
-    // Check if already running
     let status_str = user_mode_check_recorder_status().await;
     debug!("Current recorder status: {}", status_str);
 
@@ -533,9 +560,10 @@ async fn user_mode_start(
     };
 
     let pid = process.id();
-    *process_guard = Some(process);
-
-    // Wait a bit for the process to start and create PID file
+    {
+        let mut process_guard = data.process.lock().unwrap();
+        *process_guard = Some(process);
+    }
     for _ in 0..10 {
         std::thread::sleep(std::time::Duration::from_millis(200));
         let status = user_mode_check_recorder_status().await;
@@ -547,69 +575,84 @@ async fn user_mode_start(
         }
     }
 
-    // If we get here, the process started but PID file wasn't created
-    // Let's create it ourselves
-    if let Some(process) = process_guard.as_mut() {
-        match process.try_wait() {
-            Ok(Some(status)) => {
-                let error_message = format!("Recorder process exited with status: {:?}", status);
-                error!("{}", error_message);
-                *process_guard = None;
-                return HttpResponse::InternalServerError().json(json!({
-                    "status": "error",
-                    "message": error_message
-                }));
+    let process_status = {
+        let process = {
+            let mut process_guard = data.process.lock().unwrap();
+            process_guard.take()
+        };
+        if let Some(mut process) = process {
+            let status = process.try_wait();
+            // Put the process back if it's still running
+            if let Ok(None) = status {
+                let mut process_guard = data.process.lock().unwrap();
+                *process_guard = Some(process);
             }
-            Ok(None) => {
-                // Process is still running, create PID file
-                debug!("Creating PID file manually");
-                if let Err(e) = std::fs::write("/var/run/recorder.pid", pid.to_string()) {
-                    let error_message = format!("Failed to create PID file: {:?}", e);
-                    error!("{}", error_message);
+            status
+        } else {
+            Ok(None)
+        }
+    };
+
+    match process_status {
+        Ok(Some(status)) => {
+            let error_message = format!("Recorder process exited with status: {:?}", status);
+            error!("{}", error_message);
+            {
+                let mut process_guard = data.process.lock().unwrap();
+                *process_guard = None;
+            }
+            return HttpResponse::InternalServerError().json(json!({
+                "status": "error",
+                "message": error_message
+            }));
+        }
+        Ok(None) => {
+            // Process is still running, create PID file
+            debug!("Creating PID file manually");
+            if let Err(e) = std::fs::write("/var/run/recorder.pid", pid.to_string()) {
+                let error_message = format!("Failed to create PID file: {:?}", e);
+                error!("{}", error_message);
+                {
+                    let mut process_guard = data.process.lock().unwrap();
                     if let Some(mut process) = process_guard.take() {
                         let _ = process.kill();
                     }
-                    return HttpResponse::InternalServerError().json(json!({
-                        "status": "error",
-                        "message": error_message
-                    }));
                 }
-                return HttpResponse::Ok().json(json!({
-                    "status": "started",
-                    "message": "Recording started successfully"
-                }));
-            }
-            Err(e) => {
-                let error_message = format!("Error checking process status: {:?}", e);
-                error!("{}", error_message);
-                *process_guard = None;
                 return HttpResponse::InternalServerError().json(json!({
                     "status": "error",
                     "message": error_message
                 }));
             }
+            return HttpResponse::Ok().json(json!({
+                "status": "started",
+                "message": "Recording started successfully"
+            }));
+        }
+        Err(e) => {
+            let error_message = format!("Error checking process status: {:?}", e);
+            error!("{}", error_message);
+            {
+                let mut process_guard = data.process.lock().unwrap();
+                *process_guard = None;
+            }
+            return HttpResponse::InternalServerError().json(json!({
+                "status": "error",
+                "message": error_message
+            }));
         }
     }
-
-    let error_message = "Failed to verify recorder started";
-    error!("{}", error_message);
-    if let Some(mut process) = process_guard.take() {
-        let _ = process.kill();
-    }
-    HttpResponse::InternalServerError().json(json!({
-        "status": "error",
-        "message": error_message
-    }))
 }
 
 async fn stop(data: web::Data<AppState>) -> impl Responder {
-    let mut process_guard = data.process.lock().unwrap();
     let mut command = Command::new("sudo");
     command.arg("systemctl").arg("stop").arg("recorder");
 
     match command.status() {
         Ok(status) if status.success() => {
-            *process_guard = None;
+            {
+                let mut process_guard = data.process.lock().unwrap();
+                *process_guard = None;
+            }
             info!("Recorder service stopped");
             HttpResponse::Ok().json(json!({
                 "status": "stopped",
@@ -630,10 +673,13 @@ async fn stop(data: web::Data<AppState>) -> impl Responder {
 }
 
 async fn user_mode_stop(data: web::Data<AppState>) -> impl Responder {
-    let mut process_guard = data.process.lock().unwrap();
     let pid_file = Path::new("/var/run/edgefirst-recorder.pid");
+    let process = {
+        let mut process_guard = data.process.lock().unwrap();
+        process_guard.take()
+    };
 
-    if let Some(process) = process_guard.take() {
+    if let Some(process) = process {
         debug!(
             "Attempting to stop recorder process with PID: {:?}",
             process.id()
@@ -852,14 +898,18 @@ async fn upload(
     debug!("url = {:?} jwt = {:?}", url, jwt);
     debug!("{:?}", sequence_name);
 
+    // Check if another upload is in progress
     {
-        let mut is_running = state.is_running.lock().unwrap();
+        let is_running = state.is_running.lock().unwrap();
         if *is_running {
             return HttpResponse::TooManyRequests().json(json!({
                 "status": "Busy",
                 "message": "Another upload is already in progress. Please try again later."
             }));
         }
+    }
+    {
+        let mut is_running = state.is_running.lock().unwrap();
         *is_running = true;
     }
 
@@ -867,7 +917,7 @@ async fn upload(
     let mat = Arc::new(Mutex::new(Metrics::default()));
     let mat_clone = Arc::clone(&mat);
 
-    handle
+    let _result = handle
         .clone()
         .spawn_blocking(move || {
             let handle_ref = &handle;
@@ -949,11 +999,13 @@ async fn upload(
                     "message": "MCAP uploaded successfully"
                 }))
             });
+            // Set is_running to false when done
             let mut is_running = state_clone.is_running.lock().unwrap();
             *is_running = false;
         })
         .await
         .unwrap();
+
     let metrics_data = mat.lock().unwrap();
     debug!("{:?}", metrics_data.clone());
     if metrics_data.duration == Duration::ZERO {

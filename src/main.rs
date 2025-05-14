@@ -17,10 +17,6 @@ use cdr::{CdrLe, Infinite};
 use chrono::DateTime;
 use clap::Parser;
 use log::{debug, error, info};
-use maivin_publisher::{
-    client::{self, Metrics},
-    mcap::{self as pub_mcap},
-};
 use mcap::Summary;
 use memmap::Mmap;
 use mime::Mime;
@@ -29,15 +25,13 @@ use openssl::{
     ssl::{SslAcceptor, SslMethod},
 };
 use percent_encoding::percent_decode;
-use pnet::datalink;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    fs::{File, OpenOptions},
-    io::{self, BufRead, Write},
-    ops::Deref,
+    fs::File,
+    io::{self, BufRead},
     path::{Path, PathBuf},
     process::{Child, Command},
     str::FromStr,
@@ -51,10 +45,6 @@ use std::{
 };
 use sysinfo::System;
 use tokio::{io::AsyncReadExt as _, runtime::Handle};
-use uuid::{
-    Uuid,
-    v1::{Context as uuidContex, Timestamp},
-};
 
 #[derive(Serialize)]
 struct FileInfo {
@@ -812,222 +802,6 @@ async fn get_upload_credentials() -> impl Responder {
             error!("{:?}", error_message);
             HttpResponse::BadRequest().body(error_message)
         }
-    }
-}
-
-async fn save_credentials(url: String, jwt: String, topic: String) -> impl Responder {
-    let file_path = "/etc/default/uploader";
-    let content = format!(
-        "URL = \"{}\"\nJWT = \"{}\"\nTOPIC = \"{}\"",
-        url, jwt, topic
-    );
-
-    match OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(file_path)
-    {
-        Ok(mut file) => {
-            if let Err(e) = writeln!(file, "{}", content) {
-                error!("Failed to write to file: {}", e);
-                return HttpResponse::InternalServerError().finish();
-            }
-            HttpResponse::Ok().finish()
-        }
-        Err(e) => {
-            error!("Failed to open file: {}", e);
-            HttpResponse::InternalServerError().finish()
-        }
-    }
-}
-
-fn get_mac_address() -> Option<[u8; 6]> {
-    for iface in datalink::interfaces() {
-        if iface.is_up() && !iface.is_loopback() {
-            let mac = iface.mac;
-            if mac != Some(pnet::datalink::MacAddr::new(0, 0, 0, 0, 0, 0)) {
-                debug!("{:?}", mac?.octets());
-                return Some(mac?.octets());
-            }
-        }
-    }
-    None
-}
-
-fn convert_time_to_timestamp(time: u64, counter: u16) -> Timestamp {
-    let seconds = time / 1_000_000_000;
-    let nanos = (time % 1_000_000_000) as u32;
-    Timestamp::from_unix(uuidContex::new(counter), seconds, nanos)
-}
-
-async fn upload(
-    params: web::Json<DeleteParams>,
-    handle: tokio::runtime::Handle,
-    state: web::Data<Arc<ThreadState>>,
-) -> impl Responder {
-    let file_path = format!("{}/{}", params.directory, params.file);
-    debug!("Attempting to delete file: {}", file_path);
-
-    let sequence_name = <str as AsRef<Path>>::as_ref(file_path.as_str())
-        .file_stem()
-        .unwrap()
-        .to_os_string()
-        .into_string()
-        .unwrap();
-    let source = sequence_name
-        .split_once('_')
-        .map(|(source, _)| source.to_string());
-
-    let url = params.url.as_ref().map_or_else(
-        || "https://dveml.com/samples/upload".to_string(),
-        |s| s.clone(),
-    );
-    let jwt = params
-        .jwt
-        .as_ref()
-        .map_or_else(|| "".to_string(), |s| s.clone());
-
-    let topic = params
-        .topic
-        .as_ref()
-        .map_or_else(|| "".to_string(), |s| s.clone());
-
-    save_credentials(url.clone(), jwt.clone(), topic.clone()).await;
-
-    debug!("url = {:?} jwt = {:?}", url, jwt);
-    debug!("{:?}", sequence_name);
-
-    // Check if another upload is in progress
-    {
-        let is_running = state.is_running.lock().unwrap();
-        if *is_running {
-            return HttpResponse::TooManyRequests().json(json!({
-                "status": "Busy",
-                "message": "Another upload is already in progress. Please try again later."
-            }));
-        }
-    }
-    {
-        let mut is_running = state.is_running.lock().unwrap();
-        *is_running = true;
-    }
-
-    let state_clone = state.clone();
-    let mat = Arc::new(Mutex::new(Metrics::default()));
-    let mat_clone = Arc::clone(&mat);
-
-    handle
-        .clone()
-        .spawn_blocking(move || {
-            let handle_ref = &handle;
-            handle_ref.block_on(async move {
-                let parse_settings = pub_mcap::ParseSettings {
-                    threshold: 0.0,
-                    framerate: 0,
-                    image_type: pub_mcap::ImageType::None,
-                    topic: Some(topic),
-                    labels: None,
-                    absolute_offset: None,
-                    relative_offset: None,
-                    skip_messages: None,
-                    disable_topics: None,
-                };
-                let mmap = pub_mcap::open_mmap(&file_path).unwrap();
-                let file_path_vec = vec![file_path.clone()];
-                let mmaps = vec![mmap];
-                let (messages, sample_count) =
-                    match pub_mcap::parse(file_path_vec.deref(), &mmaps, parse_settings) {
-                        Ok(messages) => messages,
-                        Err(e) => {
-                            let error_message = e.to_string();
-                            if error_message.contains("Bad magic number") {
-                                let mut mat = mat_clone.lock().unwrap();
-                                *mat = Metrics {
-                                    success: 0,
-                                    already_uploaded: 0,
-                                    missing_image: 0,
-                                    duration: Duration::MAX,
-                                };
-                                return HttpResponse::InternalServerError().json(json!({
-                                    "status": "BadMagic",
-                                    "message": "Invalid MCAP file, please check the MCAP file"
-                                }));
-                            }
-                            let error_message = format!("Failed to parse MCAP file: {:?}", e);
-                            error!("{}", error_message);
-                            return HttpResponse::InternalServerError().json(json!({
-                                "status": "Invalid",
-                                "message": "Invalid topic, please check /etc/default/uploader"
-                            }));
-                        }
-                    };
-
-                let mac = get_mac_address().expect("Unable to find MAC address");
-                let time = match mcap_start_time(file_path.clone()) {
-                    Ok(info) => info,
-                    Err(_) => todo!(),
-                };
-                let timestamp = convert_time_to_timestamp(time, 42);
-                debug!("{:?}", timestamp);
-                let uuid = Uuid::new_v1(timestamp, &mac);
-
-                debug!("UUID = {:?}", uuid);
-
-                let pb = maivin_publisher::create_pb(sample_count, "sending samples");
-                let client = client::Client::new(url, jwt, Some(uuid), sequence_name, None, source);
-                let (metrics, upload_handler) =
-                    client::send_all_messages(Arc::new(client), messages, handle_ref, Some(pb))
-                        .await;
-                let mut mat = mat_clone.lock().unwrap();
-                *mat = metrics.clone();
-                info!("{:?}", metrics);
-                if metrics.success > 0 && metrics.already_uploaded == 0 {
-                    match upload_handler {
-                        Ok(()) => HttpResponse::Ok().json(json!({
-                            "status": "Uploading",
-                            "message": "MCAP uploaded successfully"
-                        })),
-                        Err(e) => HttpResponse::InternalServerError().json(json!({
-                            "status": "Error",
-                            "message": format!("Failed to upload MCAP: {:?}", e)
-                        })),
-                    };
-                }
-                HttpResponse::Ok().json(json!({
-                    "status": "Uploading",
-                    "message": "MCAP uploaded successfully"
-                }))
-            });
-            // Set is_running to false when done
-            let mut is_running = state_clone.is_running.lock().unwrap();
-            *is_running = false;
-        })
-        .await
-        .unwrap();
-
-    let metrics_data = mat.lock().unwrap();
-    debug!("{:?}", metrics_data.clone());
-    if metrics_data.duration == Duration::ZERO {
-        HttpResponse::InternalServerError().json(json!({
-            "status": "Invalid",
-            "message": "Invalid topic, please check /etc/default/uploader"
-        }))
-    } else if metrics_data.duration == Duration::MAX {
-        HttpResponse::InternalServerError().json(json!({
-            "status": "BadMagic",
-            "message": "Invalid MCAP file, please check the MCAP file"
-        }))
-    } else if metrics_data.success == 0 && metrics_data.already_uploaded > 0 {
-        HttpResponse::InternalServerError().json(json!({
-            "status": "Already",
-            "message": "MCAP already uploaded, unable to upload again"
-        }))
-    } else {
-        HttpResponse::Ok().json(json!({
-            "status": "Uploading",
-            "message": "MCAP uploaded successfully"
-        }))
     }
 }
 
@@ -1967,8 +1741,8 @@ async fn main() -> std::io::Result<()> {
             err_stream: Arc::new(MessageStream::new(tx, Box::new(|| {}), false)),
             err_count: AtomicI64::new(0),
         };
-        let handle = handle.clone();
-        let thread_state_clone = thread_state.clone();
+        let _handle = handle.clone();
+        let _thread_state_clone = thread_state.clone();
 
         if args.system {
             App::new()
@@ -2015,13 +1789,7 @@ async fn main() -> std::io::Result<()> {
                         .route("/config/{service}", web::get().to(serve_config_page))
                         .route("/config/{service}/details", web::get().to(get_config))
                         .route("/config/{service}", web::post().to(set_config))
-                        .route("/{file:.*}", web::get().to(custom_file_handler))
-                        .route(
-                            "/upload",
-                            web::post().to(move |params| {
-                                upload(params, handle.clone(), thread_state_clone.clone())
-                            }),
-                        ),
+                        .route("/{file:.*}", web::get().to(custom_file_handler)),
                 )
         } else {
             App::new()
@@ -2077,13 +1845,7 @@ async fn main() -> std::io::Result<()> {
                             web::get().to(user_mode_get_config),
                         )
                         .route("/config/{service}", web::post().to(set_config))
-                        .route("/{file:.*}", web::get().to(custom_file_handler))
-                        .route(
-                            "/upload",
-                            web::post().to(move |params| {
-                                upload(params, handle.clone(), thread_state_clone.clone())
-                            }),
-                        ),
+                        .route("/{file:.*}", web::get().to(custom_file_handler)),
                 )
         }
     })
@@ -2097,20 +1859,6 @@ async fn main() -> std::io::Result<()> {
 fn map_mcap<P: AsRef<Utf8Path>>(p: P) -> res<Mmap> {
     let fd = std::fs::File::open(p.as_ref()).context("Couldn't open MCAP file")?;
     unsafe { Mmap::map(&fd) }.context("Couldn't map MCAP file")
-}
-
-fn mcap_start_time<P: AsRef<Utf8Path>>(path: P) -> res<u64> {
-    let mapped = map_mcap(&path).context("Failed to map MCAP file")?;
-    let summary = Summary::read(&mapped).context("Failed to read MCAP summary")?;
-
-    if let Some(summary) = summary {
-        if let Some(ref stats) = summary.stats {
-            debug!("Statistics: {:?}", stats);
-            let message_start_time = stats.message_start_time;
-            return Ok(message_start_time);
-        }
-    }
-    Ok(0)
 }
 
 fn read_mcap_info<P: AsRef<Utf8Path>>(path: P) -> res<(HashMap<String, TopicInfo>, f64)> {

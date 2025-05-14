@@ -3,7 +3,7 @@ use serde::Serialize;
 use serde_json::json;
 use zenoh::config::{Config, WhatAmI};
 
-pub type Boolean = bool;
+pub type Boolean = bool; //Need this to be able to set bool to true/false in the cmd line
 
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]

@@ -22,7 +22,6 @@ definitions:
         name: Analyze
         size: 2x
         script:
-          - export CARGO_NET_GIT_FETCH_WITH_CLI=true
           - cargo clippy --message-format=json > clippy.json || true
           - cargo audit --json > audit.json || true
           - cargo outdated --depth 1 --format json > outdated.json || true
@@ -33,18 +32,16 @@ definitions:
         name: Build Linux AMD64
         size: 2x
         script:
-          - export CARGO_NET_GIT_FETCH_WITH_CLI=true
           - cargo build --release
         artifacts:
-          - target/release/maivin-websrv
+          - target/release/edgefirst-websrv
     - step: &build-linux-arm64
         name: Build Linux ARM64
         size: 2x
         script:
-          - export CARGO_NET_GIT_FETCH_WITH_CLI=true
           - cargo build --target=aarch64-unknown-linux-gnu --release
         artifacts:
-          - target/aarch64-unknown-linux-gnu/release/maivin-websrv
+          - target/aarch64-unknown-linux-gnu/release/edgefirst-websrv
     - step: &sonar
         name: Code Sonar
         image: sonarsource/sonar-scanner-cli:11.3
@@ -83,18 +80,18 @@ pipelines:
           name: Deploy to Production
           deployment: Production
           script:
-            - cp target/release/maivin-websrv maivin-websrv-$BITBUCKET_TAG-linux-amd64
-            - cp target/aarch64-unknown-linux-gnu/release/maivin-websrv maivin-websrv-$BITBUCKET_TAG-linux-arm64
+            - cp target/release/edgefirst-websrv edgefirst-websrv-$BITBUCKET_TAG-linux-amd64
+            - cp target/aarch64-unknown-linux-gnu/release/edgefirst-websrv edgefirst-websrv-$BITBUCKET_TAG-linux-arm64
             - pipe: atlassian/bitbucket-upload-file:0.7.4
               variables:
                 BITBUCKET_USERNAME: au-zone-ci
                 BITBUCKET_APP_PASSWORD: $BITBUCKET_PASSWORD
-                FILENAME: "maivin-websrv-$BITBUCKET_TAG-*"
+                FILENAME: "edgefirst-websrv-$BITBUCKET_TAG-*"
             - pipe: atlassian/aws-s3-deploy:2.0.1
               variables:
                 AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
                 AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
                 AWS_DEFAULT_REGION: 'us-west-2'
-                S3_BUCKET: "maivin/services/maivin-websrv"
+                S3_BUCKET: "maivin/services/edgefirst-websrv"
                 LOCAL_PATH: "."
-                EXTRA_ARGS: "--exclude=* --include=maivin-websrv-${BITBUCKET_TAG}-*"
+                EXTRA_ARGS: "--exclude=* --include=edgefirst-websrv-${BITBUCKET_TAG}-*"

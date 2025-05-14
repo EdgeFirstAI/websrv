@@ -1,6 +1,6 @@
 [package]
-name = "maivin-websrv"
-description = "Maivin Web UI Server"
+name = "edgefirst-websrv"
+description = "EdgeFirst Web UI Server"
 repository = "https://bitbucket.org/au-zone/maivin-websrv"
 license = "CLOSED"
 version = "0.0.0"
@@ -33,7 +33,6 @@ env_logger = "0.11.8"
 fs2 = "0.4.3"
 hostname = "0.4.1"
 log = "0.4.27"
-maivin-publisher = { git = "ssh://git@bitbucket.org/au-zone/maivin-publisher.git", rev = "5defd71a" }
 mcap = "0.18.0"
 memmap = "0.7.0"
 mime = "0.3.17"

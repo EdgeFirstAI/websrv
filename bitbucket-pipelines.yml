@@ -1,51 +1,69 @@
-image: deepview/rust:1.84.1
+image: deepview/rust:1.86.0
 
 clone:
   depth: full
 
 definitions:
-  caches:
-    rust-target: $BITBUCKET_CLONE_DIR/target
   steps:
-    - step: &build
-        name: Build
-        runs-on:
-          - 'self.hosted'
-        size: 2x
-        caches:
-          - rust-target
+    - step: &version
+        name: VERSION
         script:
           - |
             if [ -z "$BITBUCKET_TAG" ] ; then
-              export BRANCH=$(echo ${BITBUCKET_BRANCH} | sed 's,/,-,g')
-              export VERSION=0.0.0-${BRANCH}-${BITBUCKET_BUILD_NUMBER}
+              export VERSION=0.0.0-dev${BITBUCKET_BUILD_NUMBER}
             else
               export VERSION=${BITBUCKET_TAG}
             fi
           - sed -i "s/0.0.0/$VERSION/g" Cargo.toml
-          - export CARGO_NET_GIT_FETCH_WITH_CLI=true
+          - echo $VERSION
+        artifacts:
+          - Cargo.toml
+    - step: &analyze
+        name: Analyze
+        size: 2x
+        script:
           - cargo clippy --message-format=json > clippy.json || true
           - cargo audit --json > audit.json || true
           - cargo outdated --depth 1 --format json > outdated.json || true
           - cargo sonar --clippy --outdated --audit
-          - cargo build --target=aarch64-unknown-linux-gnu --config target.aarch64-unknown-linux-gnu.linker=\"aarch64-linux-gnu-gcc\" --release
         artifacts:
-          - target/aarch64-unknown-linux-gnu/release/maivin-websrv
           - sonar-issues.json
+    - step: &build-linux-amd64
+        name: Build Linux AMD64
+        size: 2x
+        script:
+          - cargo build --release
+        artifacts:
+          - target/release/edgefirst-websrv
+    - step: &build-linux-arm64
+        name: Build Linux ARM64
+        size: 2x
+        script:
+          - cargo build --target=aarch64-unknown-linux-gnu --release
+        artifacts:
+          - target/aarch64-unknown-linux-gnu/release/edgefirst-websrv
     - step: &sonar
         name: Code Sonar
-        image: sonarsource/sonar-scanner-cli:11.2
+        image: sonarsource/sonar-scanner-cli:11.3
         runs-on:
           - 'self.hosted'
         script:
           - sonar-scanner
 pipelines:
   default:
-    - step: *build
+    - step: *version
+    - parallel:
+        - step: *analyze
+        - step: *build-linux-amd64
+        - step: *build-linux-arm64
     - step: *sonar
   pull-requests:
     '**':
-      - step: *build
+      - step: *version
+      - parallel:
+          - step: *analyze
+          - step: *build-linux-amd64
+          - step: *build-linux-arm64
       - step: *sonar
       - step:
           name: Deploy
@@ -54,23 +72,26 @@ pipelines:
             - echo "Deploy Pull-Request"
   tags:
     '*.*.*':
-      - step: *build
-      - step: *sonar
+      - step: *version
+      - parallel:
+        - step: *build-linux-amd64        
+        - step: *build-linux-arm64
       - step:
           name: Deploy to Production
           deployment: Production
           script:
-            - cp target/aarch64-unknown-linux-gnu/release/maivin-websrv maivin-websrv-$BITBUCKET_TAG
+            - cp target/release/edgefirst-websrv edgefirst-websrv-$BITBUCKET_TAG-linux-amd64
+            - cp target/aarch64-unknown-linux-gnu/release/edgefirst-websrv edgefirst-websrv-$BITBUCKET_TAG-linux-arm64
             - pipe: atlassian/bitbucket-upload-file:0.7.4
               variables:
                 BITBUCKET_USERNAME: au-zone-ci
                 BITBUCKET_APP_PASSWORD: $BITBUCKET_PASSWORD
-                FILENAME: "maivin-websrv-*$VERSION*"
-            - pipe: atlassian/aws-s3-deploy:2.0.0
+                FILENAME: "edgefirst-websrv-$BITBUCKET_TAG-*"
+            - pipe: atlassian/aws-s3-deploy:2.0.1
               variables:
                 AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
                 AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
                 AWS_DEFAULT_REGION: 'us-west-2'
-                S3_BUCKET: "maivin/services/maivin-websrv"
+                S3_BUCKET: "maivin/services/edgefirst-websrv"
                 LOCAL_PATH: "."
-                EXTRA_ARGS: "--exclude=* --include=maivin-websrv-*${BITBUCKET_TAG}*"
+                EXTRA_ARGS: "--exclude=* --include=edgefirst-websrv-${BITBUCKET_TAG}-*"

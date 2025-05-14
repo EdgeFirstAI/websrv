@@ -1,4 +1,5 @@
 use clap::Parser;
+use serde::Serialize;
 use serde_json::json;
 use zenoh::config::{Config, WhatAmI};
 
@@ -8,6 +9,10 @@ pub struct Args {
     /// The web document root for serving html pages.
     #[arg(short, long, env, default_value = "/usr/share/webui")]
     pub docroot: String,
+
+    /// Run the applitation in user mode
+    #[arg(long, env)]
+    pub system: bool,
 
     /// zenoh connection mode
     #[arg(long, env, default_value = "peer")]
@@ -24,6 +29,71 @@ pub struct Args {
     /// disable zenoh multicast scouting
     #[arg(long, env)]
     no_multicast_scouting: bool,
+
+    #[arg(
+        long,
+        env,
+        default_value = "/rt/model/mask_compressed",
+        conflicts_with = "system"
+    )]
+    mask: String,
+
+    #[arg(
+        long,
+        env,
+        default_value = "/rt/model/boxes2d",
+        conflicts_with = "system"
+    )]
+    detect: String,
+
+    #[arg(
+        long,
+        env,
+        default_value = "/rt/camera/h264",
+        conflicts_with = "system"
+    )]
+    h264: String,
+
+    #[arg(long, env, default_value = "true", conflicts_with = "system")]
+    draw_box: bool,
+
+    #[arg(long, env, default_value = "true", conflicts_with = "system")]
+    draw_labels: bool,
+
+    #[arg(long, env, default_value = "true", conflicts_with = "system")]
+    mirror: bool,
+
+    #[arg(
+        long,
+        env,
+        default_value = "/home/root/recordings",
+        conflicts_with = "system"
+    )]
+    pub storage_path: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub struct WebUISettings {
+    mask_topic: String,
+    detect_topic: String,
+    h264_topic: String,
+    draw_box: bool,
+    draw_box_text: bool,
+    mirror: bool,
+}
+
+impl From<Args> for WebUISettings {
+    fn from(value: Args) -> Self {
+        Self {
+            mask_topic: value.mask,
+            detect_topic: value.detect,
+            h264_topic: value.h264,
+            draw_box: value.draw_box,
+            draw_box_text: value.draw_labels,
+            mirror: value.mirror,
+        }
+    }
 }
 
 impl From<Args> for Config {

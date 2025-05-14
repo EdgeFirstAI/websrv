@@ -3,6 +3,8 @@ use serde::Serialize;
 use serde_json::json;
 use zenoh::config::{Config, WhatAmI};
 
+pub type Boolean = bool;
+
 #[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
 pub struct Args {
@@ -55,13 +57,13 @@ pub struct Args {
     h264: String,
 
     #[arg(long, env, default_value = "true", conflicts_with = "system")]
-    draw_box: bool,
+    draw_box: Boolean,
 
     #[arg(long, env, default_value = "true", conflicts_with = "system")]
-    draw_labels: bool,
+    draw_labels: Boolean,
 
     #[arg(long, env, default_value = "true", conflicts_with = "system")]
-    mirror: bool,
+    mirror: Boolean,
 
     #[arg(
         long,

@@ -65,12 +65,7 @@ pub struct Args {
     #[arg(long, env, default_value = "true", conflicts_with = "system")]
     mirror: Boolean,
 
-    #[arg(
-        long,
-        env,
-        default_value = "/home/root/recordings",
-        conflicts_with = "system"
-    )]
+    #[arg(long, env, default_value = ".", conflicts_with = "system")]
     pub storage_path: String,
 }
 

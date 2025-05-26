@@ -56,16 +56,16 @@ pub struct Args {
     )]
     h264: String,
 
-    #[arg(long, env, default_value = "true", conflicts_with = "system")]
+    #[arg(long, default_value = "true", conflicts_with = "system")]
     draw_box: Boolean,
 
-    #[arg(long, env, default_value = "true", conflicts_with = "system")]
+    #[arg(long, default_value = "true", conflicts_with = "system")]
     draw_labels: Boolean,
 
-    #[arg(long, env, default_value = "true", conflicts_with = "system")]
+    #[arg(long, default_value = "true", conflicts_with = "system")]
     mirror: Boolean,
 
-    #[arg(long, env, default_value = ".", conflicts_with = "system")]
+    #[arg(long, default_value = ".", conflicts_with = "system")]
     pub storage_path: String,
 }
 

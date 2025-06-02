@@ -825,7 +825,7 @@ fn read_storage_directory() -> io::Result<String> {
     }
     Err(io::Error::new(
         io::ErrorKind::NotFound,
-        "STORAGE directory not found",
+        "STORAGE directory not found in configuration",
     ))
 }
 
@@ -971,10 +971,13 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WebSocketSession 
                         ctx.text(response);
                     }
                     Err(e) => {
-                        error!("Directory Not Defined: {}", e);
-                        let response = serde_json::to_string(
-                            &json!({"error": "Directory Not Defined", "dir_name": directory.clone()}),
-                        )
+                        debug!("Directory not found: {}", e);
+                        let response = serde_json::to_string(&DirectoryResponse {
+                            dir_name: directory.clone(),
+                            files: None,
+                            message: Some("No MCAP files found".to_string()),
+                            topics: None,
+                        })
                         .unwrap();
                         ctx.text(response);
                     }
@@ -1034,9 +1037,7 @@ async fn serve_config_page(
 
 async fn mcap_downloader(req: HttpRequest) -> impl Responder {
     let path: String = req.match_info().query("file").parse().unwrap();
-    let base_path = Path::new("/");
-
-    let file_path = base_path.join(&path);
+    let file_path = Path::new(&path);
 
     if !file_path
         .extension()

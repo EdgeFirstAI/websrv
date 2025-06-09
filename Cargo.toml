@@ -25,7 +25,7 @@ actix-web-actors = "4.3.0"
 actix-web-lab = "0.24.1"
 anyhow = "1.0.98"
 async-stream = "0.3.6"
-camino = "1.1.9"
+camino = "1.1.10"
 cdr = "0.2.4"
 chrono = "0.4.41"
 clap = { version = "4.5.39", features = ["derive", "env"] }
@@ -36,13 +36,13 @@ log = "0.4.27"
 mcap = "0.18.0"
 memmap = "0.7.0"
 mime = "0.3.17"
-openssl = { version = "0.10.72", features = ["vendored"] }
+openssl = { version = "0.10.73", features = ["vendored"] }
 percent-encoding = "2.3.1"
 pnet = "0.35.0"
 regex = "1.11.1"
 serde = "1.0.219"
 serde_json = "1.0.140"
-sysinfo = "0.35.1"
+sysinfo = "0.35.2"
 tokio = { version = "1.45.1", features = ["rt-multi-thread", "time", "io-std"] }
 uuid = { version = "1.17.0", features = ["v1"] }
 zenoh = "1.4.0"

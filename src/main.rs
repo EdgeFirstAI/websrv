@@ -825,7 +825,7 @@ fn read_storage_directory() -> io::Result<String> {
     }
     Err(io::Error::new(
         io::ErrorKind::NotFound,
-        "STORAGE directory not found",
+        "STORAGE directory not found in configuration",
     ))
 }
 
@@ -971,10 +971,13 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WebSocketSession 
                         ctx.text(response);
                     }
                     Err(e) => {
-                        error!("Directory Not Defined: {}", e);
-                        let response = serde_json::to_string(
-                            &json!({"error": "Directory Not Defined", "dir_name": directory.clone()}),
-                        )
+                        debug!("Directory not found: {}", e);
+                        let response = serde_json::to_string(&DirectoryResponse {
+                            dir_name: directory.clone(),
+                            files: None,
+                            message: Some("No MCAP files found".to_string()),
+                            topics: None,
+                        })
                         .unwrap();
                         ctx.text(response);
                     }
@@ -1034,9 +1037,7 @@ async fn serve_config_page(
 
 async fn mcap_downloader(req: HttpRequest) -> impl Responder {
     let path: String = req.match_info().query("file").parse().unwrap();
-    let base_path = Path::new("/");
-
-    let file_path = base_path.join(&path);
+    let file_path = Path::new(&path);
 
     if !file_path
         .extension()
@@ -1109,100 +1110,41 @@ struct StorageDetails {
     total_space: Option<FormattedSize>,
 }
 
-#[derive(Serialize)]
-struct StorageInfo {
-    internal: StorageDetails,
-    external: StorageDetails,
-    sd_card_present: bool,
-    sd_card_mounted: bool,
-    sd_card_formatted: bool,
-}
-
-async fn check_storage_availability() -> impl Responder {
-    let internal_path = Path::new("/");
-    let external_path = Path::new("/media/DATA");
-
-    let sd_card_present = std::fs::read_dir("/sys/block")
-        .map(|entries| {
-            entries.filter_map(Result::ok).any(|entry| {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                name_str == "mmcblk1"
-            })
-        })
-        .unwrap_or(false);
-
-    let sd_card_mounted = std::fs::read_to_string("/proc/mounts")
-        .map(|contents| {
-            contents.lines().any(|line| {
-                line.contains("/dev/mmcblk1p1")
-                    && (line.contains("/media/DATA") || line.contains("/var/rootdirs/media/DATA"))
-            })
-        })
-        .unwrap_or(false);
-
-    let sd_card_formatted = if sd_card_present {
-        std::fs::read_to_string("/proc/partitions")
-            .map(|contents| contents.contains("mmcblk1p1"))
-            .unwrap_or(false)
+async fn check_storage_availability(data: web::Data<ServerContext>) -> impl Responder {
+    let storage_dir = if data.args.system {
+        match read_storage_directory() {
+            Ok(dir) => dir,
+            Err(e) => {
+                error!("Error reading storage directory from config: {}", e);
+                return HttpResponse::InternalServerError().json(json!({
+                    "error": "Error reading storage directory from config"
+                }));
+            }
+        }
     } else {
-        false
+        data.args.storage_path.clone()
     };
 
-    let internal_details = StorageDetails {
-        path: "/home/torizon/recordings".to_string(),
-        exists: true,
-        available_space: std::fs::metadata(internal_path)
-            .and_then(|_| fs2::available_space(internal_path))
-            .ok()
-            .map(FormattedSize::from_bytes),
-        total_space: std::fs::metadata(internal_path)
-            .and_then(|_| fs2::total_space(internal_path))
-            .ok()
-            .map(FormattedSize::from_bytes),
+    let dir_path = Path::new(&storage_dir);
+
+    let exists = dir_path.exists();
+    let available_space = std::fs::metadata(dir_path)
+        .and_then(|_| fs2::available_space(dir_path))
+        .ok()
+        .map(FormattedSize::from_bytes);
+    let total_space = std::fs::metadata(dir_path)
+        .and_then(|_| fs2::total_space(dir_path))
+        .ok()
+        .map(FormattedSize::from_bytes);
+
+    let details = StorageDetails {
+        path: storage_dir,
+        exists,
+        available_space,
+        total_space,
     };
 
-    let external_details = StorageDetails {
-        path: external_path.to_string_lossy().to_string(),
-        exists: external_path.exists() && sd_card_mounted,
-        available_space: if sd_card_mounted {
-            let mount_path = Path::new("/var/rootdirs/media/DATA");
-            std::fs::metadata(mount_path)
-                .and_then(|_| fs2::available_space(mount_path))
-                .ok()
-                .map(FormattedSize::from_bytes)
-        } else {
-            None
-        },
-        total_space: if sd_card_mounted {
-            let mount_path = Path::new("/var/rootdirs/media/DATA");
-            std::fs::metadata(mount_path)
-                .and_then(|_| fs2::total_space(mount_path))
-                .ok()
-                .map(FormattedSize::from_bytes)
-        } else {
-            None
-        },
-    };
-
-    let storage_info = StorageInfo {
-        internal: internal_details,
-        external: external_details,
-        sd_card_present,
-        sd_card_mounted,
-        sd_card_formatted,
-    };
-
-    debug!(
-        "Storage info: internal={:?} external={:?} sd_present={:?} mounted={:?} formatted={:?}",
-        storage_info.internal.exists,
-        storage_info.external.exists,
-        storage_info.sd_card_present,
-        storage_info.sd_card_mounted,
-        storage_info.sd_card_formatted
-    );
-
-    HttpResponse::Ok().json(storage_info)
+    HttpResponse::Ok().json(details)
 }
 
 #[derive(Deserialize, Debug, Clone)]

@@ -1,3 +1,6 @@
+// Copyright 2025 Au-Zone Technologies Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 mod args;
 use crate::args::WebUISettings;
 use actix::prelude::*;

@@ -6,9 +6,9 @@ use crate::args::WebUISettings;
 use actix::prelude::*;
 use actix_files::{self as fs, NamedFile};
 use actix_web::{
-    App, HttpRequest, HttpResponse, HttpServer, Responder, Result,
     http::header::ContentLength,
     web::{self, Bytes},
+    App, HttpRequest, HttpResponse, HttpServer, Responder, Result,
 };
 use actix_web_actors::ws;
 use actix_web_lab::middleware::RedirectHttps;
@@ -30,7 +30,7 @@ use openssl::{
 use percent_encoding::percent_decode;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     fs::File,
@@ -39,9 +39,9 @@ use std::{
     process::{Child, Command},
     str::FromStr,
     sync::{
-        Arc, Mutex,
         atomic::{AtomicI64, Ordering},
-        mpsc::{Receiver, Sender, channel},
+        mpsc::{channel, Receiver, Sender},
+        Arc, Mutex,
     },
     thread,
     time::{Duration, UNIX_EPOCH},

@@ -105,21 +105,21 @@ jobs:
           mkdir -p release-assets
           
           # Copy x86_64 binary
-          if [ -f artifacts/packages-x86_64/edgefirst-camera-x86_64 ]; then
-            cp artifacts/packages-x86_64/edgefirst-camera-x86_64 \
-               release-assets/edgefirst-camera-v${{ needs.prepare-release.outputs.version }}-linux-x86_64
+          if [ -f artifacts/packages-x86_64/edgefirst-websrv-x86_64 ]; then
+            cp artifacts/packages-x86_64/edgefirst-websrv-x86_64 \
+               release-assets/edgefirst-websrv-v${{ needs.prepare-release.outputs.version }}-linux-x86_64
           fi
-          
+
           # Copy ARM64 binary
-          if [ -f artifacts/packages-aarch64/edgefirst-camera-aarch64 ]; then
-            cp artifacts/packages-aarch64/edgefirst-camera-aarch64 \
-               release-assets/edgefirst-camera-v${{ needs.prepare-release.outputs.version }}-linux-aarch64
+          if [ -f artifacts/packages-aarch64/edgefirst-websrv-aarch64 ]; then
+            cp artifacts/packages-aarch64/edgefirst-websrv-aarch64 \
+               release-assets/edgefirst-websrv-v${{ needs.prepare-release.outputs.version }}-linux-aarch64
           fi
-          
+
           # Copy SBOM
           if [ -f artifacts/sbom/sbom.json ]; then
             cp artifacts/sbom/sbom.json \
-               release-assets/edgefirst-camera-v${{ needs.prepare-release.outputs.version }}-sbom.json
+               release-assets/edgefirst-websrv-v${{ needs.prepare-release.outputs.version }}-sbom.json
           fi
           
           echo "Release assets prepared:"
@@ -128,36 +128,36 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: EdgeFirst Camera v${{ needs.prepare-release.outputs.version }}
+          name: EdgeFirst WebSrv v${{ needs.prepare-release.outputs.version }}
           body: |
-            # EdgeFirst Camera v${{ needs.prepare-release.outputs.version }}
-            
+            # EdgeFirst WebSrv v${{ needs.prepare-release.outputs.version }}
+
             ## Downloads
-            
-            - **Linux x86_64**: `edgefirst-camera-v${{ needs.prepare-release.outputs.version }}-linux-x86_64`
-            - **Linux ARM64**: `edgefirst-camera-v${{ needs.prepare-release.outputs.version }}-linux-aarch64`
-            - **SBOM**: `edgefirst-camera-v${{ needs.prepare-release.outputs.version }}-sbom.json`
-            
+
+            - **Linux x86_64**: `edgefirst-websrv-v${{ needs.prepare-release.outputs.version }}-linux-x86_64`
+            - **Linux ARM64**: `edgefirst-websrv-v${{ needs.prepare-release.outputs.version }}-linux-aarch64`
+            - **SBOM**: `edgefirst-websrv-v${{ needs.prepare-release.outputs.version }}-sbom.json`
+
             ## Installation
-            
+
             ```bash
             # Download binary (replace URL with your platform)
-            wget https://github.com/EdgeFirstAI/camera/releases/download/v${{ needs.prepare-release.outputs.version }}/edgefirst-camera-v${{ needs.prepare-release.outputs.version }}-linux-aarch64
-            
+            wget https://github.com/EdgeFirstAI/websrv/releases/download/v${{ needs.prepare-release.outputs.version }}/edgefirst-websrv-v${{ needs.prepare-release.outputs.version }}-linux-aarch64
+
             # Make executable
-            chmod +x edgefirst-camera-v${{ needs.prepare-release.outputs.version }}-linux-aarch64
-            
+            chmod +x edgefirst-websrv-v${{ needs.prepare-release.outputs.version }}-linux-aarch64
+
             # Run
-            ./edgefirst-camera-v${{ needs.prepare-release.outputs.version }}-linux-aarch64 --jpeg --h264
+            ./edgefirst-websrv-v${{ needs.prepare-release.outputs.version }}-linux-aarch64 --help
             ```
-            
+
             ## What's Changed
-            
+
             ${{ needs.prepare-release.outputs.changelog }}
-            
+
             ---
-            
-            **Full Documentation**: https://github.com/EdgeFirstAI/camera#readme
+
+            **Full Documentation**: https://github.com/EdgeFirstAI/websrv#readme
           files: |
             release-assets/*
           draft: false

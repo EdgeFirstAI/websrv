@@ -19,30 +19,30 @@ debug = true
 
 [dependencies]
 actix = "0.13.5"
-actix-files = "0.6.6"
-actix-web = { version = "4.11.0", features = ["openssl"] }
+actix-files = "0.6.9"
+actix-web = { version = "4.12.1", features = ["openssl"] }
 actix-web-actors = "4.3.0"
-actix-web-lab = "0.24.1"
-anyhow = "1.0.98"
+actix-web-lab = "0.24.3"
+anyhow = "1.0.100"
 async-stream = "0.3.6"
-camino = "1.1.10"
+camino = "1.2.1"
 cdr = "0.2.4"
-chrono = "0.4.41"
-clap = { version = "4.5.39", features = ["derive", "env"] }
+chrono = "0.4.42"
+clap = { version = "4.5.53", features = ["derive", "env"] }
 env_logger = "0.11.8"
 fs2 = "0.4.3"
-hostname = "0.4.1"
-log = "0.4.27"
-mcap = "0.18.0"
+hostname = "0.4.2"
+log = "0.4.28"
+mcap = "0.23.4"
 memmap = "0.7.0"
 mime = "0.3.17"
-openssl = { version = "0.10.73", features = ["vendored"] }
-percent-encoding = "2.3.1"
+openssl = { version = "0.10.75", features = ["vendored"] }
+percent-encoding = "2.3.2"
 pnet = "0.35.0"
-regex = "1.11.1"
+regex = "1.12.2"
 serde = "1.0.219"
 serde_json = "1.0.140"
-sysinfo = "0.35.2"
-tokio = { version = "1.45.1", features = ["rt-multi-thread", "time", "io-std"] }
-uuid = { version = "1.17.0", features = ["v1"] }
-zenoh = "1.4.0"
+sysinfo = "0.37.2"
+tokio = { version = "1.48.0", features = ["rt-multi-thread", "time", "io-std"] }
+uuid = { version = "1.18.1", features = ["v1"] }
+zenoh = "1.6.2"

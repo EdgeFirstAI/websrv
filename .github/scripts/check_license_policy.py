@@ -34,7 +34,8 @@ from typing import Set, List, Dict, Tuple
 LICENSE_OVERRIDES = {
     "sublime_fuzzy@0.7.0": "Apache-2.0",  # Confirmed from upstream repo
     "dma-buf@0.4.0": "MIT",  # Confirmed from https://github.com/mripard/dma-buf
-    "dma-heap@0.4.1": "MIT"  # Confirmed from https://github.com/mripard/dma-heap
+    "dma-heap@0.4.1": "MIT",  # Confirmed from https://github.com/mripard/dma-heap
+    "owo-colors@3.5.0": "MIT"  # MIT per crates.io - cargo-cyclonedx reports both MIT and Unknown
 }
 
 # Proprietary licenses requiring conditional approval
@@ -123,23 +124,27 @@ def extract_license_from_component(component: Dict) -> Set[str]:
         return licenses
 
     for lic_entry in component["licenses"]:
-        # Check for direct license ID or name
-        if "license" in lic_entry:
-            if "id" in lic_entry["license"]:
-                licenses.add(lic_entry["license"]["id"])
-            # Also check for license name (for proprietary/non-SPDX licenses)
-            elif "name" in lic_entry["license"]:
-                licenses.add(lic_entry["license"]["name"])
-
-        # Check for SPDX expression
+        # Check for SPDX expression first (more reliable)
         if "expression" in lic_entry:
             expr = lic_entry["expression"]
             # Parse expression (simplified - splits on OR/AND/WITH)
             parts = expr.replace("(", "").replace(")", "")
             parts = parts.replace(" OR ", " ").replace(" AND ", " ").replace(" WITH ", " ")
             for part in parts.split():
-                if part and not part.isspace():
+                if part and not part.isspace() and part != "Unknown":
                     licenses.add(part)
+        
+        # Check for direct license ID or name (but skip Unknown licenses)
+        if "license" in lic_entry:
+            if "id" in lic_entry["license"]:
+                lic_id = lic_entry["license"]["id"]
+                if lic_id != "Unknown":
+                    licenses.add(lic_id)
+            # Also check for license name (for proprietary/non-SPDX licenses)
+            elif "name" in lic_entry["license"]:
+                lic_name = lic_entry["license"]["name"]
+                if lic_name != "Unknown":
+                    licenses.add(lic_name)
 
     return licenses
 

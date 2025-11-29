@@ -29,6 +29,7 @@ help:
 	@echo "  make lint           - Run clippy with strict settings"
 	@echo "  make build          - Build with coverage enabled (for testing)"
 	@echo "  make test           - Run tests with coverage (nextest + llvm-cov)"
+	@echo "  make sbom           - Generate SBOM and validate licenses"
 	@echo "  make verify-version - Verify version consistency"
 	@echo "  make pre-release    - Complete pre-release validation"
 	@echo "  make clean          - Remove build artifacts"
@@ -76,6 +77,14 @@ test: build
 
 	@echo "✓ Tests passed with coverage"
 	@echo "Coverage report: target/rust-coverage.lcov"
+
+# Generate SBOM and validate licenses
+.PHONY: sbom
+sbom:
+	@echo "Generating SBOM and validating license compliance..."
+	bash .github/scripts/generate_sbom.sh
+	@echo "✓ SBOM generated and validated"
+	@echo "SBOM file: sbom.json"
 
 # Verify version consistency
 .PHONY: verify-version

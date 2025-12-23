@@ -17,7 +17,7 @@ use args::Args;
 use async_stream::stream;
 use camino::Utf8Path;
 use cdr::{CdrLe, Infinite};
-use chrono::DateTime;
+use chrono::{DateTime, Utc};
 use clap::Parser;
 use log::{debug, error, info};
 use mcap::Summary;
@@ -31,6 +31,8 @@ use percent_encoding::percent_decode;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use uuid::Uuid;
+use edgefirst_client::{Client, Progress, ProjectID, SnapshotID};
 use std::{
     collections::HashMap,
     fs::File,
@@ -47,7 +49,12 @@ use std::{
     time::{Duration, UNIX_EPOCH},
 };
 use sysinfo::System;
-use tokio::{io::AsyncReadExt as _, runtime::Handle};
+use tokio::{
+    io::AsyncReadExt as _,
+    runtime::Handle,
+    sync::{mpsc, RwLock},
+    task::JoinHandle,
+};
 
 #[derive(Serialize)]
 struct FileInfo {
@@ -92,6 +99,749 @@ struct ThreadState {
 #[derive(Deserialize)]
 struct ConfigPath {
     service: String,
+}
+
+// ============================================================================
+// Upload Manager Data Structures
+// ============================================================================
+
+/// Unique identifier for an upload task
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct UploadId(Uuid);
+
+impl UploadId {
+    fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+/// Upload mode selection
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum UploadMode {
+    Basic,
+    Extended {
+        project_id: u64,
+        labels: Vec<String>,
+        dataset_name: Option<String>,
+        dataset_description: Option<String>,
+    },
+}
+
+/// Task lifecycle states
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UploadState {
+    Queued,      // Created, not started
+    Uploading,   // Uploading MCAP
+    Processing,  // Auto-labeling (Extended mode only)
+    Completed,   // Success
+    Failed,      // Error occurred
+}
+
+/// In-memory task representation
+pub struct UploadTask {
+    pub id: UploadId,
+    pub mcap_path: PathBuf,
+    pub mode: UploadMode,
+    pub state: UploadState,
+    pub progress: f32,  // 0.0 to 100.0
+    pub message: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub snapshot_id: Option<u64>,
+    pub dataset_id: Option<u64>,
+    pub error: Option<String>,
+    #[allow(dead_code)]
+    pub task_handle: Option<JoinHandle<()>>,
+}
+
+/// Persistent status file format (.upload-status.json)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UploadStatus {
+    pub upload_id: UploadId,
+    pub mcap_path: PathBuf,
+    pub mode: UploadMode,
+    pub state: UploadState,
+    pub progress: f32,
+    pub message: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub snapshot_id: Option<u64>,
+    pub dataset_id: Option<u64>,
+    pub error: Option<String>,
+}
+
+impl From<&UploadTask> for UploadStatus {
+    fn from(task: &UploadTask) -> Self {
+        Self {
+            upload_id: task.id,
+            mcap_path: task.mcap_path.clone(),
+            mode: task.mode.clone(),
+            state: task.state,
+            progress: task.progress,
+            message: task.message.clone(),
+            created_at: task.created_at,
+            updated_at: task.updated_at,
+            snapshot_id: task.snapshot_id,
+            dataset_id: task.dataset_id,
+            error: task.error.clone(),
+        }
+    }
+}
+
+/// Serializable task info for API responses
+#[derive(Debug, Clone, Serialize)]
+pub struct UploadTaskInfo {
+    pub upload_id: UploadId,
+    pub mcap_path: PathBuf,
+    pub mode: UploadMode,
+    pub state: UploadState,
+    pub progress: f32,
+    pub message: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub snapshot_id: Option<u64>,
+    pub dataset_id: Option<u64>,
+    pub error: Option<String>,
+}
+
+impl From<&UploadTask> for UploadTaskInfo {
+    fn from(task: &UploadTask) -> Self {
+        Self {
+            upload_id: task.id,
+            mcap_path: task.mcap_path.clone(),
+            mode: task.mode.clone(),
+            state: task.state,
+            progress: task.progress,
+            message: task.message.clone(),
+            created_at: task.created_at,
+            updated_at: task.updated_at,
+            snapshot_id: task.snapshot_id,
+            dataset_id: task.dataset_id,
+            error: task.error.clone(),
+        }
+    }
+}
+
+/// Upload Manager - Manages upload tasks and EdgeFirst Studio client
+pub struct UploadManager {
+    tasks: Arc<RwLock<HashMap<UploadId, UploadTask>>>,
+    client: Arc<RwLock<Option<Client>>>,
+    storage_path: PathBuf,
+    ws_broadcaster: Arc<MessageStream>,
+}
+
+impl UploadManager {
+    /// Create a new UploadManager
+    pub fn new(storage_path: PathBuf, broadcaster: Arc<MessageStream>) -> Self {
+        Self {
+            tasks: Arc::new(RwLock::new(HashMap::new())),
+            client: Arc::new(RwLock::new(None)),
+            storage_path,
+            ws_broadcaster: broadcaster,
+        }
+    }
+
+    /// Initialize the upload manager and scan for incomplete uploads (power loss recovery)
+    pub async fn initialize(&self) -> anyhow::Result<()> {
+        info!(
+            "Initializing UploadManager, scanning for incomplete uploads in {:?}",
+            self.storage_path
+        );
+
+        // Scan for existing status files
+        let status_files = Self::scan_status_files(&self.storage_path).await?;
+        info!("Found {} upload status files", status_files.len());
+
+        let mut recovered_count = 0;
+        let mut tasks = self.tasks.write().await;
+
+        for status_path in status_files {
+            match Self::read_status_file(&status_path).await {
+                Ok(status) => {
+                    // Check if the upload was incomplete (not completed or failed)
+                    let needs_recovery = matches!(
+                        status.state,
+                        UploadState::Queued | UploadState::Uploading | UploadState::Processing
+                    );
+
+                    if needs_recovery {
+                        info!(
+                            "Recovering incomplete upload {} for {:?} (was {:?})",
+                            status.upload_id.0, status.mcap_path, status.state
+                        );
+
+                        // Create a failed task from the status
+                        let task = UploadTask {
+                            id: status.upload_id,
+                            mcap_path: status.mcap_path.clone(),
+                            mode: status.mode,
+                            state: UploadState::Failed,
+                            progress: status.progress,
+                            message: "Server restart - upload incomplete".to_string(),
+                            created_at: status.created_at,
+                            updated_at: Utc::now(),
+                            snapshot_id: status.snapshot_id,
+                            dataset_id: status.dataset_id,
+                            error: Some("Upload interrupted by server restart".to_string()),
+                            task_handle: None,
+                        };
+
+                        // Update the status file
+                        if let Err(e) = Self::write_status_file(&task).await {
+                            error!("Failed to update status file for recovered upload: {}", e);
+                        }
+
+                        tasks.insert(status.upload_id, task);
+                        recovered_count += 1;
+                    } else {
+                        // Load completed/failed uploads into memory for status tracking
+                        let task = UploadTask {
+                            id: status.upload_id,
+                            mcap_path: status.mcap_path,
+                            mode: status.mode,
+                            state: status.state,
+                            progress: status.progress,
+                            message: status.message,
+                            created_at: status.created_at,
+                            updated_at: status.updated_at,
+                            snapshot_id: status.snapshot_id,
+                            dataset_id: status.dataset_id,
+                            error: status.error,
+                            task_handle: None,
+                        };
+                        tasks.insert(status.upload_id, task);
+                    }
+                }
+                Err(e) => {
+                    error!("Failed to read status file {:?}: {}", status_path, e);
+                }
+            }
+        }
+
+        if recovered_count > 0 {
+            info!(
+                "Recovered {} incomplete uploads (marked as failed)",
+                recovered_count
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Authenticate with EdgeFirst Studio
+    pub async fn authenticate(&self, username: &str, password: &str) -> anyhow::Result<()> {
+        info!("Authenticating with EdgeFirst Studio as {}", username);
+
+        // Create new client and authenticate
+        let client = Client::new()?;
+        let authenticated_client = client
+            .with_login(username, password)
+            .await
+            .map_err(|e| anyhow::anyhow!("Authentication failed: {}", e))?;
+
+        // Store authenticated client
+        let mut client_lock = self.client.write().await;
+        *client_lock = Some(authenticated_client);
+
+        info!("Successfully authenticated with EdgeFirst Studio");
+        Ok(())
+    }
+
+    /// Logout from EdgeFirst Studio
+    pub async fn logout(&self) -> anyhow::Result<()> {
+        info!("Logging out from EdgeFirst Studio");
+        let mut client_lock = self.client.write().await;
+        *client_lock = None;
+        Ok(())
+    }
+
+    /// Get the username of the authenticated user
+    pub async fn get_username(&self) -> Option<String> {
+        let client_lock = self.client.read().await;
+        if let Some(client) = client_lock.as_ref() {
+            client.username().await.ok()
+        } else {
+            None
+        }
+    }
+
+    // =========================================================================
+    // Status File Management
+    // =========================================================================
+
+    /// Generate the status file path for a given MCAP file
+    /// Returns: /path/to/file.mcap.upload-status.json
+    fn get_status_file_path(mcap_path: &Path) -> PathBuf {
+        let mut status_path = mcap_path.to_path_buf();
+        let new_extension = match mcap_path.extension() {
+            Some(ext) => format!("{}.upload-status.json", ext.to_string_lossy()),
+            None => "upload-status.json".to_string(),
+        };
+        status_path.set_extension(new_extension);
+        status_path
+    }
+
+    /// Write the upload status to a JSON file alongside the MCAP file
+    async fn write_status_file(task: &UploadTask) -> anyhow::Result<()> {
+        let status_path = Self::get_status_file_path(&task.mcap_path);
+        let status: UploadStatus = task.into();
+        let json = serde_json::to_string_pretty(&status)?;
+
+        // Use sync file I/O in a blocking task to avoid holding locks across await
+        tokio::task::spawn_blocking(move || {
+            std::fs::write(&status_path, json)
+                .map_err(|e| anyhow::anyhow!("Failed to write status file {:?}: {}", status_path, e))
+        })
+        .await??;
+
+        Ok(())
+    }
+
+    /// Read the upload status from a JSON file
+    async fn read_status_file(path: &Path) -> anyhow::Result<UploadStatus> {
+        let path = path.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let content = std::fs::read_to_string(&path)
+                .map_err(|e| anyhow::anyhow!("Failed to read status file {:?}: {}", path, e))?;
+            let status: UploadStatus = serde_json::from_str(&content)
+                .map_err(|e| anyhow::anyhow!("Failed to parse status file {:?}: {}", path, e))?;
+            Ok(status)
+        })
+        .await?
+    }
+
+    /// Scan storage directory for upload status files
+    async fn scan_status_files(storage_path: &Path) -> anyhow::Result<Vec<PathBuf>> {
+        let storage_path = storage_path.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let mut status_files = Vec::new();
+
+            fn scan_dir(dir: &Path, status_files: &mut Vec<PathBuf>) -> std::io::Result<()> {
+                if dir.is_dir() {
+                    for entry in std::fs::read_dir(dir)? {
+                        let entry = entry?;
+                        let path = entry.path();
+                        if path.is_dir() {
+                            scan_dir(&path, status_files)?;
+                        } else if path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().ends_with(".upload-status.json"))
+                            .unwrap_or(false)
+                        {
+                            status_files.push(path);
+                        }
+                    }
+                }
+                Ok(())
+            }
+
+            scan_dir(&storage_path, &mut status_files)
+                .map_err(|e| anyhow::anyhow!("Failed to scan storage directory: {}", e))?;
+
+            Ok(status_files)
+        })
+        .await?
+    }
+
+    /// Check if authenticated
+    pub async fn is_authenticated(&self) -> bool {
+        let client_lock = self.client.read().await;
+        client_lock.is_some()
+    }
+
+    /// Get a clone of the authenticated client
+    async fn get_client(&self) -> Option<Client> {
+        let client_lock = self.client.read().await;
+        client_lock.clone()
+    }
+
+    /// Update task state and write status file
+    async fn update_task_state(
+        &self,
+        id: UploadId,
+        state: UploadState,
+        progress: f32,
+        message: &str,
+        snapshot_id: Option<u64>,
+        dataset_id: Option<u64>,
+        error: Option<String>,
+    ) -> anyhow::Result<()> {
+        let status: UploadStatus = {
+            let mut tasks = self.tasks.write().await;
+            if let Some(task) = tasks.get_mut(&id) {
+                task.state = state;
+                task.progress = progress;
+                task.message = message.to_string();
+                task.updated_at = Utc::now();
+                if snapshot_id.is_some() {
+                    task.snapshot_id = snapshot_id;
+                }
+                if dataset_id.is_some() {
+                    task.dataset_id = dataset_id;
+                }
+                if error.is_some() {
+                    task.error = error;
+                }
+                // Convert to UploadStatus for file writing
+                UploadStatus::from(&*task)
+            } else {
+                return Err(anyhow::anyhow!("Task {} not found", id.0));
+            }
+        };
+
+        // Write status file
+        Self::write_status_file_from_status(&status).await?;
+
+        // Broadcast progress via WebSocket
+        self.broadcast_progress(&status);
+
+        Ok(())
+    }
+
+    /// Broadcast upload progress to all connected WebSocket clients
+    fn broadcast_progress(&self, status: &UploadStatus) {
+        match serde_json::to_vec(status) {
+            Ok(json) => {
+                self.ws_broadcaster.broadcast(BroadcastMessage(json));
+            }
+            Err(e) => {
+                error!("Failed to serialize upload status for broadcast: {}", e);
+            }
+        }
+    }
+
+    /// Write the upload status to a JSON file (from UploadStatus directly)
+    async fn write_status_file_from_status(status: &UploadStatus) -> anyhow::Result<()> {
+        let status_path = Self::get_status_file_path(&status.mcap_path);
+        let json = serde_json::to_string_pretty(&status)?;
+
+        // Use sync file I/O in a blocking task
+        let status_path_clone = status_path.clone();
+        tokio::task::spawn_blocking(move || {
+            std::fs::write(&status_path_clone, json)
+                .map_err(|e| anyhow::anyhow!("Failed to write status file {:?}: {}", status_path_clone, e))
+        })
+        .await??;
+
+        Ok(())
+    }
+
+    /// Start a new upload task
+    pub async fn start_upload(
+        self: &Arc<Self>,
+        mcap_path: PathBuf,
+        mode: UploadMode,
+    ) -> anyhow::Result<UploadId> {
+        let upload_id = UploadId::new();
+        info!("Starting upload task {} for {:?}", upload_id.0, mcap_path);
+
+        // Validate MCAP file exists
+        if !mcap_path.exists() {
+            return Err(anyhow::anyhow!("MCAP file not found: {:?}", mcap_path));
+        }
+
+        // Validate file is within storage_path (prevent path traversal)
+        let canonical_mcap = mcap_path
+            .canonicalize()
+            .map_err(|e| anyhow::anyhow!("Failed to resolve MCAP path: {}", e))?;
+        let canonical_storage = self
+            .storage_path
+            .canonicalize()
+            .unwrap_or_else(|_| self.storage_path.clone());
+        if !canonical_mcap.starts_with(&canonical_storage) {
+            return Err(anyhow::anyhow!(
+                "MCAP file is not within the storage directory"
+            ));
+        }
+
+        // Verify we have an authenticated client
+        let client = self
+            .get_client()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Not authenticated with EdgeFirst Studio"))?;
+
+        // Create new task
+        let task = UploadTask {
+            id: upload_id,
+            mcap_path: mcap_path.clone(),
+            mode: mode.clone(),
+            state: UploadState::Queued,
+            progress: 0.0,
+            message: "Queued".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            snapshot_id: None,
+            dataset_id: None,
+            error: None,
+            task_handle: None,
+        };
+
+        // Write initial status file
+        Self::write_status_file(&task).await?;
+
+        // Store task
+        {
+            let mut tasks = self.tasks.write().await;
+            tasks.insert(upload_id, task);
+        }
+
+        // Spawn background worker task
+        let manager = Arc::clone(self);
+        let task_handle = tokio::spawn(async move {
+            if let Err(e) = upload_worker(manager, upload_id, client, mcap_path, mode).await {
+                error!("Upload worker failed for task {}: {}", upload_id.0, e);
+            }
+        });
+
+        // Store the task handle for potential cancellation
+        {
+            let mut tasks = self.tasks.write().await;
+            if let Some(task) = tasks.get_mut(&upload_id) {
+                task.task_handle = Some(task_handle);
+            }
+        }
+
+        Ok(upload_id)
+    }
+
+    /// List all upload tasks
+    pub async fn list_uploads(&self) -> Vec<UploadTaskInfo> {
+        let tasks = self.tasks.read().await;
+        tasks.values().map(|t| t.into()).collect()
+    }
+
+    /// Get a specific upload task
+    pub async fn get_upload(&self, id: UploadId) -> Option<UploadTaskInfo> {
+        let tasks = self.tasks.read().await;
+        tasks.get(&id).map(|t| t.into())
+    }
+
+    /// Cancel an upload task
+    pub async fn cancel_upload(&self, id: UploadId) -> anyhow::Result<()> {
+        info!("Cancelling upload task {}", id.0);
+
+        let task = {
+            let mut tasks = self.tasks.write().await;
+            if let Some(task) = tasks.get_mut(&id) {
+                // Abort the task handle if it's running
+                if let Some(handle) = task.task_handle.take() {
+                    handle.abort();
+                    info!("Aborted upload task {}", id.0);
+                }
+                task.state = UploadState::Failed;
+                task.error = Some("Cancelled by user".to_string());
+                task.message = "Cancelled by user".to_string();
+                task.updated_at = Utc::now();
+                // Convert to UploadStatus for file writing
+                UploadStatus::from(&*task)
+            } else {
+                return Err(anyhow::anyhow!("Upload task {} not found", id.0));
+            }
+        };
+
+        // Write updated status file
+        Self::write_status_file_from_status(&task).await?;
+
+        Ok(())
+    }
+}
+
+/// Background upload worker function
+/// Handles the actual upload to EdgeFirst Studio
+async fn upload_worker(
+    manager: Arc<UploadManager>,
+    upload_id: UploadId,
+    client: Client,
+    mcap_path: PathBuf,
+    mode: UploadMode,
+) -> anyhow::Result<()> {
+    info!(
+        "Upload worker started for task {} - {:?}",
+        upload_id.0, mcap_path
+    );
+
+    // Update state to Uploading
+    manager
+        .update_task_state(
+            upload_id,
+            UploadState::Uploading,
+            0.0,
+            "Uploading to EdgeFirst Studio...",
+            None,
+            None,
+            None,
+        )
+        .await?;
+
+    // Create progress channel
+    let (progress_tx, mut progress_rx) = mpsc::channel::<Progress>(100);
+
+    // Spawn a task to monitor progress
+    let progress_manager = Arc::clone(&manager);
+    let progress_upload_id = upload_id;
+    let progress_handle = tokio::spawn(async move {
+        while let Some(progress) = progress_rx.recv().await {
+            let percentage = if progress.total > 0 {
+                (progress.current as f32 / progress.total as f32) * 100.0
+            } else {
+                0.0
+            };
+            let message = format!(
+                "Uploading... {:.1}% ({}/{})",
+                percentage, progress.current, progress.total
+            );
+            if let Err(e) = progress_manager
+                .update_task_state(
+                    progress_upload_id,
+                    UploadState::Uploading,
+                    percentage,
+                    &message,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+            {
+                error!("Failed to update progress: {}", e);
+            }
+        }
+    });
+
+    // Perform the upload
+    let mcap_path_str = mcap_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Invalid MCAP path"))?;
+
+    let snapshot = match client.create_snapshot(mcap_path_str, Some(progress_tx)).await {
+        Ok(snapshot) => {
+            info!(
+                "Upload completed for task {} - Snapshot ID: {}",
+                upload_id.0,
+                snapshot.id().value()
+            );
+            snapshot
+        }
+        Err(e) => {
+            error!("Upload failed for task {}: {}", upload_id.0, e);
+            manager
+                .update_task_state(
+                    upload_id,
+                    UploadState::Failed,
+                    0.0,
+                    "Upload failed",
+                    None,
+                    None,
+                    Some(format!("Upload failed: {}", e)),
+                )
+                .await?;
+            return Err(anyhow::anyhow!("Upload failed: {}", e));
+        }
+    };
+
+    // Wait for progress task to complete
+    let _ = progress_handle.await;
+
+    let snapshot_id = snapshot.id().value();
+
+    // Handle Extended mode - restore snapshot to dataset
+    match &mode {
+        UploadMode::Basic => {
+            // Basic mode complete
+            manager
+                .update_task_state(
+                    upload_id,
+                    UploadState::Completed,
+                    100.0,
+                    &format!("Upload completed - Snapshot ID: {}", snapshot_id),
+                    Some(snapshot_id),
+                    None,
+                    None,
+                )
+                .await?;
+            info!(
+                "Task {} completed (Basic mode) - Snapshot ID: {}",
+                upload_id.0, snapshot_id
+            );
+        }
+        UploadMode::Extended {
+            project_id,
+            labels,
+            dataset_name,
+            dataset_description,
+        } => {
+            // Update state to Processing
+            manager
+                .update_task_state(
+                    upload_id,
+                    UploadState::Processing,
+                    100.0,
+                    "Processing - Restoring snapshot to dataset...",
+                    Some(snapshot_id),
+                    None,
+                    None,
+                )
+                .await?;
+
+            // Restore snapshot to dataset with auto-labeling
+            let result = client
+                .restore_snapshot(
+                    ProjectID::from(*project_id),
+                    SnapshotID::from(snapshot_id),
+                    &[], // All topics
+                    labels,
+                    false, // autodepth
+                    dataset_name.as_deref(),
+                    dataset_description.as_deref(),
+                )
+                .await;
+
+            match result {
+                Ok(restore_result) => {
+                    let dataset_id = restore_result.dataset_id.value();
+                    manager
+                        .update_task_state(
+                            upload_id,
+                            UploadState::Completed,
+                            100.0,
+                            &format!(
+                                "Completed - Snapshot: {}, Dataset: {}",
+                                snapshot_id, dataset_id
+                            ),
+                            Some(snapshot_id),
+                            Some(dataset_id),
+                            None,
+                        )
+                        .await?;
+                    info!(
+                        "Task {} completed (Extended mode) - Snapshot: {}, Dataset: {}",
+                        upload_id.0, snapshot_id, dataset_id
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        "Snapshot restore failed for task {}: {}",
+                        upload_id.0, e
+                    );
+                    manager
+                        .update_task_state(
+                            upload_id,
+                            UploadState::Failed,
+                            100.0,
+                            "Snapshot uploaded but restore failed",
+                            Some(snapshot_id),
+                            None,
+                            Some(format!("Restore failed: {}", e)),
+                        )
+                        .await?;
+                    return Err(anyhow::anyhow!("Restore failed: {}", e));
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 const SERVER_PEM: &[u8] = include_bytes!("../server.pem");
@@ -1008,6 +1758,296 @@ struct ServerContext {
     args: Args,
     err_stream: Arc<MessageStream>,
     err_count: AtomicI64,
+    upload_manager: Arc<UploadManager>,
+    upload_progress_stream: Arc<MessageStream>,
+}
+
+// ============================================================================
+// Authentication API Handlers
+// ============================================================================
+
+#[derive(Deserialize)]
+struct AuthRequest {
+    username: String,
+    password: String,
+}
+
+#[derive(Serialize)]
+struct AuthResponse {
+    status: String,
+    message: String,
+}
+
+#[derive(Serialize)]
+struct AuthStatusResponse {
+    authenticated: bool,
+    username: Option<String>,
+}
+
+/// POST /api/auth/login - Authenticate with EdgeFirst Studio
+async fn auth_login(
+    body: web::Json<AuthRequest>,
+    data: web::Data<ServerContext>,
+) -> impl Responder {
+    info!("Login request received for user: {}", body.username);
+
+    match data
+        .upload_manager
+        .authenticate(&body.username, &body.password)
+        .await
+    {
+        Ok(()) => {
+            info!("User {} authenticated successfully", body.username);
+            HttpResponse::Ok().json(AuthResponse {
+                status: "ok".to_string(),
+                message: "Authentication successful".to_string(),
+            })
+        }
+        Err(e) => {
+            error!("Authentication failed for user {}: {}", body.username, e);
+            HttpResponse::Unauthorized().json(AuthResponse {
+                status: "error".to_string(),
+                message: format!("Authentication failed: {}", e),
+            })
+        }
+    }
+}
+
+/// GET /api/auth/status - Check authentication status
+async fn auth_status(data: web::Data<ServerContext>) -> impl Responder {
+    let is_authenticated = data.upload_manager.is_authenticated().await;
+    let username = data.upload_manager.get_username().await;
+
+    HttpResponse::Ok().json(AuthStatusResponse {
+        authenticated: is_authenticated,
+        username,
+    })
+}
+
+/// POST /api/auth/logout - Logout from EdgeFirst Studio
+async fn auth_logout(data: web::Data<ServerContext>) -> impl Responder {
+    match data.upload_manager.logout().await {
+        Ok(()) => {
+            info!("User logged out successfully");
+            HttpResponse::Ok().json(AuthResponse {
+                status: "ok".to_string(),
+                message: "Logged out successfully".to_string(),
+            })
+        }
+        Err(e) => {
+            error!("Logout failed: {}", e);
+            HttpResponse::InternalServerError().json(AuthResponse {
+                status: "error".to_string(),
+                message: format!("Logout failed: {}", e),
+            })
+        }
+    }
+}
+
+// ============================================================================
+// Upload API Handlers
+// ============================================================================
+
+#[derive(Deserialize)]
+struct StartUploadRequest {
+    mcap_path: String,
+    mode: UploadMode,
+}
+
+#[derive(Serialize)]
+struct StartUploadResponse {
+    upload_id: UploadId,
+    status: String,
+}
+
+#[derive(Serialize)]
+struct UploadErrorResponse {
+    error: String,
+}
+
+/// POST /api/uploads - Start a new upload
+async fn start_upload_handler(
+    body: web::Json<StartUploadRequest>,
+    data: web::Data<ServerContext>,
+) -> impl Responder {
+    info!("Start upload request for: {}", body.mcap_path);
+
+    let mcap_path = PathBuf::from(&body.mcap_path);
+
+    match data
+        .upload_manager
+        .start_upload(mcap_path, body.mode.clone())
+        .await
+    {
+        Ok(upload_id) => {
+            info!("Upload started with ID: {}", upload_id.0);
+            HttpResponse::Accepted().json(StartUploadResponse {
+                upload_id,
+                status: "queued".to_string(),
+            })
+        }
+        Err(e) => {
+            error!("Failed to start upload: {}", e);
+            HttpResponse::BadRequest().json(UploadErrorResponse {
+                error: format!("{}", e),
+            })
+        }
+    }
+}
+
+/// GET /api/uploads - List all uploads
+async fn list_uploads_handler(data: web::Data<ServerContext>) -> impl Responder {
+    let uploads = data.upload_manager.list_uploads().await;
+    HttpResponse::Ok().json(uploads)
+}
+
+/// GET /api/uploads/{id} - Get a specific upload
+async fn get_upload_handler(
+    path: web::Path<String>,
+    data: web::Data<ServerContext>,
+) -> impl Responder {
+    let id_str = path.into_inner();
+
+    // Parse the UUID
+    match Uuid::parse_str(&id_str) {
+        Ok(uuid) => {
+            let upload_id = UploadId(uuid);
+            match data.upload_manager.get_upload(upload_id).await {
+                Some(upload) => HttpResponse::Ok().json(upload),
+                None => HttpResponse::NotFound().json(UploadErrorResponse {
+                    error: "Upload not found".to_string(),
+                }),
+            }
+        }
+        Err(_) => HttpResponse::BadRequest().json(UploadErrorResponse {
+            error: "Invalid upload ID format".to_string(),
+        }),
+    }
+}
+
+/// DELETE /api/uploads/{id} - Cancel an upload
+async fn cancel_upload_handler(
+    path: web::Path<String>,
+    data: web::Data<ServerContext>,
+) -> impl Responder {
+    let id_str = path.into_inner();
+
+    // Parse the UUID
+    match Uuid::parse_str(&id_str) {
+        Ok(uuid) => {
+            let upload_id = UploadId(uuid);
+            match data.upload_manager.cancel_upload(upload_id).await {
+                Ok(()) => HttpResponse::Ok().json(json!({
+                    "status": "cancelled",
+                    "message": "Upload cancelled successfully"
+                })),
+                Err(e) => HttpResponse::NotFound().json(UploadErrorResponse {
+                    error: format!("{}", e),
+                }),
+            }
+        }
+        Err(_) => HttpResponse::BadRequest().json(UploadErrorResponse {
+            error: "Invalid upload ID format".to_string(),
+        }),
+    }
+}
+
+/// WebSocket handler for upload progress updates
+/// GET /ws/uploads
+async fn upload_websocket_handler(
+    req: HttpRequest,
+    stream: web::Payload,
+    data: web::Data<ServerContext>,
+) -> Result<HttpResponse, actix_web::Error> {
+    ws::start(
+        MyWebSocket::new(data.upload_progress_stream.clone(), 16),
+        &req,
+        stream,
+    )
+    .map_err(|e| {
+        error!("Upload WebSocket connection failed: {:?}", e);
+        e
+    })
+}
+
+// =====================================================
+// Studio API Endpoints
+// =====================================================
+
+/// Response for project list
+#[derive(Serialize)]
+struct ProjectInfo {
+    id: String,
+    name: String,
+}
+
+/// Response for label list
+#[derive(Serialize)]
+struct LabelInfo {
+    id: String,
+    name: String,
+}
+
+/// GET /api/studio/projects - List projects from EdgeFirst Studio
+async fn list_studio_projects(data: web::Data<ServerContext>) -> impl Responder {
+    let client_lock = data.upload_manager.client.read().await;
+
+    match &*client_lock {
+        Some(client) => {
+            match client.projects(None).await {
+                Ok(projects) => {
+                    let project_infos: Vec<ProjectInfo> = projects
+                        .into_iter()
+                        .map(|p| ProjectInfo {
+                            id: p.id().to_string(),
+                            name: p.name().to_string(),
+                        })
+                        .collect();
+                    HttpResponse::Ok().json(project_infos)
+                }
+                Err(e) => {
+                    error!("Failed to fetch projects: {}", e);
+                    HttpResponse::InternalServerError().json(UploadErrorResponse {
+                        error: format!("Failed to fetch projects: {}", e),
+                    })
+                }
+            }
+        }
+        None => HttpResponse::Unauthorized().json(UploadErrorResponse {
+            error: "Not authenticated with EdgeFirst Studio".to_string(),
+        }),
+    }
+}
+
+/// GET /api/studio/projects/{id}/labels - Get labels for auto-labeling
+/// Note: Returns common labels for AGTG auto-labeling (hardcoded list)
+/// In EdgeFirst, labels are per-dataset, not per-project, but AGTG uses a standard set
+async fn list_project_labels(
+    _path: web::Path<String>,
+    data: web::Data<ServerContext>,
+) -> impl Responder {
+    let client_lock = data.upload_manager.client.read().await;
+
+    match &*client_lock {
+        Some(_client) => {
+            // Return common AGTG labels (standard set for auto-labeling)
+            // These are the label names that AGTG recognizes
+            let common_labels = vec![
+                LabelInfo { id: "person".to_string(), name: "Person".to_string() },
+                LabelInfo { id: "car".to_string(), name: "Car".to_string() },
+                LabelInfo { id: "truck".to_string(), name: "Truck".to_string() },
+                LabelInfo { id: "bus".to_string(), name: "Bus".to_string() },
+                LabelInfo { id: "motorcycle".to_string(), name: "Motorcycle".to_string() },
+                LabelInfo { id: "bicycle".to_string(), name: "Bicycle".to_string() },
+                LabelInfo { id: "traffic_light".to_string(), name: "Traffic Light".to_string() },
+                LabelInfo { id: "stop_sign".to_string(), name: "Stop Sign".to_string() },
+            ];
+            HttpResponse::Ok().json(common_labels)
+        }
+        None => HttpResponse::Unauthorized().json(UploadErrorResponse {
+            error: "Not authenticated with EdgeFirst Studio".to_string(),
+        }),
+    }
 }
 
 async fn serve_settings_page(data: web::Data<ServerContext>) -> Result<NamedFile> {
@@ -1673,6 +2713,20 @@ async fn main() -> std::io::Result<()> {
     let thread_state = web::Data::new(Arc::new(ThreadState {
         is_running: Mutex::new(false),
     }));
+
+    // Initialize UploadManager
+    let (upload_tx, _) = channel();
+    let upload_broadcaster = Arc::new(MessageStream::new(upload_tx, Box::new(|| {}), false));
+    let upload_manager = Arc::new(UploadManager::new(
+        PathBuf::from(&args.storage_path),
+        upload_broadcaster,
+    ));
+
+    // Initialize upload manager (scan for incomplete uploads from previous session)
+    if let Err(e) = Handle::current().block_on(upload_manager.initialize()) {
+        error!("Failed to initialize upload manager: {}", e);
+    }
+
     // binding to [::] will also bind to 0.0.0.0. We try to bind both ivp6 and ipv4
     // with [::]. If that fails we will try just ivp4. If we do 0.0.0.0 first, the
     // [::] bind won't happen
@@ -1681,10 +2735,20 @@ async fn main() -> std::io::Result<()> {
 
     HttpServer::new(move || {
         let (tx, _) = channel();
+        // Create upload progress stream (does not need on_exit channel)
+        let (upload_tx, _upload_rx) = channel();
+        let upload_progress_stream = Arc::new(MessageStream::new(
+            upload_tx,
+            Box::new(|| {}),
+            false,
+        ));
+
         let server_ctx = ServerContext {
             args: args.clone(),
             err_stream: Arc::new(MessageStream::new(tx, Box::new(|| {}), false)),
             err_count: AtomicI64::new(0),
+            upload_manager: upload_manager.clone(),
+            upload_progress_stream: upload_progress_stream.clone(),
         };
         let _handle = handle.clone();
         let _thread_state_clone = thread_state.clone();
@@ -1712,6 +2776,18 @@ async fn main() -> std::io::Result<()> {
                             "/get-upload-credentials",
                             web::get().to(get_upload_credentials),
                         )
+                        // Authentication API routes
+                        .route("/api/auth/login", web::post().to(auth_login))
+                        .route("/api/auth/status", web::get().to(auth_status))
+                        .route("/api/auth/logout", web::post().to(auth_logout))
+                        // Upload API routes
+                        .route("/api/uploads", web::post().to(start_upload_handler))
+                        .route("/api/uploads", web::get().to(list_uploads_handler))
+                        .route("/api/uploads/{id}", web::get().to(get_upload_handler))
+                        .route("/api/uploads/{id}", web::delete().to(cancel_upload_handler))
+                        // Studio API routes
+                        .route("/api/studio/projects", web::get().to(list_studio_projects))
+                        .route("/api/studio/projects/{id}/labels", web::get().to(list_project_labels))
                         .route("/recorder-status", web::get().to(check_recorder_status))
                         .route("/current-recording", web::get().to(get_current_recording))
                         .service(
@@ -1730,6 +2806,10 @@ async fn main() -> std::io::Result<()> {
                         .route("/config/services/update", web::post().to(update_service))
                         .service(
                             web::resource("/mcap/").route(web::get().to(mcap_websocket_handler)),
+                        )
+                        .service(
+                            web::resource("/ws/uploads")
+                                .route(web::get().to(upload_websocket_handler)),
                         )
                         .route("/config/{service}", web::get().to(serve_config_page))
                         .route("/config/{service}/details", web::get().to(get_config))
@@ -1762,6 +2842,18 @@ async fn main() -> std::io::Result<()> {
                             "/get-upload-credentials",
                             web::get().to(get_upload_credentials),
                         )
+                        // Authentication API routes
+                        .route("/api/auth/login", web::post().to(auth_login))
+                        .route("/api/auth/status", web::get().to(auth_status))
+                        .route("/api/auth/logout", web::post().to(auth_logout))
+                        // Upload API routes
+                        .route("/api/uploads", web::post().to(start_upload_handler))
+                        .route("/api/uploads", web::get().to(list_uploads_handler))
+                        .route("/api/uploads/{id}", web::get().to(get_upload_handler))
+                        .route("/api/uploads/{id}", web::delete().to(cancel_upload_handler))
+                        // Studio API routes
+                        .route("/api/studio/projects", web::get().to(list_studio_projects))
+                        .route("/api/studio/projects/{id}/labels", web::get().to(list_project_labels))
                         .route(
                             "/recorder-status",
                             web::get().to(user_mode_check_recorder_status),
@@ -1783,6 +2875,10 @@ async fn main() -> std::io::Result<()> {
                         .route("/config/services/update", web::post().to(update_service))
                         .service(
                             web::resource("/mcap/").route(web::get().to(mcap_websocket_handler)),
+                        )
+                        .service(
+                            web::resource("/ws/uploads")
+                                .route(web::get().to(upload_websocket_handler)),
                         )
                         .route("/config/{service}", web::get().to(serve_config_page))
                         .route(

@@ -19,6 +19,7 @@ use camino::Utf8Path;
 use cdr::{CdrLe, Infinite};
 use chrono::{DateTime, Utc};
 use clap::Parser;
+use edgefirst_client::{Client, Progress, ProjectID, SnapshotID};
 use log::{debug, error, info, warn};
 use mcap::Summary;
 use memmap::Mmap;
@@ -31,8 +32,6 @@ use percent_encoding::percent_decode;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use uuid::Uuid;
-use edgefirst_client::{Client, Progress, ProjectID, SnapshotID};
 use std::{
     collections::HashMap,
     fs::File,
@@ -55,6 +54,7 @@ use tokio::{
     sync::{mpsc, RwLock},
     task::JoinHandle,
 };
+use uuid::Uuid;
 
 #[derive(Serialize)]
 struct FileInfo {
@@ -73,6 +73,7 @@ struct DirectoryResponse {
 }
 
 #[derive(Deserialize, Debug, Clone)]
+#[allow(dead_code)]
 struct DeleteParams {
     directory: String,
     file: String,
@@ -92,6 +93,7 @@ struct AppState {
     process: Mutex<Option<Child>>,
 }
 
+#[allow(dead_code)]
 struct ThreadState {
     is_running: Mutex<bool>,
 }
@@ -132,11 +134,11 @@ pub enum UploadMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UploadState {
-    Queued,      // Created, not started
-    Uploading,   // Uploading MCAP
-    Processing,  // Auto-labeling (Extended mode only)
-    Completed,   // Success
-    Failed,      // Error occurred
+    Queued,     // Created, not started
+    Uploading,  // Uploading MCAP
+    Processing, // Auto-labeling (Extended mode only)
+    Completed,  // Success
+    Failed,     // Error occurred
 }
 
 /// In-memory task representation
@@ -145,7 +147,7 @@ pub struct UploadTask {
     pub mcap_path: PathBuf,
     pub mode: UploadMode,
     pub state: UploadState,
-    pub progress: f32,  // 0.0 to 100.0
+    pub progress: f32, // 0.0 to 100.0
     pub message: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -233,6 +235,7 @@ pub struct UploadManager {
 
 impl UploadManager {
     /// Create a new UploadManager
+    #[allow(private_interfaces)]
     pub fn new(storage_path: PathBuf, broadcaster: Arc<MessageStream>) -> Self {
         Self {
             tasks: Arc::new(RwLock::new(HashMap::new())),
@@ -390,8 +393,9 @@ impl UploadManager {
 
         // Use sync file I/O in a blocking task to avoid holding locks across await
         tokio::task::spawn_blocking(move || {
-            std::fs::write(&status_path, json)
-                .map_err(|e| anyhow::anyhow!("Failed to write status file {:?}: {}", status_path, e))
+            std::fs::write(&status_path, json).map_err(|e| {
+                anyhow::anyhow!("Failed to write status file {:?}: {}", status_path, e)
+            })
         })
         .await??;
 
@@ -457,6 +461,7 @@ impl UploadManager {
     }
 
     /// Update task state and write status file
+    #[allow(clippy::too_many_arguments)]
     async fn update_task_state(
         &self,
         id: UploadId,
@@ -519,8 +524,9 @@ impl UploadManager {
         // Use sync file I/O in a blocking task
         let status_path_clone = status_path.clone();
         tokio::task::spawn_blocking(move || {
-            std::fs::write(&status_path_clone, json)
-                .map_err(|e| anyhow::anyhow!("Failed to write status file {:?}: {}", status_path_clone, e))
+            std::fs::write(&status_path_clone, json).map_err(|e| {
+                anyhow::anyhow!("Failed to write status file {:?}: {}", status_path_clone, e)
+            })
         })
         .await??;
 
@@ -736,7 +742,10 @@ async fn upload_worker(
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("Invalid MCAP path"))?;
 
-    let snapshot = match client.create_snapshot(mcap_path_str, Some(progress_tx)).await {
+    let snapshot = match client
+        .create_snapshot(mcap_path_str, Some(progress_tx))
+        .await
+    {
         Ok(snapshot) => {
             info!(
                 "Upload completed for task {} - Snapshot ID: {}",
@@ -848,10 +857,7 @@ async fn upload_worker(
                     );
                 }
                 Err(e) => {
-                    error!(
-                        "Snapshot restore failed for task {}: {}",
-                        upload_id.0, e
-                    );
+                    error!("Snapshot restore failed for task {}: {}", upload_id.0, e);
                     manager
                         .update_task_state(
                             upload_id,
@@ -2024,26 +2030,24 @@ async fn list_studio_projects(data: web::Data<ServerContext>) -> impl Responder 
     let client_lock = data.upload_manager.client.read().await;
 
     match &*client_lock {
-        Some(client) => {
-            match client.projects(None).await {
-                Ok(projects) => {
-                    let project_infos: Vec<ProjectInfo> = projects
-                        .into_iter()
-                        .map(|p| ProjectInfo {
-                            id: p.id().to_string(),
-                            name: p.name().to_string(),
-                        })
-                        .collect();
-                    HttpResponse::Ok().json(project_infos)
-                }
-                Err(e) => {
-                    error!("Failed to fetch projects: {}", e);
-                    HttpResponse::InternalServerError().json(UploadErrorResponse {
-                        error: format!("Failed to fetch projects: {}", e),
+        Some(client) => match client.projects(None).await {
+            Ok(projects) => {
+                let project_infos: Vec<ProjectInfo> = projects
+                    .into_iter()
+                    .map(|p| ProjectInfo {
+                        id: p.id().to_string(),
+                        name: p.name().to_string(),
                     })
-                }
+                    .collect();
+                HttpResponse::Ok().json(project_infos)
             }
-        }
+            Err(e) => {
+                error!("Failed to fetch projects: {}", e);
+                HttpResponse::InternalServerError().json(UploadErrorResponse {
+                    error: format!("Failed to fetch projects: {}", e),
+                })
+            }
+        },
         None => HttpResponse::Unauthorized().json(UploadErrorResponse {
             error: "Not authenticated with EdgeFirst Studio".to_string(),
         }),
@@ -2066,97 +2070,417 @@ async fn list_project_labels(
             // "person" is selected by default as the most common use case
             let coco_labels = vec![
                 // Person (default selected)
-                LabelInfo { id: "person".to_string(), name: "Person".to_string(), default: true },
+                LabelInfo {
+                    id: "person".to_string(),
+                    name: "Person".to_string(),
+                    default: true,
+                },
                 // Vehicles
-                LabelInfo { id: "bicycle".to_string(), name: "Bicycle".to_string(), default: false },
-                LabelInfo { id: "car".to_string(), name: "Car".to_string(), default: false },
-                LabelInfo { id: "motorcycle".to_string(), name: "Motorcycle".to_string(), default: false },
-                LabelInfo { id: "airplane".to_string(), name: "Airplane".to_string(), default: false },
-                LabelInfo { id: "bus".to_string(), name: "Bus".to_string(), default: false },
-                LabelInfo { id: "train".to_string(), name: "Train".to_string(), default: false },
-                LabelInfo { id: "truck".to_string(), name: "Truck".to_string(), default: false },
-                LabelInfo { id: "boat".to_string(), name: "Boat".to_string(), default: false },
+                LabelInfo {
+                    id: "bicycle".to_string(),
+                    name: "Bicycle".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "car".to_string(),
+                    name: "Car".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "motorcycle".to_string(),
+                    name: "Motorcycle".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "airplane".to_string(),
+                    name: "Airplane".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "bus".to_string(),
+                    name: "Bus".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "train".to_string(),
+                    name: "Train".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "truck".to_string(),
+                    name: "Truck".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "boat".to_string(),
+                    name: "Boat".to_string(),
+                    default: false,
+                },
                 // Outdoor objects
-                LabelInfo { id: "traffic_light".to_string(), name: "Traffic Light".to_string(), default: false },
-                LabelInfo { id: "fire_hydrant".to_string(), name: "Fire Hydrant".to_string(), default: false },
-                LabelInfo { id: "stop_sign".to_string(), name: "Stop Sign".to_string(), default: false },
-                LabelInfo { id: "parking_meter".to_string(), name: "Parking Meter".to_string(), default: false },
-                LabelInfo { id: "bench".to_string(), name: "Bench".to_string(), default: false },
+                LabelInfo {
+                    id: "traffic_light".to_string(),
+                    name: "Traffic Light".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "fire_hydrant".to_string(),
+                    name: "Fire Hydrant".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "stop_sign".to_string(),
+                    name: "Stop Sign".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "parking_meter".to_string(),
+                    name: "Parking Meter".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "bench".to_string(),
+                    name: "Bench".to_string(),
+                    default: false,
+                },
                 // Animals
-                LabelInfo { id: "bird".to_string(), name: "Bird".to_string(), default: false },
-                LabelInfo { id: "cat".to_string(), name: "Cat".to_string(), default: false },
-                LabelInfo { id: "dog".to_string(), name: "Dog".to_string(), default: false },
-                LabelInfo { id: "horse".to_string(), name: "Horse".to_string(), default: false },
-                LabelInfo { id: "sheep".to_string(), name: "Sheep".to_string(), default: false },
-                LabelInfo { id: "cow".to_string(), name: "Cow".to_string(), default: false },
-                LabelInfo { id: "elephant".to_string(), name: "Elephant".to_string(), default: false },
-                LabelInfo { id: "bear".to_string(), name: "Bear".to_string(), default: false },
-                LabelInfo { id: "zebra".to_string(), name: "Zebra".to_string(), default: false },
-                LabelInfo { id: "giraffe".to_string(), name: "Giraffe".to_string(), default: false },
+                LabelInfo {
+                    id: "bird".to_string(),
+                    name: "Bird".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "cat".to_string(),
+                    name: "Cat".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "dog".to_string(),
+                    name: "Dog".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "horse".to_string(),
+                    name: "Horse".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "sheep".to_string(),
+                    name: "Sheep".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "cow".to_string(),
+                    name: "Cow".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "elephant".to_string(),
+                    name: "Elephant".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "bear".to_string(),
+                    name: "Bear".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "zebra".to_string(),
+                    name: "Zebra".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "giraffe".to_string(),
+                    name: "Giraffe".to_string(),
+                    default: false,
+                },
                 // Accessories
-                LabelInfo { id: "backpack".to_string(), name: "Backpack".to_string(), default: false },
-                LabelInfo { id: "umbrella".to_string(), name: "Umbrella".to_string(), default: false },
-                LabelInfo { id: "handbag".to_string(), name: "Handbag".to_string(), default: false },
-                LabelInfo { id: "tie".to_string(), name: "Tie".to_string(), default: false },
-                LabelInfo { id: "suitcase".to_string(), name: "Suitcase".to_string(), default: false },
+                LabelInfo {
+                    id: "backpack".to_string(),
+                    name: "Backpack".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "umbrella".to_string(),
+                    name: "Umbrella".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "handbag".to_string(),
+                    name: "Handbag".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "tie".to_string(),
+                    name: "Tie".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "suitcase".to_string(),
+                    name: "Suitcase".to_string(),
+                    default: false,
+                },
                 // Sports
-                LabelInfo { id: "frisbee".to_string(), name: "Frisbee".to_string(), default: false },
-                LabelInfo { id: "skis".to_string(), name: "Skis".to_string(), default: false },
-                LabelInfo { id: "snowboard".to_string(), name: "Snowboard".to_string(), default: false },
-                LabelInfo { id: "sports_ball".to_string(), name: "Sports Ball".to_string(), default: false },
-                LabelInfo { id: "kite".to_string(), name: "Kite".to_string(), default: false },
-                LabelInfo { id: "baseball_bat".to_string(), name: "Baseball Bat".to_string(), default: false },
-                LabelInfo { id: "baseball_glove".to_string(), name: "Baseball Glove".to_string(), default: false },
-                LabelInfo { id: "skateboard".to_string(), name: "Skateboard".to_string(), default: false },
-                LabelInfo { id: "surfboard".to_string(), name: "Surfboard".to_string(), default: false },
-                LabelInfo { id: "tennis_racket".to_string(), name: "Tennis Racket".to_string(), default: false },
+                LabelInfo {
+                    id: "frisbee".to_string(),
+                    name: "Frisbee".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "skis".to_string(),
+                    name: "Skis".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "snowboard".to_string(),
+                    name: "Snowboard".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "sports_ball".to_string(),
+                    name: "Sports Ball".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "kite".to_string(),
+                    name: "Kite".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "baseball_bat".to_string(),
+                    name: "Baseball Bat".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "baseball_glove".to_string(),
+                    name: "Baseball Glove".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "skateboard".to_string(),
+                    name: "Skateboard".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "surfboard".to_string(),
+                    name: "Surfboard".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "tennis_racket".to_string(),
+                    name: "Tennis Racket".to_string(),
+                    default: false,
+                },
                 // Kitchen
-                LabelInfo { id: "bottle".to_string(), name: "Bottle".to_string(), default: false },
-                LabelInfo { id: "wine_glass".to_string(), name: "Wine Glass".to_string(), default: false },
-                LabelInfo { id: "cup".to_string(), name: "Cup".to_string(), default: false },
-                LabelInfo { id: "fork".to_string(), name: "Fork".to_string(), default: false },
-                LabelInfo { id: "knife".to_string(), name: "Knife".to_string(), default: false },
-                LabelInfo { id: "spoon".to_string(), name: "Spoon".to_string(), default: false },
-                LabelInfo { id: "bowl".to_string(), name: "Bowl".to_string(), default: false },
+                LabelInfo {
+                    id: "bottle".to_string(),
+                    name: "Bottle".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "wine_glass".to_string(),
+                    name: "Wine Glass".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "cup".to_string(),
+                    name: "Cup".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "fork".to_string(),
+                    name: "Fork".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "knife".to_string(),
+                    name: "Knife".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "spoon".to_string(),
+                    name: "Spoon".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "bowl".to_string(),
+                    name: "Bowl".to_string(),
+                    default: false,
+                },
                 // Food
-                LabelInfo { id: "banana".to_string(), name: "Banana".to_string(), default: false },
-                LabelInfo { id: "apple".to_string(), name: "Apple".to_string(), default: false },
-                LabelInfo { id: "sandwich".to_string(), name: "Sandwich".to_string(), default: false },
-                LabelInfo { id: "orange".to_string(), name: "Orange".to_string(), default: false },
-                LabelInfo { id: "broccoli".to_string(), name: "Broccoli".to_string(), default: false },
-                LabelInfo { id: "carrot".to_string(), name: "Carrot".to_string(), default: false },
-                LabelInfo { id: "hot_dog".to_string(), name: "Hot Dog".to_string(), default: false },
-                LabelInfo { id: "pizza".to_string(), name: "Pizza".to_string(), default: false },
-                LabelInfo { id: "donut".to_string(), name: "Donut".to_string(), default: false },
-                LabelInfo { id: "cake".to_string(), name: "Cake".to_string(), default: false },
+                LabelInfo {
+                    id: "banana".to_string(),
+                    name: "Banana".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "apple".to_string(),
+                    name: "Apple".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "sandwich".to_string(),
+                    name: "Sandwich".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "orange".to_string(),
+                    name: "Orange".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "broccoli".to_string(),
+                    name: "Broccoli".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "carrot".to_string(),
+                    name: "Carrot".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "hot_dog".to_string(),
+                    name: "Hot Dog".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "pizza".to_string(),
+                    name: "Pizza".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "donut".to_string(),
+                    name: "Donut".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "cake".to_string(),
+                    name: "Cake".to_string(),
+                    default: false,
+                },
                 // Furniture
-                LabelInfo { id: "chair".to_string(), name: "Chair".to_string(), default: false },
-                LabelInfo { id: "couch".to_string(), name: "Couch".to_string(), default: false },
-                LabelInfo { id: "potted_plant".to_string(), name: "Potted Plant".to_string(), default: false },
-                LabelInfo { id: "bed".to_string(), name: "Bed".to_string(), default: false },
-                LabelInfo { id: "dining_table".to_string(), name: "Dining Table".to_string(), default: false },
-                LabelInfo { id: "toilet".to_string(), name: "Toilet".to_string(), default: false },
+                LabelInfo {
+                    id: "chair".to_string(),
+                    name: "Chair".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "couch".to_string(),
+                    name: "Couch".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "potted_plant".to_string(),
+                    name: "Potted Plant".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "bed".to_string(),
+                    name: "Bed".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "dining_table".to_string(),
+                    name: "Dining Table".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "toilet".to_string(),
+                    name: "Toilet".to_string(),
+                    default: false,
+                },
                 // Electronics
-                LabelInfo { id: "tv".to_string(), name: "TV".to_string(), default: false },
-                LabelInfo { id: "laptop".to_string(), name: "Laptop".to_string(), default: false },
-                LabelInfo { id: "mouse".to_string(), name: "Mouse".to_string(), default: false },
-                LabelInfo { id: "remote".to_string(), name: "Remote".to_string(), default: false },
-                LabelInfo { id: "keyboard".to_string(), name: "Keyboard".to_string(), default: false },
-                LabelInfo { id: "cell_phone".to_string(), name: "Cell Phone".to_string(), default: false },
+                LabelInfo {
+                    id: "tv".to_string(),
+                    name: "TV".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "laptop".to_string(),
+                    name: "Laptop".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "mouse".to_string(),
+                    name: "Mouse".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "remote".to_string(),
+                    name: "Remote".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "keyboard".to_string(),
+                    name: "Keyboard".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "cell_phone".to_string(),
+                    name: "Cell Phone".to_string(),
+                    default: false,
+                },
                 // Appliances
-                LabelInfo { id: "microwave".to_string(), name: "Microwave".to_string(), default: false },
-                LabelInfo { id: "oven".to_string(), name: "Oven".to_string(), default: false },
-                LabelInfo { id: "toaster".to_string(), name: "Toaster".to_string(), default: false },
-                LabelInfo { id: "sink".to_string(), name: "Sink".to_string(), default: false },
-                LabelInfo { id: "refrigerator".to_string(), name: "Refrigerator".to_string(), default: false },
+                LabelInfo {
+                    id: "microwave".to_string(),
+                    name: "Microwave".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "oven".to_string(),
+                    name: "Oven".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "toaster".to_string(),
+                    name: "Toaster".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "sink".to_string(),
+                    name: "Sink".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "refrigerator".to_string(),
+                    name: "Refrigerator".to_string(),
+                    default: false,
+                },
                 // Indoor objects
-                LabelInfo { id: "book".to_string(), name: "Book".to_string(), default: false },
-                LabelInfo { id: "clock".to_string(), name: "Clock".to_string(), default: false },
-                LabelInfo { id: "vase".to_string(), name: "Vase".to_string(), default: false },
-                LabelInfo { id: "scissors".to_string(), name: "Scissors".to_string(), default: false },
-                LabelInfo { id: "teddy_bear".to_string(), name: "Teddy Bear".to_string(), default: false },
-                LabelInfo { id: "hair_drier".to_string(), name: "Hair Drier".to_string(), default: false },
-                LabelInfo { id: "toothbrush".to_string(), name: "Toothbrush".to_string(), default: false },
+                LabelInfo {
+                    id: "book".to_string(),
+                    name: "Book".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "clock".to_string(),
+                    name: "Clock".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "vase".to_string(),
+                    name: "Vase".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "scissors".to_string(),
+                    name: "Scissors".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "teddy_bear".to_string(),
+                    name: "Teddy Bear".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "hair_drier".to_string(),
+                    name: "Hair Drier".to_string(),
+                    default: false,
+                },
+                LabelInfo {
+                    id: "toothbrush".to_string(),
+                    name: "Toothbrush".to_string(),
+                    default: false,
+                },
             ];
             HttpResponse::Ok().json(coco_labels)
         }
@@ -2853,11 +3177,8 @@ async fn main() -> std::io::Result<()> {
         let (tx, _) = channel();
         // Create upload progress stream (does not need on_exit channel)
         let (upload_tx, _upload_rx) = channel();
-        let upload_progress_stream = Arc::new(MessageStream::new(
-            upload_tx,
-            Box::new(|| {}),
-            false,
-        ));
+        let upload_progress_stream =
+            Arc::new(MessageStream::new(upload_tx, Box::new(|| {}), false));
 
         let server_ctx = ServerContext {
             args: args.clone(),
@@ -2903,7 +3224,10 @@ async fn main() -> std::io::Result<()> {
                         .route("/api/uploads/{id}", web::delete().to(cancel_upload_handler))
                         // Studio API routes
                         .route("/api/studio/projects", web::get().to(list_studio_projects))
-                        .route("/api/studio/projects/{id}/labels", web::get().to(list_project_labels))
+                        .route(
+                            "/api/studio/projects/{id}/labels",
+                            web::get().to(list_project_labels),
+                        )
                         .route("/recorder-status", web::get().to(check_recorder_status))
                         .route("/current-recording", web::get().to(get_current_recording))
                         .service(
@@ -2969,7 +3293,10 @@ async fn main() -> std::io::Result<()> {
                         .route("/api/uploads/{id}", web::delete().to(cancel_upload_handler))
                         // Studio API routes
                         .route("/api/studio/projects", web::get().to(list_studio_projects))
-                        .route("/api/studio/projects/{id}/labels", web::get().to(list_project_labels))
+                        .route(
+                            "/api/studio/projects/{id}/labels",
+                            web::get().to(list_project_labels),
+                        )
                         .route(
                             "/recorder-status",
                             web::get().to(user_mode_check_recorder_status),

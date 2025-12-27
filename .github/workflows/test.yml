@@ -96,6 +96,12 @@ jobs:
         if: matrix.platform.name == 'aarch64'
         run: rm -f .cargo/config.toml
 
+      - name: Install build dependencies (ARM64)
+        if: matrix.platform.name == 'aarch64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:

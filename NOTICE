@@ -17,10 +17,11 @@ This software contains the following first-level dependencies:
   * cdr 0.2.4 (MIT)
   * chrono 0.4.42 (MIT OR Apache-2.0)
   * clap 4.5.53 (MIT OR Apache-2.0)
+  * edgefirst-client 2.6.4 (Apache-2.0)
   * env_logger 0.11.8 (MIT OR Apache-2.0)
   * fs2 0.4.3 (MIT OR Apache-2.0)
   * hostname 0.4.2 (MIT OR Apache-2.0)
-  * log 0.4.28 (MIT OR Apache-2.0)
+  * log 0.4.29 (MIT OR Apache-2.0)
   * mcap 0.23.4 (MIT)
   * memmap 0.7.0 (MIT OR Apache-2.0)
   * mime 0.3.17 (MIT OR Apache-2.0)
@@ -32,7 +33,7 @@ This software contains the following first-level dependencies:
   * serde_json 1.0.145 (MIT OR Apache-2.0)
   * sysinfo 0.37.2 (MIT)
   * tokio 1.48.0 (MIT)
-  * uuid 1.18.1 (MIT OR Apache-2.0)
+  * uuid 1.19.0 (MIT OR Apache-2.0)
   * zenoh 1.6.2 (EPL 2.0 OR Apache 2.0)
 
 For complete dependency information and transitive dependencies,

@@ -92,6 +92,10 @@ jobs:
         with:
           fetch-depth: 0  # Full history for better analysis
 
+      - name: Remove cross-compilation config on native ARM64
+        if: matrix.platform.name == 'aarch64'
+        run: rm -f .cargo/config.toml
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:

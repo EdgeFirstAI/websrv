@@ -82,7 +82,7 @@ jobs:
             runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
           - name: aarch64
-            runner: ubuntu-22.04-arm-private
+            runner: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
       fail-fast: false
 

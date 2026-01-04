@@ -7,9 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.7.0] - 2026-01-04
+
 ### Added
 
 - Initial open source release
+- MCAP upload to EdgeFirst Studio with real-time progress tracking
+- EdgeFirst Studio authentication (login/logout/status APIs)
+- Background upload worker with power loss recovery
+- Extended upload mode with AGTG auto-labeling support
+- 80 COCO classes for YOLOX/SAM2 auto-labeling
+- SBOM generation and license compliance validation
 - Web UI for Maivin platform control
 - Real-time data visualization
 - MCAP file playback and analysis
@@ -21,7 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Migrated from Bitbucket to GitHub
 - Updated license to Apache-2.0
+- SPS v2.1.1 compliance with complete documentation
+- Updated to Rust 1.90.0
 
 ### Security
 
 - Added security policy and vulnerability reporting process
+- Sanitized authentication error messages to prevent information leakage

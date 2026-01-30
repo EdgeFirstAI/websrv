@@ -70,19 +70,8 @@ jobs:
         with:
           components: clippy
 
-      - name: Cache cargo registry
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: ~/.cargo/registry/index
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-index-
-
-      - name: Cache cargo build
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: target
-          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-clippy-
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
 
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -135,19 +124,11 @@ jobs:
         with:
           tool: cargo-llvm-cov,cargo-nextest
 
-      - name: Cache cargo registry
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      - name: Cache Rust builds
+        uses: Swatinem/rust-cache@ad397744b0d591a723ab90405b7247fac0e6b8db # v2
         with:
-          path: ~/.cargo/registry/index
-          key: ${{ runner.os }}-${{ matrix.platform.name }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-${{ matrix.platform.name }}-cargo-index-
-
-      - name: Cache cargo build
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
-        with:
-          path: target
-          key: ${{ runner.os }}-${{ matrix.platform.name }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-${{ matrix.platform.name }}-cargo-test-
+          # Cache the instrumented build directory for coverage
+          cache-directories: target/llvm-cov-target
 
       - name: Run unit tests with coverage
         run: |

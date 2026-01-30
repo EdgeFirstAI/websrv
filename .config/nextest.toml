@@ -49,6 +49,18 @@ test-threads = 1
 filter = 'test(hardware)'
 threads-required = 1
 
+# Profiling profile for coverage instrumentation
+[profile.profiling]
+inherits = "default"
+
+# JUnit XML output path for profiling runs
+junit.path = "target/nextest/profiling/junit.xml"
+junit.store-success-output = true
+junit.store-failure-output = true
+
+# Longer timeouts for instrumented builds
+slow-timeout = { period = "120s", terminate-after = 2 }
+
 # Example: Platform-specific test configuration
 # [[profile.default.overrides]]
 # platform = 'aarch64-unknown-linux-gnu'

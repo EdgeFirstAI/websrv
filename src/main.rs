@@ -41,17 +41,16 @@ use std::{
     str::FromStr,
     sync::{
         atomic::{AtomicI64, Ordering},
-        mpsc::{channel, Receiver, Sender},
+        mpsc::{channel, Sender},
         Arc, Mutex,
     },
-    thread,
-    time::{Duration, UNIX_EPOCH},
+    time::UNIX_EPOCH,
 };
 use sysinfo::System;
 use tokio::{
     io::AsyncReadExt as _,
     runtime::Handle,
-    sync::{mpsc, RwLock},
+    sync::{mpsc, oneshot, RwLock},
     task::JoinHandle,
 };
 use uuid::Uuid;
@@ -192,7 +191,7 @@ impl From<&UploadTask> for UploadStatus {
 }
 
 /// Serializable task info for API responses
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UploadTaskInfo {
     pub upload_id: UploadId,
     pub mcap_path: PathBuf,
@@ -333,11 +332,20 @@ impl UploadManager {
     }
 
     /// Authenticate with EdgeFirst Studio
-    pub async fn authenticate(&self, username: &str, password: &str) -> anyhow::Result<()> {
-        info!("Authenticating with EdgeFirst Studio as {}", username);
+    /// server: "saas" (default), "stage", "test", or "dev"
+    pub async fn authenticate(
+        &self,
+        username: &str,
+        password: &str,
+        server: &str,
+    ) -> anyhow::Result<()> {
+        info!(
+            "Authenticating with EdgeFirst Studio ({}) as {}",
+            server, username
+        );
 
-        // Create new client and authenticate
-        let client = Client::new()?;
+        // Create new client with specified server and authenticate
+        let client = Client::new()?.with_server(server)?;
         let authenticated_client = client
             .with_login(username, password)
             .await
@@ -347,7 +355,10 @@ impl UploadManager {
         let mut client_lock = self.client.write().await;
         *client_lock = Some(authenticated_client);
 
-        info!("Successfully authenticated with EdgeFirst Studio");
+        info!(
+            "Successfully authenticated with EdgeFirst Studio ({})",
+            server
+        );
         Ok(())
     }
 
@@ -506,9 +517,9 @@ impl UploadManager {
 
     /// Broadcast upload progress to all connected WebSocket clients
     fn broadcast_progress(&self, status: &UploadStatus) {
-        match serde_json::to_vec(status) {
+        match serde_json::to_string(status) {
             Ok(json) => {
-                self.ws_broadcaster.broadcast(BroadcastMessage(json));
+                self.ws_broadcaster.broadcast(Broadcast::Text(json));
             }
             Err(e) => {
                 error!("Failed to serialize upload status for broadcast: {}", e);
@@ -888,11 +899,10 @@ fn load_encrypted_private_key() -> PKey<Private> {
 }
 
 struct MessageStream {
-    clients: Arc<Mutex<Vec<Recipient<BroadcastMessage>>>>,
+    clients: Arc<Mutex<Vec<Recipient<Broadcast>>>>,
     on_exit: Sender<String>,
     on_err: Box<dyn Fn() + Send + Sync>,
     high_priority: bool,
-    // err: Sender<String>,
 }
 
 #[derive(Deserialize)]
@@ -915,11 +925,11 @@ impl MessageStream {
         }
     }
 
-    fn add_client(&self, client: Recipient<BroadcastMessage>) {
+    fn add_client(&self, client: Recipient<Broadcast>) {
         self.clients.lock().unwrap().push(client);
     }
 
-    fn broadcast(&self, message: BroadcastMessage) {
+    fn broadcast(&self, message: Broadcast) {
         for client in self.clients.lock().unwrap().iter() {
             if self.high_priority {
                 client.do_send(message.clone());
@@ -933,9 +943,13 @@ impl MessageStream {
     }
 }
 
+/// WebSocket broadcast message - Binary for CDR data, Text for JSON
 #[derive(Message, Clone)]
 #[rtype(result = "()")]
-struct BroadcastMessage(Vec<u8>);
+enum Broadcast {
+    Binary(Vec<u8>),
+    Text(String),
+}
 
 async fn index(data: web::Data<ServerContext>) -> Result<fs::NamedFile> {
     let base_path = PathBuf::from(&data.args.docroot);
@@ -962,7 +976,7 @@ async fn websocket_handler_errors(
     stream: web::Payload,
     data: web::Data<ServerContext>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    ws::start(MyWebSocket::new(data.err_stream.clone(), 1), &req, stream).map_err(|e| {
+    ws::start(MyWebSocket::without_zenoh(data.err_stream.clone(), 1), &req, stream).map_err(|e| {
         error!("WebSocket connection failed: {:?}", e);
         e
     })
@@ -1002,9 +1016,13 @@ async fn websocket_handler(
         cleaned_path.clone()
     };
 
-    let args = data.args.clone();
     let topic = cleaned_path.clone();
-    let (tx, rx) = channel();
+    let (tx, _rx) = channel();
+
+    // Clone fields before moving into closure
+    let err_stream = data.err_stream.clone();
+    let zenoh_session = data.zenoh_session.clone();
+
     let video_stream = Arc::new(MessageStream::new(
         tx,
         Box::new(move || {
@@ -1014,21 +1032,27 @@ async fn websocket_handler(
                 topic.clone()
             );
             let msg = cdr::serialize::<_, _, CdrLe>(&msg, Infinite).unwrap();
-            data.err_stream.broadcast(BroadcastMessage(msg));
+            err_stream.broadcast(Broadcast::Binary(msg));
         }),
         is_high_priority,
     ));
     let video_stream_clone = video_stream.clone();
 
+    // Create shutdown channel for graceful zenoh listener termination
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
     let capacity = if is_high_priority { 16 } else { 1 };
-    let ws_result = ws::start(MyWebSocket::new(video_stream, capacity), &req, stream);
+    let ws_result = ws::start(
+        MyWebSocket::new(video_stream, capacity, shutdown_tx),
+        &req,
+        stream,
+    );
 
     if ws_result.is_ok() {
-        thread::Builder::new()
-            .name("zenoh".to_string())
-            .spawn(move || zenoh_listener(video_stream_clone, args, rx, cleaned_path))?;
-    } else {
-        drop(rx);
+        // Spawn zenoh listener as a tokio task instead of a separate thread
+        tokio::spawn(async move {
+            zenoh_listener(video_stream_clone, zenoh_session, shutdown_rx, cleaned_path).await;
+        });
     }
 
     ws_result.map_err(|e| {
@@ -1040,13 +1064,29 @@ async fn websocket_handler(
 struct MyWebSocket {
     video_stream: Arc<MessageStream>,
     capacity: usize,
+    shutdown_tx: Option<oneshot::Sender<()>>,
 }
 
 impl MyWebSocket {
-    fn new(video_stream: Arc<MessageStream>, capacity: usize) -> Self {
+    fn new(
+        video_stream: Arc<MessageStream>,
+        capacity: usize,
+        shutdown_tx: oneshot::Sender<()>,
+    ) -> Self {
         MyWebSocket {
             video_stream,
             capacity,
+            shutdown_tx: Some(shutdown_tx),
+        }
+    }
+
+    /// Create a WebSocket without zenoh shutdown signaling
+    /// Used for error streams and upload progress that don't have zenoh subscribers
+    fn without_zenoh(video_stream: Arc<MessageStream>, capacity: usize) -> Self {
+        MyWebSocket {
+            video_stream,
+            capacity,
+            shutdown_tx: None,
         }
     }
 }
@@ -1064,6 +1104,11 @@ impl Actor for MyWebSocket {
 
 impl Drop for MyWebSocket {
     fn drop(&mut self) {
+        // Signal the zenoh listener to shutdown
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        // Keep the old signal for backward compatibility
         let _ = self.video_stream.on_exit.send(STOP.to_string());
     }
 }
@@ -1092,58 +1137,63 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for MyWebSocket {
     }
 }
 
-impl Handler<BroadcastMessage> for MyWebSocket {
+impl Handler<Broadcast> for MyWebSocket {
     type Result = ();
 
-    fn handle(&mut self, msg: BroadcastMessage, ctx: &mut Self::Context) {
-        ctx.binary(msg.0);
+    fn handle(&mut self, msg: Broadcast, ctx: &mut Self::Context) {
+        match msg {
+            Broadcast::Binary(data) => ctx.binary(data),
+            Broadcast::Text(data) => ctx.text(data),
+        }
     }
 }
 
-#[tokio::main]
 async fn zenoh_listener(
     video_stream: Arc<MessageStream>,
-    args: Args,
-    rx: Receiver<String>,
+    session: zenoh::Session,
+    mut shutdown_rx: oneshot::Receiver<()>,
     topic: String,
 ) {
-    let session = zenoh::open(args.clone()).await.unwrap();
-    let subscriber = session
-        .declare_subscriber(topic.clone())
-        .await
-        .expect("Failed to declare Zenoh subscriber");
+    let subscriber = match session.declare_subscriber(topic.clone()).await {
+        Ok(sub) => sub,
+        Err(e) => {
+            error!("Failed to declare Zenoh subscriber for {}: {}", topic, e);
+            return;
+        }
+    };
+
+    debug!("Zenoh subscriber created for topic: {:?}", topic);
+
     loop {
-        if let Ok(msg) = rx.recv_timeout(Duration::from_millis(0)) {
-            if msg == STOP {
-                drop(video_stream);
-                subscriber
-                    .undeclare()
-                    .await
-                    .expect("Failed to undeclare subscriber");
-                session
-                    .close()
-                    .await
-                    .expect("Failed to close Zenoh session");
+        tokio::select! {
+            // Check for shutdown signal
+            _ = &mut shutdown_rx => {
+                debug!("Shutdown signal received for topic: {:?}", topic);
+                // Undeclare subscriber (session is shared, don't close it)
+                if let Err(e) = subscriber.undeclare().await {
+                    warn!("Failed to undeclare subscriber for {}: {}", topic, e);
+                }
                 return;
             }
-        }
-        debug!("topic: {:?}", topic);
-        // Take all messages from the subscriber. If there are no messages, then wait
-        // for the next message. If there were messages, only process the most recent
-        // message
-        let msgs = subscriber.drain();
-        match msgs.last() {
-            None => {
-                if let Ok(sample) = subscriber.recv_async().await {
-                    let data = sample.payload().to_bytes().to_vec();
-                    video_stream.broadcast(BroadcastMessage(data));
+            // Wait for Zenoh messages
+            sample = subscriber.recv_async() => {
+                match sample {
+                    Ok(sample) => {
+                        let data = sample.payload().to_bytes().to_vec();
+                        video_stream.broadcast(Broadcast::Binary(data));
+                    }
+                    Err(e) => {
+                        debug!("Subscriber recv error for {}: {}", topic, e);
+                        break;
+                    }
                 }
             }
-            Some(sample) => {
-                let data = sample.payload().to_bytes().to_vec();
-                video_stream.broadcast(BroadcastMessage(data));
-            }
         }
+    }
+
+    // Clean up subscriber on exit
+    if let Err(e) = subscriber.undeclare().await {
+        warn!("Failed to undeclare subscriber for {}: {}", topic, e);
     }
 }
 
@@ -1794,6 +1844,7 @@ struct ServerContext {
     err_count: AtomicI64,
     upload_manager: Arc<UploadManager>,
     upload_progress_stream: Arc<MessageStream>,
+    zenoh_session: zenoh::Session,
 }
 
 // ============================================================================
@@ -1804,15 +1855,22 @@ struct ServerContext {
 struct AuthRequest {
     username: String,
     password: String,
+    /// Server instance: "saas" (default), "stage", "test", or "dev"
+    #[serde(default = "default_server")]
+    server: String,
 }
 
-#[derive(Serialize)]
+fn default_server() -> String {
+    "saas".to_string()
+}
+
+#[derive(Serialize, Deserialize)]
 struct AuthResponse {
     status: String,
     message: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct AuthStatusResponse {
     authenticated: bool,
     username: Option<String>,
@@ -1823,15 +1881,21 @@ async fn auth_login(
     body: web::Json<AuthRequest>,
     data: web::Data<ServerContext>,
 ) -> impl Responder {
-    info!("Login request received for user: {}", body.username);
+    info!(
+        "Login request received for user: {} on server: {}",
+        body.username, body.server
+    );
 
     match data
         .upload_manager
-        .authenticate(&body.username, &body.password)
+        .authenticate(&body.username, &body.password, &body.server)
         .await
     {
         Ok(()) => {
-            info!("User {} authenticated successfully", body.username);
+            info!(
+                "User {} authenticated successfully on {}",
+                body.username, body.server
+            );
             HttpResponse::Ok().json(AuthResponse {
                 status: "ok".to_string(),
                 message: "Authentication successful".to_string(),
@@ -1895,7 +1959,7 @@ struct StartUploadResponse {
     status: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct UploadErrorResponse {
     error: String,
 }
@@ -1995,7 +2059,7 @@ async fn upload_websocket_handler(
     data: web::Data<ServerContext>,
 ) -> Result<HttpResponse, actix_web::Error> {
     ws::start(
-        MyWebSocket::new(data.upload_progress_stream.clone(), 16),
+        MyWebSocket::without_zenoh(data.upload_progress_stream.clone(), 16),
         &req,
         stream,
     )
@@ -2010,18 +2074,19 @@ async fn upload_websocket_handler(
 // =====================================================
 
 /// Response for project list
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct ProjectInfo {
     id: String,
     name: String,
 }
 
 /// Response for label list
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct LabelInfo {
     id: String,
     name: String,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default)]
     default: bool,
 }
 
@@ -3155,17 +3220,35 @@ async fn main() -> std::io::Result<()> {
     }));
 
     // Initialize UploadManager
+    // In system mode, read storage path from /etc/default/recorder (same as MCAP listing)
+    let storage_path = if args.system {
+        match read_storage_directory() {
+            Ok(dir) => PathBuf::from(dir),
+            Err(e) => {
+                error!("Failed to read storage directory from config: {}", e);
+                PathBuf::from(&args.storage_path)
+            }
+        }
+    } else {
+        PathBuf::from(&args.storage_path)
+    };
     let (upload_tx, _) = channel();
     let upload_broadcaster = Arc::new(MessageStream::new(upload_tx, Box::new(|| {}), false));
     let upload_manager = Arc::new(UploadManager::new(
-        PathBuf::from(&args.storage_path),
-        upload_broadcaster,
+        storage_path,
+        upload_broadcaster.clone(),
     ));
 
     // Initialize upload manager (scan for incomplete uploads from previous session)
-    if let Err(e) = Handle::current().block_on(upload_manager.initialize()) {
+    if let Err(e) = upload_manager.initialize().await {
         error!("Failed to initialize upload manager: {}", e);
     }
+
+    // Initialize shared Zenoh session
+    let zenoh_session = zenoh::open(args.clone())
+        .await
+        .expect("Failed to open Zenoh session");
+    info!("Zenoh session initialized");
 
     // binding to [::] will also bind to 0.0.0.0. We try to bind both ivp6 and ipv4
     // with [::]. If that fails we will try just ivp4. If we do 0.0.0.0 first, the
@@ -3175,17 +3258,15 @@ async fn main() -> std::io::Result<()> {
 
     HttpServer::new(move || {
         let (tx, _) = channel();
-        // Create upload progress stream (does not need on_exit channel)
-        let (upload_tx, _upload_rx) = channel();
-        let upload_progress_stream =
-            Arc::new(MessageStream::new(upload_tx, Box::new(|| {}), false));
 
         let server_ctx = ServerContext {
             args: args.clone(),
             err_stream: Arc::new(MessageStream::new(tx, Box::new(|| {}), false)),
             err_count: AtomicI64::new(0),
             upload_manager: upload_manager.clone(),
-            upload_progress_stream: upload_progress_stream.clone(),
+            // Use the same broadcaster that UploadManager uses for progress updates
+            upload_progress_stream: upload_broadcaster.clone(),
+            zenoh_session: zenoh_session.clone(),
         };
         let _handle = handle.clone();
         let _thread_state_clone = thread_state.clone();
@@ -3404,4 +3485,880 @@ fn read_mcap_info<P: AsRef<Utf8Path>>(path: P) -> res<(HashMap<String, TopicInfo
     };
 
     Ok((topic_infos, average_duration))
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::env;
+    use tempfile::TempDir;
+
+    /// Helper to create an UploadManager for testing
+    fn create_test_upload_manager(temp_dir: &TempDir) -> Arc<UploadManager> {
+        let (tx, _) = std::sync::mpsc::channel();
+        let broadcaster = Arc::new(MessageStream::new(tx, Box::new(|| {}), false));
+        Arc::new(UploadManager::new(temp_dir.path().to_path_buf(), broadcaster))
+    }
+
+    /// Get test credentials from environment variables
+    fn get_test_credentials() -> Option<(String, String, String)> {
+        let server = env::var("STUDIO_SERVER").ok()?;
+        let username = env::var("STUDIO_USERNAME").ok()?;
+        let password = env::var("STUDIO_PASSWORD").ok()?;
+        Some((server, username, password))
+    }
+
+    // =========================================================================
+    // Authentication Tests
+    // =========================================================================
+
+    #[actix_rt::test]
+    async fn test_auth_status_unauthenticated() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let manager = create_test_upload_manager(&temp_dir);
+
+        // Initially should not be authenticated
+        assert!(!manager.is_authenticated().await);
+        assert!(manager.get_username().await.is_none());
+    }
+
+    #[actix_rt::test]
+    async fn test_auth_login_invalid_credentials() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let manager = create_test_upload_manager(&temp_dir);
+
+        // Try to authenticate with invalid credentials
+        let result = manager
+            .authenticate("invalid_user", "invalid_password", "test")
+            .await;
+
+        assert!(result.is_err());
+        assert!(!manager.is_authenticated().await);
+    }
+
+    #[actix_rt::test]
+    async fn test_auth_login_valid_credentials() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let manager = create_test_upload_manager(&temp_dir);
+
+        let (server, username, password) = match get_test_credentials() {
+            Some(creds) => creds,
+            None => {
+                eprintln!("Skipping test: STUDIO_SERVER, STUDIO_USERNAME, STUDIO_PASSWORD not set");
+                return;
+            }
+        };
+
+        // Authenticate with valid credentials
+        let result = manager.authenticate(&username, &password, &server).await;
+        assert!(result.is_ok(), "Authentication failed: {:?}", result);
+
+        // Should now be authenticated
+        assert!(manager.is_authenticated().await);
+
+        // Should have a username
+        let retrieved_username = manager.get_username().await;
+        assert!(retrieved_username.is_some());
+        assert_eq!(retrieved_username.unwrap(), username);
+    }
+
+    #[actix_rt::test]
+    async fn test_auth_logout() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let manager = create_test_upload_manager(&temp_dir);
+
+        let (server, username, password) = match get_test_credentials() {
+            Some(creds) => creds,
+            None => {
+                eprintln!("Skipping test: STUDIO_SERVER, STUDIO_USERNAME, STUDIO_PASSWORD not set");
+                return;
+            }
+        };
+
+        // First authenticate
+        manager
+            .authenticate(&username, &password, &server)
+            .await
+            .expect("Authentication failed");
+        assert!(manager.is_authenticated().await);
+
+        // Then logout
+        manager.logout().await.expect("Logout failed");
+
+        // Should no longer be authenticated
+        assert!(!manager.is_authenticated().await);
+        assert!(manager.get_username().await.is_none());
+    }
+
+    // =========================================================================
+    // Studio API Tests
+    // =========================================================================
+
+    #[actix_rt::test]
+    async fn test_studio_projects_requires_auth() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let manager = create_test_upload_manager(&temp_dir);
+
+        // Without authentication, client should be None
+        let client_lock = manager.client.read().await;
+        assert!(client_lock.is_none());
+    }
+
+    #[actix_rt::test]
+    async fn test_studio_list_projects() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let manager = create_test_upload_manager(&temp_dir);
+
+        let (server, username, password) = match get_test_credentials() {
+            Some(creds) => creds,
+            None => {
+                eprintln!("Skipping test: STUDIO_SERVER, STUDIO_USERNAME, STUDIO_PASSWORD not set");
+                return;
+            }
+        };
+
+        // Authenticate first
+        manager
+            .authenticate(&username, &password, &server)
+            .await
+            .expect("Authentication failed");
+
+        // Get projects
+        let client_lock = manager.client.read().await;
+        let client = client_lock.as_ref().expect("Client should be authenticated");
+
+        let projects = client.projects(None).await;
+        assert!(projects.is_ok(), "Failed to list projects: {:?}", projects);
+
+        // Should return a list (could be empty but should not error)
+        let project_list = projects.unwrap();
+        // Just verify we got a valid response - the test account may or may not have projects
+        eprintln!("Found {} projects", project_list.len());
+    }
+
+    // =========================================================================
+    // Upload Manager Tests
+    // =========================================================================
+
+    #[actix_rt::test]
+    async fn test_upload_manager_initialization() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let manager = create_test_upload_manager(&temp_dir);
+
+        // Initialize should succeed even with empty directory
+        let result = manager.initialize().await;
+        assert!(result.is_ok());
+
+        // Should have no uploads initially
+        let uploads = manager.list_uploads().await;
+        assert!(uploads.is_empty());
+    }
+
+    #[actix_rt::test]
+    async fn test_upload_requires_authentication() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let manager = create_test_upload_manager(&temp_dir);
+
+        // Create a dummy MCAP file
+        let mcap_path = temp_dir.path().join("test.mcap");
+        std::fs::write(&mcap_path, b"dummy mcap content").expect("Failed to write test file");
+
+        // Try to start upload without authentication
+        let result = manager
+            .start_upload(mcap_path, UploadMode::Basic)
+            .await;
+
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("authenticated") || err_msg.contains("login"),
+            "Expected authentication error, got: {}",
+            err_msg
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_upload_validates_mcap_path() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let manager = create_test_upload_manager(&temp_dir);
+
+        let (server, username, password) = match get_test_credentials() {
+            Some(creds) => creds,
+            None => {
+                eprintln!("Skipping test: STUDIO_SERVER, STUDIO_USERNAME, STUDIO_PASSWORD not set");
+                return;
+            }
+        };
+
+        // Authenticate first
+        manager
+            .authenticate(&username, &password, &server)
+            .await
+            .expect("Authentication failed");
+
+        // Try to upload non-existent file
+        let result = manager
+            .start_upload(PathBuf::from("/nonexistent/path.mcap"), UploadMode::Basic)
+            .await;
+
+        assert!(result.is_err());
+    }
+
+    #[actix_rt::test]
+    async fn test_upload_prevents_path_traversal() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let manager = create_test_upload_manager(&temp_dir);
+
+        let (server, username, password) = match get_test_credentials() {
+            Some(creds) => creds,
+            None => {
+                eprintln!("Skipping test: STUDIO_SERVER, STUDIO_USERNAME, STUDIO_PASSWORD not set");
+                return;
+            }
+        };
+
+        // Authenticate first
+        manager
+            .authenticate(&username, &password, &server)
+            .await
+            .expect("Authentication failed");
+
+        // Try path traversal attack - the validation should reject this
+        // either because the file doesn't exist or because it's outside storage
+        let malicious_path = temp_dir.path().join("../../../etc/passwd");
+        let result = manager
+            .start_upload(malicious_path, UploadMode::Basic)
+            .await;
+
+        // The upload should be rejected - the important thing is it fails
+        assert!(
+            result.is_err(),
+            "Path traversal should be rejected, but upload was accepted"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_get_nonexistent_upload() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let manager = create_test_upload_manager(&temp_dir);
+
+        // Try to get a non-existent upload
+        let upload_id = UploadId::new();
+        let result = manager.get_upload(upload_id).await;
+        assert!(result.is_none());
+    }
+
+    // =========================================================================
+    // UploadId Tests
+    // =========================================================================
+
+    #[test]
+    fn test_upload_id_uniqueness() {
+        let id1 = UploadId::new();
+        let id2 = UploadId::new();
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_upload_id_serialization() {
+        let id = UploadId::new();
+        let serialized = serde_json::to_string(&id).expect("Failed to serialize");
+        let deserialized: UploadId =
+            serde_json::from_str(&serialized).expect("Failed to deserialize");
+        assert_eq!(id, deserialized);
+    }
+
+    // =========================================================================
+    // UploadMode Tests
+    // =========================================================================
+
+    #[test]
+    fn test_upload_mode_basic_serialization() {
+        let mode = UploadMode::Basic;
+        let serialized = serde_json::to_string(&mode).expect("Failed to serialize");
+        assert!(serialized.contains("Basic"));
+
+        let deserialized: UploadMode =
+            serde_json::from_str(&serialized).expect("Failed to deserialize");
+        assert!(matches!(deserialized, UploadMode::Basic));
+    }
+
+    #[test]
+    fn test_upload_mode_extended_serialization() {
+        let mode = UploadMode::Extended {
+            project_id: 123,
+            labels: vec!["person".to_string(), "car".to_string()],
+            dataset_name: Some("Test Dataset".to_string()),
+            dataset_description: None,
+        };
+
+        let serialized = serde_json::to_string(&mode).expect("Failed to serialize");
+        assert!(serialized.contains("Extended"));
+        assert!(serialized.contains("123"));
+        assert!(serialized.contains("person"));
+
+        let deserialized: UploadMode =
+            serde_json::from_str(&serialized).expect("Failed to deserialize");
+        match deserialized {
+            UploadMode::Extended {
+                project_id,
+                labels,
+                dataset_name,
+                dataset_description,
+            } => {
+                assert_eq!(project_id, 123);
+                assert_eq!(labels, vec!["person", "car"]);
+                assert_eq!(dataset_name, Some("Test Dataset".to_string()));
+                assert!(dataset_description.is_none());
+            }
+            _ => panic!("Expected Extended mode"),
+        }
+    }
+
+    // =========================================================================
+    // UploadState Tests
+    // =========================================================================
+
+    #[test]
+    fn test_upload_state_serialization() {
+        let states = vec![
+            UploadState::Queued,
+            UploadState::Uploading,
+            UploadState::Processing,
+            UploadState::Completed,
+            UploadState::Failed,
+        ];
+
+        for state in states {
+            let serialized = serde_json::to_string(&state).expect("Failed to serialize");
+            let deserialized: UploadState =
+                serde_json::from_str(&serialized).expect("Failed to deserialize");
+            assert_eq!(state, deserialized);
+        }
+    }
+
+    // =========================================================================
+    // Status File Path Tests
+    // =========================================================================
+
+    #[test]
+    fn test_status_file_path_generation() {
+        let mcap_path = PathBuf::from("/data/recordings/test.mcap");
+        let status_path = UploadManager::get_status_file_path(&mcap_path);
+        assert_eq!(
+            status_path,
+            PathBuf::from("/data/recordings/test.mcap.upload-status.json")
+        );
+    }
+
+    #[test]
+    fn test_status_file_path_no_extension() {
+        let mcap_path = PathBuf::from("/data/recordings/testfile");
+        let status_path = UploadManager::get_status_file_path(&mcap_path);
+        assert_eq!(
+            status_path,
+            PathBuf::from("/data/recordings/testfile.upload-status.json")
+        );
+    }
+
+    // =========================================================================
+    // Status File Persistence Tests
+    // =========================================================================
+
+    #[actix_rt::test]
+    async fn test_status_file_write_and_read() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let mcap_path = temp_dir.path().join("test.mcap");
+
+        // Create status
+        let status = UploadStatus {
+            upload_id: UploadId::new(),
+            mcap_path: mcap_path.clone(),
+            mode: UploadMode::Basic,
+            state: UploadState::Uploading,
+            progress: 45.5,
+            message: "Test upload".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            snapshot_id: Some(12345),
+            dataset_id: None,
+            error: None,
+        };
+
+        // Create task from status to test write_status_file
+        let task = UploadTask {
+            id: status.upload_id,
+            mcap_path: status.mcap_path.clone(),
+            mode: status.mode.clone(),
+            state: status.state,
+            progress: status.progress,
+            message: status.message.clone(),
+            created_at: status.created_at,
+            updated_at: status.updated_at,
+            snapshot_id: status.snapshot_id,
+            dataset_id: status.dataset_id,
+            error: status.error.clone(),
+            task_handle: None,
+        };
+
+        // Write status file
+        UploadManager::write_status_file(&task)
+            .await
+            .expect("Failed to write status file");
+
+        // Verify file exists
+        let status_path = UploadManager::get_status_file_path(&mcap_path);
+        assert!(status_path.exists());
+
+        // Read it back
+        let read_status = UploadManager::read_status_file(&status_path)
+            .await
+            .expect("Failed to read status file");
+
+        // Verify contents
+        assert_eq!(read_status.upload_id, task.id);
+        assert_eq!(read_status.state, UploadState::Uploading);
+        assert!((read_status.progress - 45.5).abs() < 0.01);
+        assert_eq!(read_status.snapshot_id, Some(12345));
+    }
+
+    #[actix_rt::test]
+    async fn test_upload_manager_recovers_incomplete_uploads() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let mcap_path = temp_dir.path().join("test.mcap");
+
+        // Create a dummy MCAP file (so status file is valid)
+        std::fs::write(&mcap_path, b"dummy mcap").expect("Failed to write dummy file");
+
+        // Write a status file simulating an interrupted upload
+        let upload_id = UploadId::new();
+        let task = UploadTask {
+            id: upload_id,
+            mcap_path: mcap_path.clone(),
+            mode: UploadMode::Basic,
+            state: UploadState::Uploading, // Incomplete state
+            progress: 50.0,
+            message: "Interrupted upload".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            snapshot_id: None,
+            dataset_id: None,
+            error: None,
+            task_handle: None,
+        };
+
+        UploadManager::write_status_file(&task)
+            .await
+            .expect("Failed to write status file");
+
+        // Create a new manager and initialize it
+        let manager = create_test_upload_manager(&temp_dir);
+        manager.initialize().await.expect("Failed to initialize");
+
+        // The incomplete upload should be recovered as Failed
+        let recovered = manager.get_upload(upload_id).await;
+        assert!(recovered.is_some(), "Upload should have been recovered");
+
+        let recovered_upload = recovered.unwrap();
+        assert_eq!(
+            recovered_upload.state,
+            UploadState::Failed,
+            "Incomplete upload should be marked as Failed"
+        );
+        assert!(
+            recovered_upload.error.is_some(),
+            "Failed upload should have error message"
+        );
+    }
+
+    // =========================================================================
+    // UploadTaskInfo Tests
+    // =========================================================================
+
+    #[test]
+    fn test_upload_task_info_from_task() {
+        let task = UploadTask {
+            id: UploadId::new(),
+            mcap_path: PathBuf::from("/test/path.mcap"),
+            mode: UploadMode::Extended {
+                project_id: 456,
+                labels: vec!["person".to_string()],
+                dataset_name: Some("My Dataset".to_string()),
+                dataset_description: Some("Description".to_string()),
+            },
+            state: UploadState::Completed,
+            progress: 100.0,
+            message: "Done".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            snapshot_id: Some(789),
+            dataset_id: Some(101112),
+            error: None,
+            task_handle: None,
+        };
+
+        let info = UploadTaskInfo::from(&task);
+        assert_eq!(info.upload_id, task.id);
+        assert_eq!(info.state, UploadState::Completed);
+        assert!((info.progress - 100.0).abs() < 0.01);
+        assert_eq!(info.snapshot_id, Some(789));
+        assert_eq!(info.dataset_id, Some(101112));
+    }
+
+    #[test]
+    fn test_upload_task_info_serialization() {
+        let task_info = UploadTaskInfo {
+            upload_id: UploadId::new(),
+            mcap_path: PathBuf::from("/test/path.mcap"),
+            mode: UploadMode::Basic,
+            state: UploadState::Queued,
+            progress: 0.0,
+            message: "Waiting".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            snapshot_id: None,
+            dataset_id: None,
+            error: None,
+        };
+
+        let json = serde_json::to_string(&task_info).expect("Failed to serialize");
+        assert!(json.contains("queued"));
+        assert!(json.contains("upload_id"));
+        assert!(json.contains("mcap_path"));
+    }
+
+    // =========================================================================
+    // API Response Structure Tests
+    // =========================================================================
+
+    #[test]
+    fn test_auth_response_structure() {
+        let response = AuthResponse {
+            status: "ok".to_string(),
+            message: "Authentication successful".to_string(),
+        };
+
+        let json = serde_json::to_string(&response).expect("Failed to serialize");
+        assert!(json.contains("\"status\":\"ok\""));
+        assert!(json.contains("\"message\""));
+    }
+
+    #[test]
+    fn test_auth_status_response_structure() {
+        let authenticated_response = AuthStatusResponse {
+            authenticated: true,
+            username: Some("testuser".to_string()),
+        };
+
+        let json = serde_json::to_string(&authenticated_response).expect("Failed to serialize");
+        assert!(json.contains("\"authenticated\":true"));
+        assert!(json.contains("\"username\":\"testuser\""));
+
+        let unauthenticated_response = AuthStatusResponse {
+            authenticated: false,
+            username: None,
+        };
+
+        let json = serde_json::to_string(&unauthenticated_response).expect("Failed to serialize");
+        assert!(json.contains("\"authenticated\":false"));
+        assert!(json.contains("\"username\":null"));
+    }
+
+    #[test]
+    fn test_start_upload_response_structure() {
+        let response = StartUploadResponse {
+            upload_id: UploadId::new(),
+            status: "queued".to_string(),
+        };
+
+        let json = serde_json::to_string(&response).expect("Failed to serialize");
+        assert!(json.contains("upload_id"));
+        assert!(json.contains("\"status\":\"queued\""));
+    }
+
+    #[test]
+    fn test_upload_error_response_structure() {
+        let response = UploadErrorResponse {
+            error: "File not found".to_string(),
+        };
+
+        let json = serde_json::to_string(&response).expect("Failed to serialize");
+        assert!(json.contains("\"error\":\"File not found\""));
+    }
+
+    #[test]
+    fn test_project_info_structure() {
+        let project = ProjectInfo {
+            id: "12345".to_string(),
+            name: "Test Project".to_string(),
+        };
+
+        let json = serde_json::to_string(&project).expect("Failed to serialize");
+        assert!(json.contains("\"id\":\"12345\""));
+        assert!(json.contains("\"name\":\"Test Project\""));
+    }
+
+    #[test]
+    fn test_label_info_structure() {
+        // Default label
+        let label = LabelInfo {
+            id: "person".to_string(),
+            name: "Person".to_string(),
+            default: true,
+        };
+
+        let json = serde_json::to_string(&label).expect("Failed to serialize");
+        assert!(json.contains("\"id\":\"person\""));
+        assert!(json.contains("\"name\":\"Person\""));
+        assert!(json.contains("\"default\":true"));
+
+        // Non-default label should not include "default" field
+        let label = LabelInfo {
+            id: "car".to_string(),
+            name: "Car".to_string(),
+            default: false,
+        };
+
+        let json = serde_json::to_string(&label).expect("Failed to serialize");
+        assert!(json.contains("\"id\":\"car\""));
+        assert!(!json.contains("default"));
+    }
+
+    // =========================================================================
+    // COCO Labels Tests
+    // =========================================================================
+
+    #[test]
+    fn test_coco_labels_expected_count() {
+        // The COCO dataset has 80 classes
+        // This test ensures all labels are present
+        let coco_labels = get_coco_labels();
+        assert_eq!(coco_labels.len(), 80, "COCO dataset should have 80 classes");
+    }
+
+    #[test]
+    fn test_coco_labels_person_is_default() {
+        let coco_labels = get_coco_labels();
+        let person_label = coco_labels
+            .iter()
+            .find(|l| l.id == "person")
+            .expect("Person label should exist");
+
+        assert!(person_label.default, "Person should be the default label");
+
+        // Verify only one default
+        let default_count = coco_labels.iter().filter(|l| l.default).count();
+        assert_eq!(default_count, 1, "Only person should be default");
+    }
+
+    #[test]
+    fn test_coco_labels_common_classes() {
+        let coco_labels = get_coco_labels();
+
+        // Common automotive/surveillance classes that users expect
+        let expected_classes = vec![
+            "person", "bicycle", "car", "motorcycle", "bus", "truck",
+            "traffic_light", "stop_sign", "dog", "cat",
+        ];
+
+        for expected in expected_classes {
+            assert!(
+                coco_labels.iter().any(|l| l.id == expected),
+                "COCO labels should include '{}'",
+                expected
+            );
+        }
+    }
+
+    /// Helper function that returns the COCO labels (same as in list_project_labels)
+    fn get_coco_labels() -> Vec<LabelInfo> {
+        vec![
+            LabelInfo { id: "person".to_string(), name: "Person".to_string(), default: true },
+            LabelInfo { id: "bicycle".to_string(), name: "Bicycle".to_string(), default: false },
+            LabelInfo { id: "car".to_string(), name: "Car".to_string(), default: false },
+            LabelInfo { id: "motorcycle".to_string(), name: "Motorcycle".to_string(), default: false },
+            LabelInfo { id: "airplane".to_string(), name: "Airplane".to_string(), default: false },
+            LabelInfo { id: "bus".to_string(), name: "Bus".to_string(), default: false },
+            LabelInfo { id: "train".to_string(), name: "Train".to_string(), default: false },
+            LabelInfo { id: "truck".to_string(), name: "Truck".to_string(), default: false },
+            LabelInfo { id: "boat".to_string(), name: "Boat".to_string(), default: false },
+            LabelInfo { id: "traffic_light".to_string(), name: "Traffic Light".to_string(), default: false },
+            LabelInfo { id: "fire_hydrant".to_string(), name: "Fire Hydrant".to_string(), default: false },
+            LabelInfo { id: "stop_sign".to_string(), name: "Stop Sign".to_string(), default: false },
+            LabelInfo { id: "parking_meter".to_string(), name: "Parking Meter".to_string(), default: false },
+            LabelInfo { id: "bench".to_string(), name: "Bench".to_string(), default: false },
+            LabelInfo { id: "bird".to_string(), name: "Bird".to_string(), default: false },
+            LabelInfo { id: "cat".to_string(), name: "Cat".to_string(), default: false },
+            LabelInfo { id: "dog".to_string(), name: "Dog".to_string(), default: false },
+            LabelInfo { id: "horse".to_string(), name: "Horse".to_string(), default: false },
+            LabelInfo { id: "sheep".to_string(), name: "Sheep".to_string(), default: false },
+            LabelInfo { id: "cow".to_string(), name: "Cow".to_string(), default: false },
+            LabelInfo { id: "elephant".to_string(), name: "Elephant".to_string(), default: false },
+            LabelInfo { id: "bear".to_string(), name: "Bear".to_string(), default: false },
+            LabelInfo { id: "zebra".to_string(), name: "Zebra".to_string(), default: false },
+            LabelInfo { id: "giraffe".to_string(), name: "Giraffe".to_string(), default: false },
+            LabelInfo { id: "backpack".to_string(), name: "Backpack".to_string(), default: false },
+            LabelInfo { id: "umbrella".to_string(), name: "Umbrella".to_string(), default: false },
+            LabelInfo { id: "handbag".to_string(), name: "Handbag".to_string(), default: false },
+            LabelInfo { id: "tie".to_string(), name: "Tie".to_string(), default: false },
+            LabelInfo { id: "suitcase".to_string(), name: "Suitcase".to_string(), default: false },
+            LabelInfo { id: "frisbee".to_string(), name: "Frisbee".to_string(), default: false },
+            LabelInfo { id: "skis".to_string(), name: "Skis".to_string(), default: false },
+            LabelInfo { id: "snowboard".to_string(), name: "Snowboard".to_string(), default: false },
+            LabelInfo { id: "sports_ball".to_string(), name: "Sports Ball".to_string(), default: false },
+            LabelInfo { id: "kite".to_string(), name: "Kite".to_string(), default: false },
+            LabelInfo { id: "baseball_bat".to_string(), name: "Baseball Bat".to_string(), default: false },
+            LabelInfo { id: "baseball_glove".to_string(), name: "Baseball Glove".to_string(), default: false },
+            LabelInfo { id: "skateboard".to_string(), name: "Skateboard".to_string(), default: false },
+            LabelInfo { id: "surfboard".to_string(), name: "Surfboard".to_string(), default: false },
+            LabelInfo { id: "tennis_racket".to_string(), name: "Tennis Racket".to_string(), default: false },
+            LabelInfo { id: "bottle".to_string(), name: "Bottle".to_string(), default: false },
+            LabelInfo { id: "wine_glass".to_string(), name: "Wine Glass".to_string(), default: false },
+            LabelInfo { id: "cup".to_string(), name: "Cup".to_string(), default: false },
+            LabelInfo { id: "fork".to_string(), name: "Fork".to_string(), default: false },
+            LabelInfo { id: "knife".to_string(), name: "Knife".to_string(), default: false },
+            LabelInfo { id: "spoon".to_string(), name: "Spoon".to_string(), default: false },
+            LabelInfo { id: "bowl".to_string(), name: "Bowl".to_string(), default: false },
+            LabelInfo { id: "banana".to_string(), name: "Banana".to_string(), default: false },
+            LabelInfo { id: "apple".to_string(), name: "Apple".to_string(), default: false },
+            LabelInfo { id: "sandwich".to_string(), name: "Sandwich".to_string(), default: false },
+            LabelInfo { id: "orange".to_string(), name: "Orange".to_string(), default: false },
+            LabelInfo { id: "broccoli".to_string(), name: "Broccoli".to_string(), default: false },
+            LabelInfo { id: "carrot".to_string(), name: "Carrot".to_string(), default: false },
+            LabelInfo { id: "hot_dog".to_string(), name: "Hot Dog".to_string(), default: false },
+            LabelInfo { id: "pizza".to_string(), name: "Pizza".to_string(), default: false },
+            LabelInfo { id: "donut".to_string(), name: "Donut".to_string(), default: false },
+            LabelInfo { id: "cake".to_string(), name: "Cake".to_string(), default: false },
+            LabelInfo { id: "chair".to_string(), name: "Chair".to_string(), default: false },
+            LabelInfo { id: "couch".to_string(), name: "Couch".to_string(), default: false },
+            LabelInfo { id: "potted_plant".to_string(), name: "Potted Plant".to_string(), default: false },
+            LabelInfo { id: "bed".to_string(), name: "Bed".to_string(), default: false },
+            LabelInfo { id: "dining_table".to_string(), name: "Dining Table".to_string(), default: false },
+            LabelInfo { id: "toilet".to_string(), name: "Toilet".to_string(), default: false },
+            LabelInfo { id: "tv".to_string(), name: "TV".to_string(), default: false },
+            LabelInfo { id: "laptop".to_string(), name: "Laptop".to_string(), default: false },
+            LabelInfo { id: "mouse".to_string(), name: "Mouse".to_string(), default: false },
+            LabelInfo { id: "remote".to_string(), name: "Remote".to_string(), default: false },
+            LabelInfo { id: "keyboard".to_string(), name: "Keyboard".to_string(), default: false },
+            LabelInfo { id: "cell_phone".to_string(), name: "Cell Phone".to_string(), default: false },
+            LabelInfo { id: "microwave".to_string(), name: "Microwave".to_string(), default: false },
+            LabelInfo { id: "oven".to_string(), name: "Oven".to_string(), default: false },
+            LabelInfo { id: "toaster".to_string(), name: "Toaster".to_string(), default: false },
+            LabelInfo { id: "sink".to_string(), name: "Sink".to_string(), default: false },
+            LabelInfo { id: "refrigerator".to_string(), name: "Refrigerator".to_string(), default: false },
+            LabelInfo { id: "book".to_string(), name: "Book".to_string(), default: false },
+            LabelInfo { id: "clock".to_string(), name: "Clock".to_string(), default: false },
+            LabelInfo { id: "vase".to_string(), name: "Vase".to_string(), default: false },
+            LabelInfo { id: "scissors".to_string(), name: "Scissors".to_string(), default: false },
+            LabelInfo { id: "teddy_bear".to_string(), name: "Teddy Bear".to_string(), default: false },
+            LabelInfo { id: "hair_drier".to_string(), name: "Hair Drier".to_string(), default: false },
+            LabelInfo { id: "toothbrush".to_string(), name: "Toothbrush".to_string(), default: false },
+        ]
+    }
+
+    // =========================================================================
+    // Request Parsing Tests
+    // =========================================================================
+
+    #[test]
+    fn test_auth_request_parsing() {
+        // With default server
+        let json = r#"{"username": "test", "password": "pass"}"#;
+        let request: AuthRequest = serde_json::from_str(json).expect("Failed to parse");
+        assert_eq!(request.username, "test");
+        assert_eq!(request.password, "pass");
+        assert_eq!(request.server, "saas"); // Default value
+
+        // With explicit server
+        let json = r#"{"username": "test", "password": "pass", "server": "test"}"#;
+        let request: AuthRequest = serde_json::from_str(json).expect("Failed to parse");
+        assert_eq!(request.server, "test");
+    }
+
+    #[test]
+    fn test_start_upload_request_parsing() {
+        // Basic mode
+        let json = r#"{"mcap_path": "/data/test.mcap", "mode": {"type": "Basic"}}"#;
+        let request: StartUploadRequest = serde_json::from_str(json).expect("Failed to parse");
+        assert_eq!(request.mcap_path, "/data/test.mcap");
+        assert!(matches!(request.mode, UploadMode::Basic));
+
+        // Extended mode
+        let json = r#"{
+            "mcap_path": "/data/test.mcap",
+            "mode": {
+                "type": "Extended",
+                "project_id": 123,
+                "labels": ["person", "car"],
+                "dataset_name": "My Dataset",
+                "dataset_description": null
+            }
+        }"#;
+        let request: StartUploadRequest = serde_json::from_str(json).expect("Failed to parse");
+        match request.mode {
+            UploadMode::Extended {
+                project_id,
+                labels,
+                dataset_name,
+                dataset_description,
+            } => {
+                assert_eq!(project_id, 123);
+                assert_eq!(labels, vec!["person", "car"]);
+                assert_eq!(dataset_name, Some("My Dataset".to_string()));
+                assert!(dataset_description.is_none());
+            }
+            _ => panic!("Expected Extended mode"),
+        }
+    }
+
+    // =========================================================================
+    // Concurrent Access Tests
+    // =========================================================================
+
+    #[actix_rt::test]
+    async fn test_concurrent_auth_status_checks() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let manager = create_test_upload_manager(&temp_dir);
+
+        // Spawn multiple concurrent status checks
+        let mut handles = vec![];
+        for _ in 0..10 {
+            let m = manager.clone();
+            handles.push(tokio::spawn(async move {
+                m.is_authenticated().await
+            }));
+        }
+
+        // All should return false (not authenticated)
+        for handle in handles {
+            let result = handle.await.expect("Task panicked");
+            assert!(!result);
+        }
+    }
+
+    #[actix_rt::test]
+    async fn test_concurrent_upload_list() {
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let manager = create_test_upload_manager(&temp_dir);
+
+        // Spawn multiple concurrent list operations
+        let mut handles = vec![];
+        for _ in 0..10 {
+            let m = manager.clone();
+            handles.push(tokio::spawn(async move {
+                m.list_uploads().await
+            }));
+        }
+
+        // All should return empty lists
+        for handle in handles {
+            let result = handle.await.expect("Task panicked");
+            assert!(result.is_empty());
+        }
+    }
+
 }

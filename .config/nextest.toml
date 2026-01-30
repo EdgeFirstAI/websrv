@@ -15,8 +15,8 @@ junit.store-failure-output = true
 retries = 0  # Don't retry failed tests by default
 fail-fast = false  # Run all tests even if some fail
 
-# Test threads (0 = number of logical CPUs)
-test-threads = 0
+# Test threads (num-cpus = number of logical CPUs)
+test-threads = "num-cpus"
 
 # Timeout settings
 slow-timeout = { period = "60s", terminate-after = 2 }
@@ -47,7 +47,7 @@ test-threads = 1
 # Filter settings for hardware-dependent tests
 [[profile.hil.overrides]]
 filter = 'test(hardware)'
-test-threads = 1
+threads-required = 1
 
 # Example: Platform-specific test configuration
 # [[profile.default.overrides]]

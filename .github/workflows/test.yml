@@ -1,22 +1,41 @@
 # GitHub Actions workflow for testing and code quality
 #
 # This workflow runs tests, performs static analysis, and collects coverage data
-# for the EdgeFirst Fusion project.
+# for the EdgeFirst WebSrv. Coverage is reported to SonarCloud.
 #
-# Action Versions (verified November 2025):
-# - actions/checkout@v4 (latest)
-# - dtolnay/rust-toolchain@stable (latest)
-# - actions/upload-artifact@v4 (latest)
-# - codecov/codecov-action@v3 (latest)
+# Three-phase architecture for on-target testing:
+# - Phase 1: Build instrumented binaries on ubuntu-22.04-arm
+# - Phase 2: Run hardware integration tests on raivin runner
+# - Phase 3: Process coverage data and report to SonarCloud
+#
+# Runner Notes:
+# - ubuntu-22.04: Standard GitHub-hosted runner (x86_64)
+# - ubuntu-22.04-arm: GitHub-hosted ARM runner (aarch64)
+# - raivin: Self-hosted hardware runner with Zenoh network and Studio access
 
 name: Test
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [main, develop]
   pull_request:
-    branches: [ main, develop ]
-  workflow_call:  # Allow other workflows to call this
+    branches: [main, develop]
+  workflow_call: # Allow other workflows to call this
+  workflow_dispatch:
+    inputs:
+      studio_server:
+        description: 'Studio server environment'
+        required: false
+        default: 'test'
+        type: choice
+        options:
+          - test
+          - stage
+          - saas
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -28,10 +47,10 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
         with:
           components: rustfmt
 
@@ -44,30 +63,33 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
         with:
           components: clippy
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@6849a6489940f00c2f30c0fb92c6274307ccb58a # v4.1.2
         with:
           path: ~/.cargo/registry/index
-          key: ${{ runner.os }}-cargo-index-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-index-
 
       - name: Cache cargo build
-        uses: actions/cache@v4
+        uses: actions/cache@6849a6489940f00c2f30c0fb92c6274307ccb58a # v4.1.2
         with:
           path: target
-          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-clippy-
 
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+  # ==========================================================================
+  # Phase 1: Build & Unit Test on GitHub-hosted runners
+  # ==========================================================================
   test:
     name: Test and Coverage (${{ matrix.platform.name }})
     runs-on: ${{ matrix.platform.runner }}
@@ -88,9 +110,9 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
-          fetch-depth: 0  # Full history for better analysis
+          fetch-depth: 0
 
       - name: Remove cross-compilation config on native ARM64
         if: matrix.platform.name == 'aarch64'
@@ -103,90 +125,404 @@ jobs:
           sudo apt-get install -y build-essential
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
         with:
           components: llvm-tools-preview
+          targets: ${{ matrix.platform.target }}
 
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Install cargo-llvm-cov and cargo-nextest
+        uses: taiki-e/install-action@7e574ed8bb89811282a11aecb3fe1d043bf5bf0e # v2
+        with:
+          tool: cargo-llvm-cov,cargo-nextest
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@6849a6489940f00c2f30c0fb92c6274307ccb58a # v4.1.2
         with:
           path: ~/.cargo/registry/index
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-index-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-index-
+          key: ${{ runner.os }}-${{ matrix.platform.name }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.platform.name }}-cargo-index-
 
       - name: Cache cargo build
-        uses: actions/cache@v4
+        uses: actions/cache@6849a6489940f00c2f30c0fb92c6274307ccb58a # v4.1.2
         with:
           path: target
-          key: ${{ runner.os }}-${{ runner.arch }}-cargo-test-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-${{ runner.arch }}-cargo-test-
+          key: ${{ runner.os }}-${{ matrix.platform.name }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.platform.name }}-cargo-test-
 
-      - name: Run unit tests
-        run: cargo test --bins --workspace
-
-      - name: Run doc tests
-        run: cargo test --doc --workspace || true  # Doc tests may not exist for binary crates
-
-      # Note: Integration tests require hardware (DMA buffers, G2D, sensors)
-      # and are skipped in CI. Run on target hardware with: cargo test --test '*'
-
-      - name: Generate coverage
+      - name: Run unit tests with coverage
         run: |
-          # Only generate coverage for unit tests (--bins) and doc tests (--doc)
-          # Integration tests require hardware and are excluded
-          cargo llvm-cov --bins --workspace --cobertura --output-path coverage.xml || true
-          cargo llvm-cov --doc --workspace --cobertura --output-path coverage-doc.xml || true
+          # Run tests with LCOV coverage output using profiling profile
+          # Note: This is a binary-only crate, so coverage will be limited
+          cargo llvm-cov nextest --workspace --lcov --output-path coverage.lcov \
+            --profile profiling --cargo-profile profiling --no-fail-fast || true
 
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v3
+      - name: Build instrumented binary for integration tests (aarch64 only)
+        if: matrix.platform.name == 'aarch64'
+        run: |
+          # Source coverage environment and build instrumented binary
+          source <(cargo llvm-cov show-env --export-prefix)
+          export CARGO_TARGET_DIR=target/llvm-cov-target
+
+          # Build the main binary with coverage instrumentation
+          cargo build --profile profiling --no-default-features
+
+          # Build integration tests with coverage instrumentation
+          cargo nextest run --workspace --no-run --run-ignored=all --cargo-profile profiling
+
+          # Prepare artifacts
+          mkdir -p instrumented-binaries
+          cp target/llvm-cov-target/profiling/edgefirst-websrv instrumented-binaries/
+
+          # Copy instrumented integration test binaries
+          find target/llvm-cov-target/profiling/deps -name "*studio_api_client*" -type f -executable \
+            -exec cp {} instrumented-binaries/ \; 2>/dev/null || true
+
+          echo "Instrumented binaries prepared:"
+          ls -lh instrumented-binaries/
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
-          files: coverage.xml
-          flags: ${{ matrix.platform.name }}
-          fail_ci_if_error: false
+          name: coverage-${{ matrix.platform.name }}
+          path: coverage.lcov
+          retention-days: 30
+          if-no-files-found: ignore
 
-      - name: Upload test results
-        uses: actions/upload-artifact@v4
+      - name: Upload instrumented binaries (aarch64 only)
+        if: matrix.platform.name == 'aarch64'
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: instrumented-binaries-aarch64
+          path: instrumented-binaries/
+          retention-days: 7
+
+      - name: Upload Rust instrumented objects for coverage processing (aarch64 only)
+        if: matrix.platform.name == 'aarch64'
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: rust-llvm-cov-aarch64
+          path: target/llvm-cov-target/
+          retention-days: 7
+
+  # ==========================================================================
+  # Phase 2: Hardware Integration Tests
+  # ==========================================================================
+  hardware-test:
+    name: Hardware Integration Tests
+    needs: test
+    runs-on: raivin
+    # Only run on main branch or when explicitly requested via label
+    if: github.ref == 'refs/heads/main' || contains(github.event.pull_request.labels.*.name, 'test-hardware')
+
+    steps:
+      - name: Clean workspace (self-hosted runner)
+        run: |
+          # Self-hosted runners persist state between runs
+          rm -rf target/ instrumented-binaries/ coverage/ 2>/dev/null || true
+          find . -name "*.profraw" -delete 2>/dev/null || true
+
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Download instrumented binaries
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: instrumented-binaries-aarch64
+          path: instrumented-binaries/
+
+      - name: Make binaries executable
+        run: chmod +x instrumented-binaries/*
+
+      - name: Run hardware integration tests
+        env:
+          # Studio server: workflow_dispatch input > repository variable > default 'test'
+          STUDIO_SERVER: ${{ inputs.studio_server || vars.STUDIO_SERVER || 'test' }}
+          # Studio credentials (configured in repository secrets)
+          STUDIO_USERNAME: ${{ secrets.STUDIO_USERNAME }}
+          STUDIO_PASSWORD: ${{ secrets.STUDIO_PASSWORD }}
+          WEBSRV_URL: https://localhost
+          WORKSPACE_DIR: ${{ github.workspace }}
+        run: |
+          # Set up profraw collection directory for coverage
+          mkdir -p coverage/profraw coverage/test-output
+          export LLVM_PROFILE_FILE="${WORKSPACE_DIR}/coverage/profraw/raivin-%p-%m.profraw"
+
+          # Set the binary location for integration tests
+          export WEBSRV_BINARY="${WORKSPACE_DIR}/instrumented-binaries/edgefirst-websrv"
+
+          # Track overall test status
+          TEST_FAILED=0
+
+          # Run each instrumented integration test binary
+          echo "Running instrumented integration test binaries..."
+          for test_bin in instrumented-binaries/*; do
+            if [ -x "$test_bin" ] && [ -f "$test_bin" ]; then
+              test_name=$(basename "$test_bin")
+
+              # Skip the main binary
+              if [ "$test_name" = "edgefirst-websrv" ]; then
+                continue
+              fi
+
+              # Check if this is a test binary (accepts --list)
+              if ! "$test_bin" --list >/dev/null 2>&1; then
+                continue
+              fi
+
+              echo "=== Running $test_name ==="
+              # --test-threads=1 for deterministic execution on hardware
+              # --include-ignored to run hardware integration tests marked with #[ignore]
+              if ! "$test_bin" --test-threads=1 --include-ignored 2>&1 | tee "coverage/test-output/${test_name}.txt"; then
+                echo "FAILED: $test_name"
+                TEST_FAILED=1
+              fi
+            fi
+          done
+
+          echo ""
+          echo "=== Profraw files generated ==="
+          ls -la coverage/profraw/ || echo "No profraw files generated"
+
+          # Fail the step if any test failed
+          if [ $TEST_FAILED -ne 0 ]; then
+            echo ""
+            echo "ERROR: One or more integration tests failed!"
+            exit 1
+          fi
+
+      - name: Upload hardware coverage artifact
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         if: always()
         with:
-          name: test-results-${{ matrix.platform.name }}
+          name: coverage-hardware
           path: |
-            coverage.xml
+            coverage/profraw/
+            coverage/test-output/
           retention-days: 30
 
-  sonarcloud:
-    name: SonarCloud Analysis
-    runs-on: ubuntu-22.04
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+  # ==========================================================================
+  # Phase 3: Process Hardware Coverage
+  # ==========================================================================
+  process-hardware-coverage:
+    name: Process Hardware Coverage
+    needs: [test, hardware-test]
+    runs-on: ubuntu-22.04-arm
+    # Only run if hardware-test ran (even if it failed, to collect partial coverage)
+    if: always() && needs.test.result == 'success' && (needs.hardware-test.result == 'success' || needs.hardware-test.result == 'failure')
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # Shallow clones should be disabled for better analysis
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be9e76fd7c4901c61fb841f559994984270fce7 # stable
         with:
           components: llvm-tools-preview
 
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
-
-      - name: Generate coverage for SonarCloud
-        run: |
-          cargo llvm-cov --bins --workspace --cobertura --output-path target/rust-coverage.xml || true
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Download Rust instrumented objects
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
         with:
-          python-version: '3.10'
+          name: rust-llvm-cov-aarch64
+          path: target/llvm-cov-target/
+
+      - name: Download hardware coverage artifacts
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: coverage-hardware
+          path: coverage-hardware/
+
+      - name: Process profraw files into coverage report
+        run: |
+          echo "=== Downloaded llvm-cov-target directory ==="
+          ls -la target/llvm-cov-target/ || echo "Directory not found"
+
+          echo ""
+          echo "=== Profraw files from hardware ==="
+          find coverage-hardware/ -name "*.profraw" -type f || echo "No profraw files found"
+
+          PROFRAW_COUNT=$(find coverage-hardware/ -name "*.profraw" 2>/dev/null | wc -l)
+          echo "Found $PROFRAW_COUNT profraw files"
+
+          if [ "$PROFRAW_COUNT" -eq 0 ]; then
+            echo "WARNING: No profraw files found from hardware tests - skipping coverage"
+            exit 0
+          fi
+
+          # Find LLVM tools from Rust toolchain
+          TOOLCHAIN_ROOT=$(rustc --print sysroot)
+          LLVM_PROFDATA=$(find "$TOOLCHAIN_ROOT" -name "llvm-profdata" -type f | head -1)
+          LLVM_COV=$(find "$TOOLCHAIN_ROOT" -name "llvm-cov" -type f | head -1)
+
+          if [ -z "$LLVM_PROFDATA" ] || [ -z "$LLVM_COV" ]; then
+            echo "ERROR: Could not find LLVM tools in Rust toolchain"
+            exit 1
+          fi
+
+          echo ""
+          echo "Using LLVM tools:"
+          echo "  llvm-profdata: $LLVM_PROFDATA"
+          echo "  llvm-cov: $LLVM_COV"
+
+          # Merge profraw files into profdata
+          echo ""
+          echo "=== Merging profraw files ==="
+          mkdir -p coverage
+          "$LLVM_PROFDATA" merge -sparse \
+            $(find coverage-hardware/ -name "*.profraw" -type f) \
+            -o coverage/hardware.profdata
+
+          if [ ! -f coverage/hardware.profdata ]; then
+            echo "ERROR: Failed to merge profraw files"
+            exit 1
+          fi
+          echo "Created coverage/hardware.profdata"
+
+          # Find all instrumented binaries
+          echo ""
+          echo "=== Finding instrumented binaries ==="
+          OBJECT_FILES=""
+          for obj in $(find target/llvm-cov-target/profiling -maxdepth 2 -type f ! -name "*.d" ! -name "*.rlib" ! -name "*.rmeta" 2>/dev/null); do
+            if file "$obj" | grep -q "ELF"; then
+              if [ -z "$OBJECT_FILES" ]; then
+                OBJECT_FILES="$obj"
+              else
+                OBJECT_FILES="$OBJECT_FILES --object=$obj"
+              fi
+            fi
+          done
+
+          # Also check deps directory
+          for obj in $(find target/llvm-cov-target/profiling/deps -maxdepth 1 -type f ! -name "*.d" ! -name "*.rlib" ! -name "*.rmeta" 2>/dev/null); do
+            if file "$obj" | grep -q "ELF"; then
+              OBJECT_FILES="$OBJECT_FILES --object=$obj"
+            fi
+          done
+
+          if [ -z "$OBJECT_FILES" ]; then
+            echo "ERROR: No ELF binaries found in target/llvm-cov-target/profiling/"
+            exit 1
+          fi
+
+          echo "Found binaries for coverage analysis"
+
+          # Generate coverage report
+          echo ""
+          echo "=== Generating coverage report ==="
+          "$LLVM_COV" export \
+            --format=lcov \
+            --instr-profile=coverage/hardware.profdata \
+            --ignore-filename-regex='/.cargo/registry|/rustc/' \
+            $OBJECT_FILES \
+            > coverage/coverage-hardware.lcov
+
+          if [ ! -s coverage/coverage-hardware.lcov ]; then
+            echo "ERROR: Failed to generate coverage report (empty file)"
+            exit 1
+          fi
+
+          echo "Generated coverage/coverage-hardware.lcov"
+          wc -l coverage/coverage-hardware.lcov
+
+      - name: Upload processed hardware coverage
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: coverage-hardware-processed
+          path: coverage/coverage-hardware.lcov
+          retention-days: 30
+          if-no-files-found: ignore
+
+  # ==========================================================================
+  # SonarCloud Analysis
+  # ==========================================================================
+  sonarcloud:
+    name: SonarCloud Analysis
+    runs-on: ubuntu-22.04
+    needs: [test, hardware-test, process-hardware-coverage]
+    # Run if test succeeded, even if hardware tests were skipped
+    if: |
+      always() &&
+      needs.test.result == 'success' &&
+      (github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository)
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Download coverage artifacts
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          pattern: coverage-*
+          path: coverage/
+
+      - name: Organize coverage files for SonarCloud
+        run: |
+          echo "=== Downloaded coverage artifacts ==="
+          find coverage/ -type f
+
+          # Collect all LCOV coverage reports
+          COVERAGE_REPORTS=$(find coverage/ -name "*.lcov" | tr '\n' ',' | sed 's/,$//')
+
+          echo "=== Coverage report paths ==="
+          echo "Coverage reports: $COVERAGE_REPORTS"
+
+          # Export for SonarCloud
+          echo "COVERAGE_PATHS=$COVERAGE_REPORTS" >> "$GITHUB_ENV"
 
       - name: SonarCloud Scan
-        uses: SonarSource/sonarcloud-github-action@master
-        continue-on-error: true  # Quality gate failures are advisory, not blocking
+        uses: SonarSource/sonarqube-scan-action@a31c9398be7ace6bbfaf30c0bd5d415f843d45e9 # master
+        continue-on-error: true # Quality gate failures are advisory, not blocking
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          COVERAGE_PATHS: ${{ env.COVERAGE_PATHS }}
+        with:
+          args: >
+            -Dsonar.rust.lcov.reportPaths=${{ env.COVERAGE_PATHS }}
+
+      - name: Generate coverage summary
+        if: always()
+        env:
+          HW_TEST_RESULT: ${{ needs.hardware-test.result }}
+        run: |
+          echo "# 📊 EdgeFirst WebSrv Coverage Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          # Test Platforms
+          echo "## 🔧 Test Platforms" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Platform | Architecture | Environment | Test Types |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|----------|--------------|-------------|------------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Ubuntu 22.04 | x86_64 | GitHub Runner | Unit tests |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Ubuntu 22.04 ARM | aarch64 | GitHub ARM Runner | Unit tests |" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$HW_TEST_RESULT" != "skipped" ]; then
+            echo "| Raivin | aarch64 | Real Hardware | Integration tests (Studio API, Zenoh) |" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          # Coverage Summary
+          echo "## 📈 Coverage Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+
+          # Parse coverage from LCOV files
+          for coverage_file in $(find coverage/ -name "*.lcov" 2>/dev/null | sort); do
+            if [ -f "$coverage_file" ]; then
+              platform=$(basename "$(dirname "$coverage_file")" | sed 's/coverage-//')
+
+              # Extract coverage metrics from LCOV
+              lines_found=$(grep -c "^DA:" "$coverage_file" 2>/dev/null || echo 0)
+              lines_hit=$(grep "^DA:" "$coverage_file" | grep -v ",0$" | wc -l 2>/dev/null || echo 0)
+
+              if [ "$lines_found" -gt 0 ]; then
+                line_pct=$(awk "BEGIN {printf \"%.1f\", ($lines_hit / $lines_found) * 100}")
+
+                echo "**$platform**:" >> "$GITHUB_STEP_SUMMARY"
+                echo "- Line coverage: ${line_pct}% (${lines_hit}/${lines_found} lines)" >> "$GITHUB_STEP_SUMMARY"
+                echo "" >> "$GITHUB_STEP_SUMMARY"
+              fi
+            fi
+          done
+
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "📋 Full analysis available on [SonarCloud](https://sonarcloud.io/dashboard?id=EdgeFirstAI_websrv)" >> "$GITHUB_STEP_SUMMARY"

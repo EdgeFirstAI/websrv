@@ -244,7 +244,8 @@ impl UploadManager {
         }
     }
 
-    /// Initialize the upload manager and scan for incomplete uploads (power loss recovery)
+    /// Initialize the upload manager and scan for incomplete uploads (power
+    /// loss recovery)
     pub async fn initialize(&self) -> anyhow::Result<()> {
         info!(
             "Initializing UploadManager, scanning for incomplete uploads in {:?}",
@@ -976,7 +977,12 @@ async fn websocket_handler_errors(
     stream: web::Payload,
     data: web::Data<ServerContext>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    ws::start(MyWebSocket::without_zenoh(data.err_stream.clone(), 1), &req, stream).map_err(|e| {
+    ws::start(
+        MyWebSocket::without_zenoh(data.err_stream.clone(), 1),
+        &req,
+        stream,
+    )
+    .map_err(|e| {
         error!("WebSocket connection failed: {:?}", e);
         e
     })
@@ -1081,7 +1087,8 @@ impl MyWebSocket {
     }
 
     /// Create a WebSocket without zenoh shutdown signaling
-    /// Used for error streams and upload progress that don't have zenoh subscribers
+    /// Used for error streams and upload progress that don't have zenoh
+    /// subscribers
     fn without_zenoh(video_stream: Arc<MessageStream>, capacity: usize) -> Self {
         MyWebSocket {
             video_stream,
@@ -2122,7 +2129,8 @@ async fn list_studio_projects(data: web::Data<ServerContext>) -> impl Responder 
 /// GET /api/studio/projects/{id}/labels - Get labels for auto-labeling
 /// Returns the 80 COCO dataset labels used by YOLOX for AGTG autobox prompts.
 /// These labels drive the SAM2 model for automatic annotation.
-/// In the future this will be configurable; for now we return the standard COCO classes.
+/// In the future this will be configurable; for now we return the standard COCO
+/// classes.
 async fn list_project_labels(
     _path: web::Path<String>,
     data: web::Data<ServerContext>,
@@ -3220,7 +3228,8 @@ async fn main() -> std::io::Result<()> {
     }));
 
     // Initialize UploadManager
-    // In system mode, read storage path from /etc/default/recorder (same as MCAP listing)
+    // In system mode, read storage path from /etc/default/recorder (same as MCAP
+    // listing)
     let storage_path = if args.system {
         match read_storage_directory() {
             Ok(dir) => PathBuf::from(dir),
@@ -3234,10 +3243,7 @@ async fn main() -> std::io::Result<()> {
     };
     let (upload_tx, _) = channel();
     let upload_broadcaster = Arc::new(MessageStream::new(upload_tx, Box::new(|| {}), false));
-    let upload_manager = Arc::new(UploadManager::new(
-        storage_path,
-        upload_broadcaster.clone(),
-    ));
+    let upload_manager = Arc::new(UploadManager::new(storage_path, upload_broadcaster.clone()));
 
     // Initialize upload manager (scan for incomplete uploads from previous session)
     if let Err(e) = upload_manager.initialize().await {
@@ -3501,7 +3507,10 @@ mod tests {
     fn create_test_upload_manager(temp_dir: &TempDir) -> Arc<UploadManager> {
         let (tx, _) = std::sync::mpsc::channel();
         let broadcaster = Arc::new(MessageStream::new(tx, Box::new(|| {}), false));
-        Arc::new(UploadManager::new(temp_dir.path().to_path_buf(), broadcaster))
+        Arc::new(UploadManager::new(
+            temp_dir.path().to_path_buf(),
+            broadcaster,
+        ))
     }
 
     /// Get test credentials from environment variables
@@ -3629,14 +3638,17 @@ mod tests {
 
         // Get projects
         let client_lock = manager.client.read().await;
-        let client = client_lock.as_ref().expect("Client should be authenticated");
+        let client = client_lock
+            .as_ref()
+            .expect("Client should be authenticated");
 
         let projects = client.projects(None).await;
         assert!(projects.is_ok(), "Failed to list projects: {:?}", projects);
 
         // Should return a list (could be empty but should not error)
         let project_list = projects.unwrap();
-        // Just verify we got a valid response - the test account may or may not have projects
+        // Just verify we got a valid response - the test account may or may not have
+        // projects
         eprintln!("Found {} projects", project_list.len());
     }
 
@@ -3668,9 +3680,7 @@ mod tests {
         std::fs::write(&mcap_path, b"dummy mcap content").expect("Failed to write test file");
 
         // Try to start upload without authentication
-        let result = manager
-            .start_upload(mcap_path, UploadMode::Basic)
-            .await;
+        let result = manager.start_upload(mcap_path, UploadMode::Basic).await;
 
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
@@ -4161,8 +4171,16 @@ mod tests {
 
         // Common automotive/surveillance classes that users expect
         let expected_classes = vec![
-            "person", "bicycle", "car", "motorcycle", "bus", "truck",
-            "traffic_light", "stop_sign", "dog", "cat",
+            "person",
+            "bicycle",
+            "car",
+            "motorcycle",
+            "bus",
+            "truck",
+            "traffic_light",
+            "stop_sign",
+            "dog",
+            "cat",
         ];
 
         for expected in expected_classes {
@@ -4174,89 +4192,410 @@ mod tests {
         }
     }
 
-    /// Helper function that returns the COCO labels (same as in list_project_labels)
+    /// Helper function that returns the COCO labels (same as in
+    /// list_project_labels)
     fn get_coco_labels() -> Vec<LabelInfo> {
         vec![
-            LabelInfo { id: "person".to_string(), name: "Person".to_string(), default: true },
-            LabelInfo { id: "bicycle".to_string(), name: "Bicycle".to_string(), default: false },
-            LabelInfo { id: "car".to_string(), name: "Car".to_string(), default: false },
-            LabelInfo { id: "motorcycle".to_string(), name: "Motorcycle".to_string(), default: false },
-            LabelInfo { id: "airplane".to_string(), name: "Airplane".to_string(), default: false },
-            LabelInfo { id: "bus".to_string(), name: "Bus".to_string(), default: false },
-            LabelInfo { id: "train".to_string(), name: "Train".to_string(), default: false },
-            LabelInfo { id: "truck".to_string(), name: "Truck".to_string(), default: false },
-            LabelInfo { id: "boat".to_string(), name: "Boat".to_string(), default: false },
-            LabelInfo { id: "traffic_light".to_string(), name: "Traffic Light".to_string(), default: false },
-            LabelInfo { id: "fire_hydrant".to_string(), name: "Fire Hydrant".to_string(), default: false },
-            LabelInfo { id: "stop_sign".to_string(), name: "Stop Sign".to_string(), default: false },
-            LabelInfo { id: "parking_meter".to_string(), name: "Parking Meter".to_string(), default: false },
-            LabelInfo { id: "bench".to_string(), name: "Bench".to_string(), default: false },
-            LabelInfo { id: "bird".to_string(), name: "Bird".to_string(), default: false },
-            LabelInfo { id: "cat".to_string(), name: "Cat".to_string(), default: false },
-            LabelInfo { id: "dog".to_string(), name: "Dog".to_string(), default: false },
-            LabelInfo { id: "horse".to_string(), name: "Horse".to_string(), default: false },
-            LabelInfo { id: "sheep".to_string(), name: "Sheep".to_string(), default: false },
-            LabelInfo { id: "cow".to_string(), name: "Cow".to_string(), default: false },
-            LabelInfo { id: "elephant".to_string(), name: "Elephant".to_string(), default: false },
-            LabelInfo { id: "bear".to_string(), name: "Bear".to_string(), default: false },
-            LabelInfo { id: "zebra".to_string(), name: "Zebra".to_string(), default: false },
-            LabelInfo { id: "giraffe".to_string(), name: "Giraffe".to_string(), default: false },
-            LabelInfo { id: "backpack".to_string(), name: "Backpack".to_string(), default: false },
-            LabelInfo { id: "umbrella".to_string(), name: "Umbrella".to_string(), default: false },
-            LabelInfo { id: "handbag".to_string(), name: "Handbag".to_string(), default: false },
-            LabelInfo { id: "tie".to_string(), name: "Tie".to_string(), default: false },
-            LabelInfo { id: "suitcase".to_string(), name: "Suitcase".to_string(), default: false },
-            LabelInfo { id: "frisbee".to_string(), name: "Frisbee".to_string(), default: false },
-            LabelInfo { id: "skis".to_string(), name: "Skis".to_string(), default: false },
-            LabelInfo { id: "snowboard".to_string(), name: "Snowboard".to_string(), default: false },
-            LabelInfo { id: "sports_ball".to_string(), name: "Sports Ball".to_string(), default: false },
-            LabelInfo { id: "kite".to_string(), name: "Kite".to_string(), default: false },
-            LabelInfo { id: "baseball_bat".to_string(), name: "Baseball Bat".to_string(), default: false },
-            LabelInfo { id: "baseball_glove".to_string(), name: "Baseball Glove".to_string(), default: false },
-            LabelInfo { id: "skateboard".to_string(), name: "Skateboard".to_string(), default: false },
-            LabelInfo { id: "surfboard".to_string(), name: "Surfboard".to_string(), default: false },
-            LabelInfo { id: "tennis_racket".to_string(), name: "Tennis Racket".to_string(), default: false },
-            LabelInfo { id: "bottle".to_string(), name: "Bottle".to_string(), default: false },
-            LabelInfo { id: "wine_glass".to_string(), name: "Wine Glass".to_string(), default: false },
-            LabelInfo { id: "cup".to_string(), name: "Cup".to_string(), default: false },
-            LabelInfo { id: "fork".to_string(), name: "Fork".to_string(), default: false },
-            LabelInfo { id: "knife".to_string(), name: "Knife".to_string(), default: false },
-            LabelInfo { id: "spoon".to_string(), name: "Spoon".to_string(), default: false },
-            LabelInfo { id: "bowl".to_string(), name: "Bowl".to_string(), default: false },
-            LabelInfo { id: "banana".to_string(), name: "Banana".to_string(), default: false },
-            LabelInfo { id: "apple".to_string(), name: "Apple".to_string(), default: false },
-            LabelInfo { id: "sandwich".to_string(), name: "Sandwich".to_string(), default: false },
-            LabelInfo { id: "orange".to_string(), name: "Orange".to_string(), default: false },
-            LabelInfo { id: "broccoli".to_string(), name: "Broccoli".to_string(), default: false },
-            LabelInfo { id: "carrot".to_string(), name: "Carrot".to_string(), default: false },
-            LabelInfo { id: "hot_dog".to_string(), name: "Hot Dog".to_string(), default: false },
-            LabelInfo { id: "pizza".to_string(), name: "Pizza".to_string(), default: false },
-            LabelInfo { id: "donut".to_string(), name: "Donut".to_string(), default: false },
-            LabelInfo { id: "cake".to_string(), name: "Cake".to_string(), default: false },
-            LabelInfo { id: "chair".to_string(), name: "Chair".to_string(), default: false },
-            LabelInfo { id: "couch".to_string(), name: "Couch".to_string(), default: false },
-            LabelInfo { id: "potted_plant".to_string(), name: "Potted Plant".to_string(), default: false },
-            LabelInfo { id: "bed".to_string(), name: "Bed".to_string(), default: false },
-            LabelInfo { id: "dining_table".to_string(), name: "Dining Table".to_string(), default: false },
-            LabelInfo { id: "toilet".to_string(), name: "Toilet".to_string(), default: false },
-            LabelInfo { id: "tv".to_string(), name: "TV".to_string(), default: false },
-            LabelInfo { id: "laptop".to_string(), name: "Laptop".to_string(), default: false },
-            LabelInfo { id: "mouse".to_string(), name: "Mouse".to_string(), default: false },
-            LabelInfo { id: "remote".to_string(), name: "Remote".to_string(), default: false },
-            LabelInfo { id: "keyboard".to_string(), name: "Keyboard".to_string(), default: false },
-            LabelInfo { id: "cell_phone".to_string(), name: "Cell Phone".to_string(), default: false },
-            LabelInfo { id: "microwave".to_string(), name: "Microwave".to_string(), default: false },
-            LabelInfo { id: "oven".to_string(), name: "Oven".to_string(), default: false },
-            LabelInfo { id: "toaster".to_string(), name: "Toaster".to_string(), default: false },
-            LabelInfo { id: "sink".to_string(), name: "Sink".to_string(), default: false },
-            LabelInfo { id: "refrigerator".to_string(), name: "Refrigerator".to_string(), default: false },
-            LabelInfo { id: "book".to_string(), name: "Book".to_string(), default: false },
-            LabelInfo { id: "clock".to_string(), name: "Clock".to_string(), default: false },
-            LabelInfo { id: "vase".to_string(), name: "Vase".to_string(), default: false },
-            LabelInfo { id: "scissors".to_string(), name: "Scissors".to_string(), default: false },
-            LabelInfo { id: "teddy_bear".to_string(), name: "Teddy Bear".to_string(), default: false },
-            LabelInfo { id: "hair_drier".to_string(), name: "Hair Drier".to_string(), default: false },
-            LabelInfo { id: "toothbrush".to_string(), name: "Toothbrush".to_string(), default: false },
+            LabelInfo {
+                id: "person".to_string(),
+                name: "Person".to_string(),
+                default: true,
+            },
+            LabelInfo {
+                id: "bicycle".to_string(),
+                name: "Bicycle".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "car".to_string(),
+                name: "Car".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "motorcycle".to_string(),
+                name: "Motorcycle".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "airplane".to_string(),
+                name: "Airplane".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "bus".to_string(),
+                name: "Bus".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "train".to_string(),
+                name: "Train".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "truck".to_string(),
+                name: "Truck".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "boat".to_string(),
+                name: "Boat".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "traffic_light".to_string(),
+                name: "Traffic Light".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "fire_hydrant".to_string(),
+                name: "Fire Hydrant".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "stop_sign".to_string(),
+                name: "Stop Sign".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "parking_meter".to_string(),
+                name: "Parking Meter".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "bench".to_string(),
+                name: "Bench".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "bird".to_string(),
+                name: "Bird".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "cat".to_string(),
+                name: "Cat".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "dog".to_string(),
+                name: "Dog".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "horse".to_string(),
+                name: "Horse".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "sheep".to_string(),
+                name: "Sheep".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "cow".to_string(),
+                name: "Cow".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "elephant".to_string(),
+                name: "Elephant".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "bear".to_string(),
+                name: "Bear".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "zebra".to_string(),
+                name: "Zebra".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "giraffe".to_string(),
+                name: "Giraffe".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "backpack".to_string(),
+                name: "Backpack".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "umbrella".to_string(),
+                name: "Umbrella".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "handbag".to_string(),
+                name: "Handbag".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "tie".to_string(),
+                name: "Tie".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "suitcase".to_string(),
+                name: "Suitcase".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "frisbee".to_string(),
+                name: "Frisbee".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "skis".to_string(),
+                name: "Skis".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "snowboard".to_string(),
+                name: "Snowboard".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "sports_ball".to_string(),
+                name: "Sports Ball".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "kite".to_string(),
+                name: "Kite".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "baseball_bat".to_string(),
+                name: "Baseball Bat".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "baseball_glove".to_string(),
+                name: "Baseball Glove".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "skateboard".to_string(),
+                name: "Skateboard".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "surfboard".to_string(),
+                name: "Surfboard".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "tennis_racket".to_string(),
+                name: "Tennis Racket".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "bottle".to_string(),
+                name: "Bottle".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "wine_glass".to_string(),
+                name: "Wine Glass".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "cup".to_string(),
+                name: "Cup".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "fork".to_string(),
+                name: "Fork".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "knife".to_string(),
+                name: "Knife".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "spoon".to_string(),
+                name: "Spoon".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "bowl".to_string(),
+                name: "Bowl".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "banana".to_string(),
+                name: "Banana".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "apple".to_string(),
+                name: "Apple".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "sandwich".to_string(),
+                name: "Sandwich".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "orange".to_string(),
+                name: "Orange".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "broccoli".to_string(),
+                name: "Broccoli".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "carrot".to_string(),
+                name: "Carrot".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "hot_dog".to_string(),
+                name: "Hot Dog".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "pizza".to_string(),
+                name: "Pizza".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "donut".to_string(),
+                name: "Donut".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "cake".to_string(),
+                name: "Cake".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "chair".to_string(),
+                name: "Chair".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "couch".to_string(),
+                name: "Couch".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "potted_plant".to_string(),
+                name: "Potted Plant".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "bed".to_string(),
+                name: "Bed".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "dining_table".to_string(),
+                name: "Dining Table".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "toilet".to_string(),
+                name: "Toilet".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "tv".to_string(),
+                name: "TV".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "laptop".to_string(),
+                name: "Laptop".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "mouse".to_string(),
+                name: "Mouse".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "remote".to_string(),
+                name: "Remote".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "keyboard".to_string(),
+                name: "Keyboard".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "cell_phone".to_string(),
+                name: "Cell Phone".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "microwave".to_string(),
+                name: "Microwave".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "oven".to_string(),
+                name: "Oven".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "toaster".to_string(),
+                name: "Toaster".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "sink".to_string(),
+                name: "Sink".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "refrigerator".to_string(),
+                name: "Refrigerator".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "book".to_string(),
+                name: "Book".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "clock".to_string(),
+                name: "Clock".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "vase".to_string(),
+                name: "Vase".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "scissors".to_string(),
+                name: "Scissors".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "teddy_bear".to_string(),
+                name: "Teddy Bear".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "hair_drier".to_string(),
+                name: "Hair Drier".to_string(),
+                default: false,
+            },
+            LabelInfo {
+                id: "toothbrush".to_string(),
+                name: "Toothbrush".to_string(),
+                default: false,
+            },
         ]
     }
 
@@ -4328,9 +4667,7 @@ mod tests {
         let mut handles = vec![];
         for _ in 0..10 {
             let m = manager.clone();
-            handles.push(tokio::spawn(async move {
-                m.is_authenticated().await
-            }));
+            handles.push(tokio::spawn(async move { m.is_authenticated().await }));
         }
 
         // All should return false (not authenticated)
@@ -4349,9 +4686,7 @@ mod tests {
         let mut handles = vec![];
         for _ in 0..10 {
             let m = manager.clone();
-            handles.push(tokio::spawn(async move {
-                m.list_uploads().await
-            }));
+            handles.push(tokio::spawn(async move { m.list_uploads().await }));
         }
 
         // All should return empty lists
@@ -4360,5 +4695,4 @@ mod tests {
             assert!(result.is_empty());
         }
     }
-
 }

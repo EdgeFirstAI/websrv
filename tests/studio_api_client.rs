@@ -18,8 +18,7 @@
 
 use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
-use std::env;
-use std::time::Duration;
+use std::{env, time::Duration};
 
 /// Base URL for the websrv server
 fn get_base_url() -> String {
@@ -126,7 +125,10 @@ async fn test_auth_status_unauthenticated() {
         Ok(response) => {
             assert!(response.status().is_success());
             // Note: Server may have existing session, so we just verify the endpoint works
-            let _status = response.json::<AuthStatusResponse>().await.expect("Failed to parse JSON");
+            let _status = response
+                .json::<AuthStatusResponse>()
+                .await
+                .expect("Failed to parse JSON");
         }
         Err(e) => {
             eprintln!("Skipping test - server not reachable: {}", e);
@@ -151,8 +153,15 @@ async fn test_auth_login_invalid_credentials() {
 
     match result {
         Ok(response) => {
-            assert_eq!(response.status(), 401, "Invalid credentials should return 401");
-            let body = response.json::<AuthResponse>().await.expect("Failed to parse JSON");
+            assert_eq!(
+                response.status(),
+                401,
+                "Invalid credentials should return 401"
+            );
+            let body = response
+                .json::<AuthResponse>()
+                .await
+                .expect("Failed to parse JSON");
             assert_eq!(body.status, "error");
         }
         Err(e) => {
@@ -187,7 +196,10 @@ async fn test_auth_login_valid_credentials() {
     match result {
         Ok(response) => {
             assert!(response.status().is_success(), "Login should succeed");
-            let body = response.json::<AuthResponse>().await.expect("Failed to parse JSON");
+            let body = response
+                .json::<AuthResponse>()
+                .await
+                .expect("Failed to parse JSON");
             assert_eq!(body.status, "ok");
         }
         Err(e) => {
@@ -238,7 +250,10 @@ async fn test_auth_full_flow() {
         .expect("Failed to get status");
 
     assert!(response.status().is_success());
-    let status = response.json::<AuthStatusResponse>().await.expect("Failed to parse JSON");
+    let status = response
+        .json::<AuthStatusResponse>()
+        .await
+        .expect("Failed to parse JSON");
     assert!(status.authenticated, "Should be authenticated after login");
     assert_eq!(status.username, Some(username));
 
@@ -258,8 +273,14 @@ async fn test_auth_full_flow() {
         .await
         .expect("Failed to get status");
 
-    let status = response.json::<AuthStatusResponse>().await.expect("Failed to parse JSON");
-    assert!(!status.authenticated, "Should be unauthenticated after logout");
+    let status = response
+        .json::<AuthStatusResponse>()
+        .await
+        .expect("Failed to parse JSON");
+    assert!(
+        !status.authenticated,
+        "Should be unauthenticated after logout"
+    );
 }
 
 // ============================================================================
@@ -285,11 +306,7 @@ async fn test_studio_projects_requires_auth() {
 
     match result {
         Ok(response) => {
-            assert_eq!(
-                response.status(),
-                401,
-                "Should require authentication"
-            );
+            assert_eq!(response.status(), 401, "Should require authentication");
         }
         Err(e) => {
             eprintln!("Skipping test - server not reachable: {}", e);
@@ -342,7 +359,10 @@ async fn test_studio_projects_authenticated() {
 
     assert!(response.status().is_success(), "Should return projects");
 
-    let projects = response.json::<Vec<ProjectInfo>>().await.expect("Failed to parse JSON");
+    let projects = response
+        .json::<Vec<ProjectInfo>>()
+        .await
+        .expect("Failed to parse JSON");
     println!("Found {} projects", projects.len());
 }
 
@@ -391,7 +411,10 @@ async fn test_studio_labels_returns_coco_classes() {
 
     assert!(response.status().is_success());
 
-    let labels = response.json::<Vec<LabelInfo>>().await.expect("Failed to parse JSON");
+    let labels = response
+        .json::<Vec<LabelInfo>>()
+        .await
+        .expect("Failed to parse JSON");
 
     // Should have 80 COCO classes
     assert_eq!(labels.len(), 80, "Should return 80 COCO classes");
@@ -403,8 +426,14 @@ async fn test_studio_labels_returns_coco_classes() {
 
     // Should have common automotive classes
     assert!(labels.iter().any(|l| l.id == "car"), "Should have 'car'");
-    assert!(labels.iter().any(|l| l.id == "truck"), "Should have 'truck'");
-    assert!(labels.iter().any(|l| l.id == "bicycle"), "Should have 'bicycle'");
+    assert!(
+        labels.iter().any(|l| l.id == "truck"),
+        "Should have 'truck'"
+    );
+    assert!(
+        labels.iter().any(|l| l.id == "bicycle"),
+        "Should have 'bicycle'"
+    );
 }
 
 // ============================================================================
@@ -416,15 +445,15 @@ async fn test_uploads_list() {
     let client = create_client();
     let base_url = get_base_url();
 
-    let result = client
-        .get(format!("{}/api/uploads", base_url))
-        .send()
-        .await;
+    let result = client.get(format!("{}/api/uploads", base_url)).send().await;
 
     match result {
         Ok(response) => {
             assert!(response.status().is_success());
-            let _uploads = response.json::<Vec<UploadTaskInfo>>().await.expect("Failed to parse JSON");
+            let _uploads = response
+                .json::<Vec<UploadTaskInfo>>()
+                .await
+                .expect("Failed to parse JSON");
         }
         Err(e) => {
             eprintln!("Skipping test - server not reachable: {}", e);
@@ -445,7 +474,10 @@ async fn test_upload_get_invalid_uuid() {
     match result {
         Ok(response) => {
             assert_eq!(response.status(), 400, "Invalid UUID should return 400");
-            let body = response.json::<UploadErrorResponse>().await.expect("Failed to parse JSON");
+            let body = response
+                .json::<UploadErrorResponse>()
+                .await
+                .expect("Failed to parse JSON");
             assert!(body.error.to_lowercase().contains("invalid"));
         }
         Err(e) => {
@@ -469,8 +501,15 @@ async fn test_upload_get_nonexistent() {
 
     match result {
         Ok(response) => {
-            assert_eq!(response.status(), 404, "Nonexistent upload should return 404");
-            let body = response.json::<UploadErrorResponse>().await.expect("Failed to parse JSON");
+            assert_eq!(
+                response.status(),
+                404,
+                "Nonexistent upload should return 404"
+            );
+            let body = response
+                .json::<UploadErrorResponse>()
+                .await
+                .expect("Failed to parse JSON");
             assert!(body.error.to_lowercase().contains("not found"));
         }
         Err(e) => {
@@ -503,7 +542,10 @@ async fn test_upload_requires_auth() {
     match result {
         Ok(response) => {
             assert_eq!(response.status(), 400, "Should fail without auth");
-            let body = response.json::<UploadErrorResponse>().await.expect("Failed to parse JSON");
+            let body = response
+                .json::<UploadErrorResponse>()
+                .await
+                .expect("Failed to parse JSON");
             assert!(
                 body.error.to_lowercase().contains("authenticated")
                     || body.error.to_lowercase().contains("login"),
@@ -551,7 +593,10 @@ async fn test_webui_login_flow() {
         }
     };
 
-    let _status = response.json::<AuthStatusResponse>().await.expect("Failed to parse status");
+    let _status = response
+        .json::<AuthStatusResponse>()
+        .await
+        .expect("Failed to parse status");
 
     // Step 2: Login via showStudioLoginDialog() - POST /api/auth/login
     println!("Step 2: Logging in...");
@@ -568,7 +613,10 @@ async fn test_webui_login_flow() {
         .expect("Failed to login");
 
     assert!(response.status().is_success(), "Login should succeed");
-    let login_resp = response.json::<AuthResponse>().await.expect("Failed to parse login response");
+    let login_resp = response
+        .json::<AuthResponse>()
+        .await
+        .expect("Failed to parse login response");
     assert_eq!(login_resp.status, "ok");
 
     // Step 3: Verify checkStudioAuthStatus() returns authenticated
@@ -579,7 +627,10 @@ async fn test_webui_login_flow() {
         .await
         .expect("Failed to get status");
 
-    let status = response.json::<AuthStatusResponse>().await.expect("Failed to parse status");
+    let status = response
+        .json::<AuthStatusResponse>()
+        .await
+        .expect("Failed to parse status");
     assert!(status.authenticated);
     assert_eq!(status.username, Some(username));
 
@@ -633,7 +684,10 @@ async fn test_webui_upload_dialog_flow() {
         .expect("Failed to get projects");
 
     assert!(response.status().is_success());
-    let projects = response.json::<Vec<ProjectInfo>>().await.expect("Failed to parse projects");
+    let projects = response
+        .json::<Vec<ProjectInfo>>()
+        .await
+        .expect("Failed to parse projects");
     println!("Found {} projects", projects.len());
 
     // Step 3: populateLabelCheckboxes() - GET /api/studio/projects/{id}/labels
@@ -645,7 +699,10 @@ async fn test_webui_upload_dialog_flow() {
         .expect("Failed to get labels");
 
     assert!(response.status().is_success());
-    let labels = response.json::<Vec<LabelInfo>>().await.expect("Failed to parse labels");
+    let labels = response
+        .json::<Vec<LabelInfo>>()
+        .await
+        .expect("Failed to parse labels");
 
     assert_eq!(labels.len(), 80, "Should return 80 COCO classes");
 

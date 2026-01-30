@@ -9,9 +9,13 @@
 # - Phase 3: Process coverage data and report to SonarCloud
 #
 # Runner Notes:
-# - ubuntu-22.04: Standard GitHub-hosted runner (x86_64)
-# - ubuntu-22.04-arm: GitHub-hosted ARM runner (aarch64)
+# - ubuntu-22.04: Standard GitHub-hosted runner (x86_64, 2 vCPU, 7 GB RAM)
+# - ubuntu-22.04-large: Larger runner (x86_64, 8 vCPU, 32 GB RAM)
+# - ubuntu-22.04-arm-large: Larger ARM runner (aarch64, 8 vCPU, 32 GB RAM)
 # - raivin: Self-hosted hardware runner with Zenoh network and Studio access
+#
+# Note: Coverage-instrumented builds require larger runners due to high memory
+# usage during LLVM instrumentation. See: github.com/actions/runner-images/issues/6680
 
 name: Test
 
@@ -86,10 +90,10 @@ jobs:
       matrix:
         platform:
           - name: x86_64
-            runner: ubuntu-22.04
+            runner: ubuntu-22.04-large
             target: x86_64-unknown-linux-gnu
           - name: aarch64
-            runner: ubuntu-22.04-arm
+            runner: ubuntu-22.04-arm-large
             target: aarch64-unknown-linux-gnu
       fail-fast: false
 

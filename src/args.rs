@@ -70,6 +70,14 @@ pub struct Args {
 
     #[arg(long, default_value = ".", conflicts_with = "system")]
     pub storage_path: String,
+
+    /// HTTP port (default: 80, use 8080 for non-root)
+    #[arg(long, env, default_value = "80")]
+    pub http_port: u16,
+
+    /// HTTPS port (default: 443, use 8443 for non-root)
+    #[arg(long, env, default_value = "443")]
+    pub https_port: u16,
 }
 
 #[derive(Serialize)]

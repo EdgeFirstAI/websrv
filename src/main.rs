@@ -318,7 +318,10 @@ async fn main() -> std::io::Result<()> {
         format!("[::]:{}", http_port).parse().unwrap(),
         format!("0.0.0.0:{}", http_port).parse().unwrap(),
     ];
-    info!("Listening on HTTPS port {} and HTTP port {}", https_port, http_port);
+    info!(
+        "Listening on HTTPS port {} and HTTP port {}",
+        https_port, http_port
+    );
 
     HttpServer::new(move || {
         let (tx, _) = channel();

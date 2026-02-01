@@ -544,7 +544,11 @@ async fn test_upload_requires_auth() {
         Ok(response) => {
             // Server validates file existence before auth, so may get 400 for file not found
             // or auth error - both are acceptable rejections
-            assert_eq!(response.status(), 400, "Should fail for unauthenticated upload");
+            assert_eq!(
+                response.status(),
+                400,
+                "Should fail for unauthenticated upload"
+            );
             let body = response
                 .json::<UploadErrorResponse>()
                 .await
@@ -754,7 +758,10 @@ async fn test_check_storage_availability() {
 
     match result {
         Ok(response) => {
-            assert!(response.status().is_success(), "Storage check should succeed");
+            assert!(
+                response.status().is_success(),
+                "Storage check should succeed"
+            );
             let storage = response
                 .json::<StorageResponse>()
                 .await
@@ -896,10 +903,7 @@ async fn test_stop_recording() {
     let client = create_client();
     let base_url = get_base_url();
 
-    let result = client
-        .post(format!("{}/stop", base_url))
-        .send()
-        .await;
+    let result = client.post(format!("{}/stop", base_url)).send().await;
 
     match result {
         Ok(response) => {
@@ -939,10 +943,7 @@ async fn test_replay_status() {
                 response.status().is_success(),
                 "Replay status should succeed"
             );
-            let status_text = response
-                .text()
-                .await
-                .expect("Failed to read replay status");
+            let status_text = response.text().await.expect("Failed to read replay status");
             println!("Replay status: {}", status_text);
             assert!(
                 status_text.contains("Replay is"),
@@ -989,10 +990,7 @@ async fn test_stop_replay() {
     let client = create_client();
     let base_url = get_base_url();
 
-    let result = client
-        .post(format!("{}/replay-end", base_url))
-        .send()
-        .await;
+    let result = client.post(format!("{}/replay-end", base_url)).send().await;
 
     match result {
         Ok(response) => {
@@ -1030,11 +1028,12 @@ async fn test_get_config_recorder() {
         Ok(response) => {
             let status = response.status();
             if status.is_success() {
-                let config: serde_json::Value = response
-                    .json()
-                    .await
-                    .expect("Failed to parse config");
-                println!("Recorder config: {}", serde_json::to_string_pretty(&config).unwrap());
+                let config: serde_json::Value =
+                    response.json().await.expect("Failed to parse config");
+                println!(
+                    "Recorder config: {}",
+                    serde_json::to_string_pretty(&config).unwrap()
+                );
             } else {
                 println!("Get recorder config returned: {}", status);
             }
@@ -1059,11 +1058,12 @@ async fn test_get_config_replayer() {
         Ok(response) => {
             let status = response.status();
             if status.is_success() {
-                let config: serde_json::Value = response
-                    .json()
-                    .await
-                    .expect("Failed to parse config");
-                println!("Replayer config: {}", serde_json::to_string_pretty(&config).unwrap());
+                let config: serde_json::Value =
+                    response.json().await.expect("Failed to parse config");
+                println!(
+                    "Replayer config: {}",
+                    serde_json::to_string_pretty(&config).unwrap()
+                );
             } else {
                 println!("Get replayer config returned: {}", status);
             }
@@ -1091,10 +1091,7 @@ async fn test_get_config_invalid_service() {
             println!("Get config for invalid service returned: {}", status);
             // Server returns 200 with empty JSON for unknown services
             assert!(status.is_success());
-            let body: serde_json::Value = response
-                .json()
-                .await
-                .expect("Failed to parse JSON");
+            let body: serde_json::Value = response.json().await.expect("Failed to parse JSON");
             // Empty object {} expected for unknown service
             assert!(
                 body.as_object().map(|o| o.is_empty()).unwrap_or(false),
@@ -1149,7 +1146,10 @@ async fn test_get_all_services_status() {
                     .json()
                     .await
                     .expect("Failed to parse services status");
-                println!("Services status: {}", serde_json::to_string_pretty(&services).unwrap());
+                println!(
+                    "Services status: {}",
+                    serde_json::to_string_pretty(&services).unwrap()
+                );
             } else {
                 println!("Get services status returned: {}", status);
             }
@@ -1202,11 +1202,7 @@ async fn test_download_nonexistent_file() {
 
     match result {
         Ok(response) => {
-            assert_eq!(
-                response.status(),
-                404,
-                "Nonexistent file should return 404"
-            );
+            assert_eq!(response.status(), 404, "Nonexistent file should return 404");
         }
         Err(e) => {
             eprintln!("Skipping test - server not reachable: {}", e);
@@ -1312,11 +1308,7 @@ async fn test_cancel_invalid_uuid() {
 
     match result {
         Ok(response) => {
-            assert_eq!(
-                response.status(),
-                400,
-                "Invalid UUID should return 400"
-            );
+            assert_eq!(response.status(), 400, "Invalid UUID should return 400");
         }
         Err(e) => {
             eprintln!("Skipping test - server not reachable: {}", e);
@@ -1382,7 +1374,10 @@ async fn test_recording_workflow_status_check() {
                 .json::<StorageResponse>()
                 .await
                 .expect("Failed to parse storage");
-            println!("Storage path: {} (exists: {})", storage.path, storage.exists);
+            println!(
+                "Storage path: {} (exists: {})",
+                storage.path, storage.exists
+            );
         }
         Err(e) => {
             eprintln!("Skipping test - server not reachable: {}", e);
@@ -1429,10 +1424,7 @@ async fn test_recording_workflow_status_check() {
         .expect("Failed to get replay status");
 
     assert!(response.status().is_success());
-    let replay_text = response
-        .text()
-        .await
-        .expect("Failed to read replay status");
+    let replay_text = response.text().await.expect("Failed to read replay status");
     println!("Replay status: {}", replay_text);
 
     println!("Recording workflow status check completed!");

@@ -46,7 +46,7 @@ pub async fn list_studio_projects<T: StudioContext>(data: web::Data<T>) -> impl 
                 let project_infos: Vec<ProjectInfo> = projects
                     .into_iter()
                     .map(|p| ProjectInfo {
-                        id: p.id().to_string(),
+                        id: p.id().value().to_string(),
                         name: p.name().to_string(),
                     })
                     .collect();

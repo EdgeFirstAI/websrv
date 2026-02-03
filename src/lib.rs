@@ -12,6 +12,7 @@ pub mod config;
 pub mod mcap;
 pub mod recording;
 pub mod services;
+pub mod shutdown;
 pub mod storage;
 pub mod studio;
 pub mod upload;

@@ -636,6 +636,73 @@ impl UploadManager {
 
         Ok(())
     }
+
+    /// Cancel all active uploads during shutdown.
+    ///
+    /// Returns the number of uploads that were cancelled.
+    pub async fn cancel_all_uploads(&self) -> usize {
+        let mut cancelled_count = 0;
+        let mut tasks = self.tasks.write().await;
+
+        for (id, task) in tasks.iter_mut() {
+            // Only cancel active uploads (Queued, Uploading, Processing)
+            if matches!(
+                task.state,
+                UploadState::Queued | UploadState::Uploading | UploadState::Processing
+            ) {
+                // Abort the task handle if it's running
+                if let Some(handle) = task.task_handle.take() {
+                    handle.abort();
+                    info!("Aborted upload task {} during shutdown", id.0);
+                }
+                task.state = UploadState::Failed;
+                task.error = Some("Cancelled due to server shutdown".to_string());
+                task.message = "Cancelled due to server shutdown".to_string();
+                task.updated_at = Utc::now();
+                cancelled_count += 1;
+
+                // Write updated status file (ignore errors during shutdown)
+                let status = UploadStatus::from(&*task);
+                if let Err(e) = Self::write_status_file_from_status(&status).await {
+                    warn!("Failed to write status file during shutdown: {}", e);
+                }
+            }
+        }
+
+        cancelled_count
+    }
+
+    /// Wait for all active uploads to complete with a timeout.
+    ///
+    /// Returns true if all uploads completed, false if timeout was reached.
+    pub async fn wait_for_completion(&self, timeout: std::time::Duration) -> bool {
+        let start = std::time::Instant::now();
+
+        loop {
+            // Check if any uploads are still active
+            let has_active = {
+                let tasks = self.tasks.read().await;
+                tasks.values().any(|t| {
+                    matches!(
+                        t.state,
+                        UploadState::Queued | UploadState::Uploading | UploadState::Processing
+                    )
+                })
+            };
+
+            if !has_active {
+                return true;
+            }
+
+            // Check timeout
+            if start.elapsed() >= timeout {
+                return false;
+            }
+
+            // Brief sleep before checking again
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
 }
 
 // ============================================================================

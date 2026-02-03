@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 // ============================================================================
 // Message Types
@@ -183,11 +184,19 @@ impl Handler<Broadcast> for MyWebSocket {
 // Zenoh Integration
 // ============================================================================
 
-/// Zenoh subscriber that forwards messages to WebSocket clients
+/// Zenoh subscriber that forwards messages to WebSocket clients.
+///
+/// # Arguments
+/// * `video_stream` - The message stream to broadcast to
+/// * `session` - The shared Zenoh session
+/// * `shutdown_rx` - Per-connection shutdown signal (from WebSocket close)
+/// * `global_shutdown` - Optional global shutdown token (for server-wide shutdown)
+/// * `topic` - The Zenoh topic to subscribe to
 pub async fn zenoh_listener(
     video_stream: Arc<MessageStream>,
     session: zenoh::Session,
     mut shutdown_rx: oneshot::Receiver<()>,
+    global_shutdown: Option<CancellationToken>,
     topic: String,
 ) {
     let subscriber = match session.declare_subscriber(topic.clone()).await {
@@ -202,10 +211,25 @@ pub async fn zenoh_listener(
 
     loop {
         tokio::select! {
-            // Check for shutdown signal
+            // Check for per-connection shutdown signal
             _ = &mut shutdown_rx => {
-                debug!("Shutdown signal received for topic: {:?}", topic);
+                debug!("Connection shutdown signal received for topic: {:?}", topic);
                 // Undeclare subscriber (session is shared, don't close it)
+                if let Err(e) = subscriber.undeclare().await {
+                    warn!("Failed to undeclare subscriber for {}: {}", topic, e);
+                }
+                return;
+            }
+            // Check for global shutdown signal (if provided)
+            _ = async {
+                if let Some(ref token) = global_shutdown {
+                    token.cancelled().await;
+                } else {
+                    // If no global shutdown token, this future never completes
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                debug!("Global shutdown signal received for topic: {:?}", topic);
                 if let Err(e) = subscriber.undeclare().await {
                     warn!("Failed to undeclare subscriber for {}: {}", topic, e);
                 }
@@ -242,6 +266,11 @@ pub trait WebSocketContext {
     fn err_stream(&self) -> &Arc<MessageStream>;
     fn err_count(&self) -> &AtomicI64;
     fn zenoh_session(&self) -> &zenoh::Session;
+    /// Get the global shutdown token for graceful shutdown coordination.
+    /// Returns None if graceful shutdown is not configured.
+    fn shutdown_token(&self) -> Option<CancellationToken> {
+        None
+    }
 }
 
 /// WebSocket handler for error stream
@@ -336,9 +365,19 @@ pub async fn websocket_handler<T: WebSocketContext + 'static>(
     );
 
     if ws_result.is_ok() {
+        // Get global shutdown token for graceful shutdown coordination
+        let global_shutdown = data.shutdown_token();
+
         // Spawn zenoh listener as a tokio task instead of a separate thread
         tokio::spawn(async move {
-            zenoh_listener(video_stream_clone, zenoh_session, shutdown_rx, cleaned_path).await;
+            zenoh_listener(
+                video_stream_clone,
+                zenoh_session,
+                shutdown_rx,
+                global_shutdown,
+                cleaned_path,
+            )
+            .await;
         });
     }
 

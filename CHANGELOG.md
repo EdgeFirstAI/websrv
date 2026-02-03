@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Graceful shutdown coordination with SIGTERM/SIGINT signal handling
+- `ShutdownCoordinator` module for coordinated shutdown of all server components
+- Global shutdown token propagation to WebSocket connections and Zenoh subscribers
+- `cancel_all_uploads()` and `wait_for_completion()` methods for upload manager shutdown
+
+### Changed
+
+- WebSocket Zenoh listeners now respond to both per-connection and global shutdown signals
+- Server performs explicit cleanup of active uploads and Zenoh session on shutdown
+
 ## [3.7.0] - 2026-01-04
 
 ### Added

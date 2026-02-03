@@ -37,6 +37,7 @@ use edgefirst_websrv::{
         user_mode_check_replay_status, user_mode_start, user_mode_stop, AppState, RecordingContext,
     },
     services::{get_all_services, update_service},
+    shutdown::ShutdownCoordinator,
     storage::{check_storage_availability, StorageContext},
     studio::{list_project_labels, list_studio_projects, StudioContext},
     upload::{
@@ -72,6 +73,7 @@ pub struct ServerContext {
     pub upload_manager: Arc<UploadManager>,
     pub upload_progress_stream: Arc<MessageStream>,
     pub zenoh_session: zenoh::Session,
+    pub shutdown_coordinator: ShutdownCoordinator,
 }
 
 // Implement all required traits for ServerContext
@@ -130,6 +132,10 @@ impl WebSocketContext for ServerContext {
 
     fn zenoh_session(&self) -> &zenoh::Session {
         &self.zenoh_session
+    }
+
+    fn shutdown_token(&self) -> Option<tokio_util::sync::CancellationToken> {
+        Some(self.shutdown_coordinator.token())
     }
 }
 
@@ -306,6 +312,12 @@ async fn main() -> std::io::Result<()> {
         .expect("Failed to open Zenoh session");
     info!("Zenoh session initialized");
 
+    // Create shutdown coordinator for graceful shutdown
+    let shutdown_coordinator = ShutdownCoordinator::new();
+
+    // Clone session for cleanup after server stops
+    let zenoh_session_cleanup = zenoh_session.clone();
+
     // Binding to [::] will also bind to 0.0.0.0
     // Use configurable ports (defaults: 443 HTTPS, 80 HTTP)
     let https_port = args.https_port;
@@ -323,7 +335,11 @@ async fn main() -> std::io::Result<()> {
         https_port, http_port
     );
 
-    HttpServer::new(move || {
+    // Clone for cleanup after server stops
+    let upload_manager_cleanup = upload_manager.clone();
+    let shutdown_coord_for_signal = shutdown_coordinator.clone();
+
+    let server = HttpServer::new(move || {
         let (tx, _) = channel();
 
         let server_ctx = ServerContext {
@@ -333,6 +349,7 @@ async fn main() -> std::io::Result<()> {
             upload_manager: upload_manager.clone(),
             upload_progress_stream: upload_broadcaster.clone(),
             zenoh_session: zenoh_session.clone(),
+            shutdown_coordinator: shutdown_coordinator.clone(),
         };
         let _handle = handle.clone();
 
@@ -538,6 +555,35 @@ async fn main() -> std::io::Result<()> {
     .bind(&addrs_http[..])?
     .bind_openssl(&addrs[..], builder)?
     .workers(8)
-    .run()
-    .await
+    .shutdown_timeout(5)
+    .run();
+
+    // Spawn signal handler task
+    let server_handle = server.handle();
+    tokio::spawn(async move {
+        shutdown_coord_for_signal.wait_for_signal().await;
+        info!("Stopping HTTP server...");
+        server_handle.stop(true).await;
+    });
+
+    // Run the server
+    let server_result = server.await;
+
+    // Graceful shutdown cleanup
+    info!("HTTP server stopped, performing cleanup...");
+
+    // Cancel all active uploads
+    let cancelled = upload_manager_cleanup.cancel_all_uploads().await;
+    if cancelled > 0 {
+        info!("Cancelled {} active upload(s)", cancelled);
+    }
+
+    // Close Zenoh session explicitly
+    info!("Closing Zenoh session...");
+    if let Err(e) = zenoh_session_cleanup.close().await {
+        error!("Failed to close Zenoh session: {}", e);
+    }
+
+    info!("Graceful shutdown complete");
+    server_result
 }

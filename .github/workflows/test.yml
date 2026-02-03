@@ -10,8 +10,8 @@
 #
 # Runner Notes:
 # - ubuntu-22.04: Standard GitHub-hosted runner (x86_64, 2 vCPU, 7 GB RAM)
-# - ubuntu-22.04-large: Larger runner (x86_64, 8 vCPU, 32 GB RAM)
-# - ubuntu-22.04-arm-large: Larger ARM runner (aarch64, 8 vCPU, 32 GB RAM)
+# - ubuntu-22.04-xlarge: Extra-large runner (x86_64, 32 vCPU, 128 GB RAM, 1200 GB SSD)
+# - ubuntu-22.04-arm-xlarge: Extra-large ARM runner (aarch64, 32 vCPU, 128 GB RAM, 1200 GB SSD)
 # - raivin: Self-hosted hardware runner with Zenoh network and Studio access
 #
 # Note: Coverage-instrumented builds require larger runners due to high memory
@@ -90,10 +90,10 @@ jobs:
       matrix:
         platform:
           - name: x86_64
-            runner: ubuntu-22.04-large
+            runner: ubuntu-22.04-xlarge
             target: x86_64-unknown-linux-gnu
           - name: aarch64
-            runner: ubuntu-22.04-arm-large
+            runner: ubuntu-22.04-arm-xlarge
             target: aarch64-unknown-linux-gnu
       fail-fast: false
 

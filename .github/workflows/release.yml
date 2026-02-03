@@ -107,19 +107,19 @@ jobs:
           # Copy x86_64 binary
           if [ -f artifacts/packages-x86_64/edgefirst-websrv-x86_64 ]; then
             cp artifacts/packages-x86_64/edgefirst-websrv-x86_64 \
-               release-assets/edgefirst-websrv-v${{ needs.prepare-release.outputs.version }}-linux-x86_64
+               release-assets/edgefirst-websrv-${{ needs.prepare-release.outputs.version }}-linux-x86_64
           fi
 
           # Copy ARM64 binary
           if [ -f artifacts/packages-aarch64/edgefirst-websrv-aarch64 ]; then
             cp artifacts/packages-aarch64/edgefirst-websrv-aarch64 \
-               release-assets/edgefirst-websrv-v${{ needs.prepare-release.outputs.version }}-linux-aarch64
+               release-assets/edgefirst-websrv-${{ needs.prepare-release.outputs.version }}-linux-aarch64
           fi
 
           # Copy SBOM
           if [ -f artifacts/sbom/sbom.json ]; then
             cp artifacts/sbom/sbom.json \
-               release-assets/edgefirst-websrv-v${{ needs.prepare-release.outputs.version }}-sbom.json
+               release-assets/edgefirst-websrv-${{ needs.prepare-release.outputs.version }}-sbom.json
           fi
           
           echo "Release assets prepared:"
@@ -134,21 +134,21 @@ jobs:
 
             ## Downloads
 
-            - **Linux x86_64**: `edgefirst-websrv-v${{ needs.prepare-release.outputs.version }}-linux-x86_64`
-            - **Linux ARM64**: `edgefirst-websrv-v${{ needs.prepare-release.outputs.version }}-linux-aarch64`
-            - **SBOM**: `edgefirst-websrv-v${{ needs.prepare-release.outputs.version }}-sbom.json`
+            - **Linux x86_64**: `edgefirst-websrv-${{ needs.prepare-release.outputs.version }}-linux-x86_64`
+            - **Linux ARM64**: `edgefirst-websrv-${{ needs.prepare-release.outputs.version }}-linux-aarch64`
+            - **SBOM**: `edgefirst-websrv-${{ needs.prepare-release.outputs.version }}-sbom.json`
 
             ## Installation
 
             ```bash
             # Download binary (replace URL with your platform)
-            wget https://github.com/EdgeFirstAI/websrv/releases/download/v${{ needs.prepare-release.outputs.version }}/edgefirst-websrv-v${{ needs.prepare-release.outputs.version }}-linux-aarch64
+            wget https://github.com/EdgeFirstAI/websrv/releases/download/v${{ needs.prepare-release.outputs.version }}/edgefirst-websrv-${{ needs.prepare-release.outputs.version }}-linux-aarch64
 
             # Make executable
-            chmod +x edgefirst-websrv-v${{ needs.prepare-release.outputs.version }}-linux-aarch64
+            chmod +x edgefirst-websrv-${{ needs.prepare-release.outputs.version }}-linux-aarch64
 
             # Run
-            ./edgefirst-websrv-v${{ needs.prepare-release.outputs.version }}-linux-aarch64 --help
+            ./edgefirst-websrv-${{ needs.prepare-release.outputs.version }}-linux-aarch64 --help
             ```
 
             ## What's Changed

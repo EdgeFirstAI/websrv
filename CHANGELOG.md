@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.8.1] - 2026-02-03
+
+### Fixed
+
+- Release artifact filenames now use `X.Y.Z` format instead of `vX.Y.Z`
+
 ## [3.8.0] - 2026-02-03
 
 ### Added

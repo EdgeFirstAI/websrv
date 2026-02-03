@@ -1,6 +1,8 @@
 // Copyright 2025 Au-Zone Technologies Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::path::PathBuf;
+
 use clap::Parser;
 use serde::Serialize;
 use serde_json::json;
@@ -78,6 +80,22 @@ pub struct Args {
     /// HTTPS port (default: 443, use 8443 for non-root)
     #[arg(long, env, default_value = "443")]
     pub https_port: u16,
+
+    /// SSL certificate directory (default: /etc/edgefirst/ssl)
+    #[arg(long, env, default_value = "/etc/edgefirst/ssl")]
+    pub cert_dir: PathBuf,
+
+    /// SSL certificate file (overrides cert_dir)
+    #[arg(long, env)]
+    pub cert: Option<PathBuf>,
+
+    /// SSL private key file (overrides cert_dir)
+    #[arg(long, env)]
+    pub key: Option<PathBuf>,
+
+    /// Force regeneration of self-signed certificate
+    #[arg(long)]
+    pub generate_cert: bool,
 }
 
 #[derive(Serialize)]

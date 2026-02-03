@@ -9,16 +9,15 @@
 //! - EdgeFirst Studio integration for uploads
 //! - System service management
 
+mod ssl;
+
 use actix_files as fs;
 use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer, Responder, Result};
 use actix_web_actors::ws;
 use actix_web_lab::middleware::RedirectHttps;
 use clap::Parser;
 use log::{debug, error, info};
-use openssl::{
-    pkey::{PKey, Private},
-    ssl::{SslAcceptor, SslMethod},
-};
+use openssl::ssl::{SslAcceptor, SslMethod};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicI64;
 use std::sync::mpsc::channel;
@@ -49,17 +48,6 @@ use edgefirst_websrv::{
         MessageStream, WebSocketContext,
     },
 };
-
-// ============================================================================
-// SSL Configuration
-// ============================================================================
-
-const SERVER_PEM: &[u8] = include_bytes!("../server.pem");
-
-fn load_encrypted_private_key() -> PKey<Private> {
-    let buffer = SERVER_PEM;
-    PKey::private_key_from_pem_passphrase(buffer, b"password").expect("Failed to load private key")
-}
 
 // ============================================================================
 // Server Context
@@ -264,21 +252,23 @@ async fn main() -> std::io::Result<()> {
 
     let handle = Handle::current();
 
-    let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
-    let certificate =
-        openssl::x509::X509::from_pem(SERVER_PEM).expect("Failed to parse certificate");
+    // Load or generate SSL certificate
+    let cert_result = ssl::load_or_generate_certificate(&args)
+        .expect("Failed to load or generate SSL certificate");
+    info!(
+        "Using {} certificate",
+        cert_result.source
+    );
 
+    let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
     builder
-        .set_private_key(&load_encrypted_private_key())
+        .set_private_key(&cert_result.private_key)
         .expect("Failed to set private key");
     builder
-        .set_certificate(&certificate)
+        .set_certificate(&cert_result.certificate)
         .expect("Failed to set certificate");
 
-    let hostname = hostname::get()
-        .unwrap_or_else(|_| "unknown".into())
-        .to_string_lossy()
-        .into_owned();
+    let hostname = ssl::get_device_hostname();
     info!("To visualize navigate to https://{} ", hostname);
     let state = web::Data::new(AppState {
         process: Mutex::new(None),

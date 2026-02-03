@@ -6,7 +6,7 @@ Maivin WebSrv is a high-performance web-based user interface server for monitori
 
 **Key Technologies:**
 - **Web Framework**: Actix-web 4.12.1 with 8-worker Tokio runtime
-- **Security**: HTTPS/TLS via OpenSSL with embedded certificates
+- **Security**: HTTPS/TLS via OpenSSL with flexible certificate management
 - **Real-time Communication**: WebSocket (binary streaming) + Zenoh 1.6.2
 - **Data Format**: MCAP (robotics recording format)
 - **Concurrency**: Tokio async/await with Arc/Mutex/RwLock synchronization
@@ -809,41 +809,88 @@ graph TB
 
 ## Security Architecture
 
-### TLS/HTTPS Configuration
+### TLS Certificate Management
+
+The server requires HTTPS for browser features (WebGL, hardware video decoding). Certificates are loaded using a priority chain that balances flexibility with ease of use.
 
 ```mermaid
-graph TB
-    subgraph "TLS Setup"
-        ServerPEM[server.pem<br/>Embedded Certificate + Key]
-        Password[Passphrase: 'password']
+flowchart TD
+    Start([Server Start]) --> CheckCLI{--cert/--key<br/>provided?}
+    CheckCLI -->|Yes| LoadUser[Load User Certificate]
+    CheckCLI -->|No| CheckDir{webui.crt exists<br/>in cert-dir?}
+    CheckDir -->|Yes| LoadExisting[Load Existing Certificate]
+    CheckDir -->|No| CheckWrite{cert-dir<br/>writable?}
+    CheckWrite -->|Yes| Generate[Generate Self-Signed<br/>Certificate]
+    CheckWrite -->|No| Fallback[Use Embedded<br/>Certificate]
 
-        ServerPEM --> LoadKey[Load Private Key]
-        Password --> LoadKey
+    LoadUser --> Validate
+    LoadExisting --> Validate
+    Generate --> Save[Save to cert-dir]
+    Save --> Validate
+    Fallback --> Validate[Validate & Build<br/>TLS Acceptor]
+    Validate --> StartTLS([Start HTTPS Server])
 
-        LoadKey --> Builder[SslAcceptor::mozilla_intermediate]
-        ServerPEM --> LoadCert[Load X509 Certificate]
-        LoadCert --> Builder
+    style Generate fill:#e1f5fe
+    style Fallback fill:#fff3e0
+```
 
-        Builder --> HTTPS[HTTPS Server<br/>Port 443]
+**Certificate Sources**:
+
+| Priority | Source | Use Case |
+|----------|--------|----------|
+| 1 | `--cert`/`--key` CLI | Production with CA-signed certificates |
+| 2 | `cert-dir/webui.crt` | Persistent device certificates |
+| 3 | Auto-generated | First-run on new devices |
+| 4 | Embedded fallback | Development/CI environments |
+
+### Self-Signed Certificate Generation
+
+Generated certificates include the device hostname for mDNS compatibility:
+
+```mermaid
+flowchart LR
+    subgraph "Certificate Contents"
+        CN[CN: hostname]
+        SAN1[DNS: hostname.local]
+        SAN2[DNS: hostname]
+        SAN3[DNS: localhost]
+        SAN4[IP: 127.0.0.1]
+        SAN5[IP: ::1]
     end
 
-    subgraph "HTTP Redirect"
-        HTTP[HTTP Server<br/>Port 80]
-        HTTP --> Middleware[RedirectHttps Middleware]
-        Middleware -.-> |301 Redirect| HTTPS
-    end
-
-    subgraph "Clients"
-        Browser[Web Browser] --> |HTTPS Request| HTTPS
-        Browser --> |HTTP Request| HTTP
+    subgraph "Properties"
+        Key[ECDSA P-256]
+        Valid[10-year validity]
+        Usage[TLS Server Auth]
     end
 ```
 
+**File Locations**:
+- Certificate: `{cert-dir}/webui.crt` (mode 0644)
+- Private Key: `{cert-dir}/webui.key` (mode 0600)
+
+### HTTPS Configuration
+
+```mermaid
+graph LR
+    subgraph "HTTP Redirect"
+        HTTP[HTTP :80] --> Redirect[301 Redirect]
+        Redirect --> HTTPS
+    end
+
+    subgraph "TLS Server"
+        HTTPS[HTTPS :443]
+        Mozilla[Mozilla Intermediate<br/>Cipher Suite]
+        TLS12[TLS 1.2+]
+    end
+
+    Browser --> HTTP
+    Browser --> HTTPS
+```
+
 **TLS Implementation**:
-- **Certificate**: Embedded in binary via `include_bytes!("../server.pem")`
 - **Cipher Suites**: Mozilla Intermediate profile (OpenSSL)
-- **Protocol**: TLS 1.2+ (via `SslMethod::tls()`)
-- **Key Encryption**: Passphrase-protected private key
+- **Protocol**: TLS 1.2+ via `SslMethod::tls()`
 - **HTTP**: Always redirects to HTTPS via `RedirectHttps` middleware
 
 ### Path Validation

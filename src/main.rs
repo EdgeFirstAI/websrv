@@ -255,10 +255,7 @@ async fn main() -> std::io::Result<()> {
     // Load or generate SSL certificate
     let cert_result = ssl::load_or_generate_certificate(&args)
         .expect("Failed to load or generate SSL certificate");
-    info!(
-        "Using {} certificate",
-        cert_result.source
-    );
+    info!("Using {} certificate", cert_result.source);
 
     let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
     builder

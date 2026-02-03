@@ -141,9 +141,7 @@ fn generate_test_certificate(hostname: &str) -> (String, String) {
 
     let mut params = CertificateParams::default();
 
-    params
-        .distinguished_name
-        .push(DnType::CommonName, hostname);
+    params.distinguished_name.push(DnType::CommonName, hostname);
 
     params.subject_alt_names = vec![
         SanType::DnsName(format!("{}.local", hostname).try_into().unwrap()),

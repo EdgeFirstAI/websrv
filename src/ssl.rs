@@ -22,8 +22,8 @@ use log::{info, warn};
 use openssl::pkey::{PKey, Private};
 use openssl::x509::X509;
 use rcgen::{
-    CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
-    SanType, PKCS_ECDSA_P256_SHA256,
+    CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType,
+    PKCS_ECDSA_P256_SHA256,
 };
 
 use crate::Args;
@@ -180,9 +180,7 @@ pub fn generate_self_signed_certificate(hostname: &str) -> anyhow::Result<(Strin
     let mut params = CertificateParams::default();
 
     // Set subject distinguished name
-    params
-        .distinguished_name
-        .push(DnType::CommonName, hostname);
+    params.distinguished_name.push(DnType::CommonName, hostname);
 
     // Set Subject Alternative Names for various access methods
     params.subject_alt_names = vec![
@@ -292,13 +290,19 @@ mod tests {
 
         // Verify Subject Alternative Names include .local
         let sans = cert.subject_alt_names().expect("SANs should exist");
-        let san_dns_names: Vec<_> = sans
-            .iter()
-            .filter_map(|n| n.dnsname())
-            .collect();
-        assert!(san_dns_names.contains(&"test-device.local"), "SANs should include hostname.local");
-        assert!(san_dns_names.contains(&"test-device"), "SANs should include hostname");
-        assert!(san_dns_names.contains(&"localhost"), "SANs should include localhost");
+        let san_dns_names: Vec<_> = sans.iter().filter_map(|n| n.dnsname()).collect();
+        assert!(
+            san_dns_names.contains(&"test-device.local"),
+            "SANs should include hostname.local"
+        );
+        assert!(
+            san_dns_names.contains(&"test-device"),
+            "SANs should include hostname"
+        );
+        assert!(
+            san_dns_names.contains(&"localhost"),
+            "SANs should include localhost"
+        );
     }
 
     #[test]
@@ -313,9 +317,6 @@ mod tests {
         assert_eq!(CertificateSource::UserProvided.to_string(), "user-provided");
         assert_eq!(CertificateSource::CertDir.to_string(), "cert-dir");
         assert_eq!(CertificateSource::Generated.to_string(), "auto-generated");
-        assert_eq!(
-            CertificateSource::Embedded.to_string(),
-            "embedded fallback"
-        );
+        assert_eq!(CertificateSource::Embedded.to_string(), "embedded fallback");
     }
 }

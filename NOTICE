@@ -33,6 +33,7 @@ This software contains the following first-level dependencies:
   * serde_json 1.0.145 (MIT OR Apache-2.0)
   * sysinfo 0.37.2 (MIT)
   * tokio 1.48.0 (MIT)
+  * tokio-util 0.7.17 (MIT)
   * uuid 1.19.0 (MIT OR Apache-2.0)
   * zenoh 1.6.2 (EPL 2.0 OR Apache 2.0)
 

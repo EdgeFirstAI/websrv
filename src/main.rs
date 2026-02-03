@@ -339,224 +339,221 @@ async fn main() -> std::io::Result<()> {
     let upload_manager_cleanup = upload_manager.clone();
     let shutdown_coord_for_signal = shutdown_coordinator.clone();
 
-    let server = HttpServer::new(move || {
-        let (tx, _) = channel();
+    let server =
+        HttpServer::new(move || {
+            let (tx, _) = channel();
 
-        let server_ctx = ServerContext {
-            args: args.clone(),
-            err_stream: Arc::new(MessageStream::new(tx, Box::new(|| {}), false)),
-            err_count: AtomicI64::new(0),
-            upload_manager: upload_manager.clone(),
-            upload_progress_stream: upload_broadcaster.clone(),
-            zenoh_session: zenoh_session.clone(),
-            shutdown_coordinator: shutdown_coordinator.clone(),
-        };
-        let _handle = handle.clone();
+            let server_ctx = ServerContext {
+                args: args.clone(),
+                err_stream: Arc::new(MessageStream::new(tx, Box::new(|| {}), false)),
+                err_count: AtomicI64::new(0),
+                upload_manager: upload_manager.clone(),
+                upload_progress_stream: upload_broadcaster.clone(),
+                zenoh_session: zenoh_session.clone(),
+                shutdown_coordinator: shutdown_coordinator.clone(),
+            };
+            let _handle = handle.clone();
 
-        if args.system {
-            App::new()
-                .wrap(RedirectHttps::default())
-                .app_data(state.clone())
-                .app_data(web::Data::new(server_ctx))
-                .service(
-                    web::scope("")
-                        .route("/", web::get().to(index))
-                        .route("/settings", web::get().to(serve_settings_page))
-                        .route(
-                            "/check-storage",
-                            web::get().to(check_storage_availability::<ServerContext>),
-                        )
-                        .route("/start", web::post().to(start))
-                        .route("/stop", web::post().to(stop))
-                        .route("/delete", web::post().to(delete))
-                        .route("/replay", web::post().to(start_replay))
-                        .route("/replay-end", web::post().to(stop_replay))
-                        .route("/replay-status", web::get().to(check_replay_status))
-                        .route("/live-run", web::post().to(isolate_system))
-                        .route("/download/{file:.*}", web::get().to(mcap_downloader))
-                        .route(
-                            "/get-upload-credentials",
-                            web::get().to(get_upload_credentials),
-                        )
-                        // Authentication API routes
-                        .route(
-                            "/api/auth/login",
-                            web::post().to(auth_login::<ServerContext>),
-                        )
-                        .route(
-                            "/api/auth/status",
-                            web::get().to(auth_status::<ServerContext>),
-                        )
-                        .route(
-                            "/api/auth/logout",
-                            web::post().to(auth_logout::<ServerContext>),
-                        )
-                        // Upload API routes
-                        .route(
-                            "/api/uploads",
-                            web::post().to(start_upload_handler::<ServerContext>),
-                        )
-                        .route(
-                            "/api/uploads",
-                            web::get().to(list_uploads_handler::<ServerContext>),
-                        )
-                        .route(
-                            "/api/uploads/{id}",
-                            web::get().to(get_upload_handler::<ServerContext>),
-                        )
-                        .route(
-                            "/api/uploads/{id}",
-                            web::delete().to(cancel_upload_handler::<ServerContext>),
-                        )
-                        // Studio API routes
-                        .route(
-                            "/api/studio/projects",
-                            web::get().to(list_studio_projects::<ServerContext>),
-                        )
-                        .route(
-                            "/api/studio/projects/{id}/labels",
-                            web::get().to(list_project_labels::<ServerContext>),
-                        )
-                        .route("/recorder-status", web::get().to(check_recorder_status))
-                        .route("/current-recording", web::get().to(get_current_recording))
-                        .service(
-                            web::resource("/ws/dropped")
-                                .route(web::get().to(websocket_handler_errors::<ServerContext>)),
-                        )
-                        .service(
-                            web::resource("/rt/detect/mask").route(
+            if args.system {
+                App::new()
+                    .wrap(RedirectHttps::default())
+                    .app_data(state.clone())
+                    .app_data(web::Data::new(server_ctx))
+                    .service(
+                        web::scope("")
+                            .route("/", web::get().to(index))
+                            .route("/settings", web::get().to(serve_settings_page))
+                            .route(
+                                "/check-storage",
+                                web::get().to(check_storage_availability::<ServerContext>),
+                            )
+                            .route("/start", web::post().to(start))
+                            .route("/stop", web::post().to(stop))
+                            .route("/delete", web::post().to(delete))
+                            .route("/replay", web::post().to(start_replay))
+                            .route("/replay-end", web::post().to(stop_replay))
+                            .route("/replay-status", web::get().to(check_replay_status))
+                            .route("/live-run", web::post().to(isolate_system))
+                            .route("/download/{file:.*}", web::get().to(mcap_downloader))
+                            .route(
+                                "/get-upload-credentials",
+                                web::get().to(get_upload_credentials),
+                            )
+                            // Authentication API routes
+                            .route(
+                                "/api/auth/login",
+                                web::post().to(auth_login::<ServerContext>),
+                            )
+                            .route(
+                                "/api/auth/status",
+                                web::get().to(auth_status::<ServerContext>),
+                            )
+                            .route(
+                                "/api/auth/logout",
+                                web::post().to(auth_logout::<ServerContext>),
+                            )
+                            // Upload API routes
+                            .route(
+                                "/api/uploads",
+                                web::post().to(start_upload_handler::<ServerContext>),
+                            )
+                            .route(
+                                "/api/uploads",
+                                web::get().to(list_uploads_handler::<ServerContext>),
+                            )
+                            .route(
+                                "/api/uploads/{id}",
+                                web::get().to(get_upload_handler::<ServerContext>),
+                            )
+                            .route(
+                                "/api/uploads/{id}",
+                                web::delete().to(cancel_upload_handler::<ServerContext>),
+                            )
+                            // Studio API routes
+                            .route(
+                                "/api/studio/projects",
+                                web::get().to(list_studio_projects::<ServerContext>),
+                            )
+                            .route(
+                                "/api/studio/projects/{id}/labels",
+                                web::get().to(list_project_labels::<ServerContext>),
+                            )
+                            .route("/recorder-status", web::get().to(check_recorder_status))
+                            .route("/current-recording", web::get().to(get_current_recording))
+                            .service(
+                                web::resource("/ws/dropped").route(
+                                    web::get().to(websocket_handler_errors::<ServerContext>),
+                                ),
+                            )
+                            .service(web::resource("/rt/detect/mask").route(
                                 web::get().to(websocket_handler_high_priority::<ServerContext>),
-                            ),
-                        )
-                        .service(
-                            web::resource("/rt/{tail:.*}").route(
+                            ))
+                            .service(web::resource("/rt/{tail:.*}").route(
                                 web::get().to(websocket_handler_low_priority::<ServerContext>),
-                            ),
-                        )
-                        .route("/config/service/status", web::post().to(get_all_services))
-                        .route("/config/services/update", web::post().to(update_service))
-                        .service(
-                            web::resource("/mcap/").route(web::get().to(mcap_websocket_handler)),
-                        )
-                        .service(
-                            web::resource("/ws/uploads")
-                                .route(web::get().to(upload_websocket_handler)),
-                        )
-                        .route("/config/{service}", web::get().to(serve_config_page))
-                        .route("/config/{service}/details", web::get().to(get_config))
-                        .route("/config/{service}", web::post().to(set_config))
-                        .route("/{file:.*}", web::get().to(custom_file_handler)),
-                )
-        } else {
-            App::new()
-                .wrap(RedirectHttps::default())
-                .app_data(state.clone())
-                .app_data(web::Data::new(server_ctx))
-                .service(
-                    web::scope("")
-                        .route("/", web::get().to(index))
-                        .route("/settings", web::get().to(serve_settings_page))
-                        .route(
-                            "/check-storage",
-                            web::get().to(check_storage_availability::<ServerContext>),
-                        )
-                        .route("/start", web::post().to(user_mode_start::<ServerContext>))
-                        .route("/stop", web::post().to(user_mode_stop))
-                        .route("/delete", web::post().to(delete))
-                        .route("/replay", web::post().to(start_replay))
-                        .route("/replay-end", web::post().to(stop_replay))
-                        .route(
-                            "/replay-status",
-                            web::get().to(user_mode_check_replay_status),
-                        )
-                        .route("/live-run", web::post().to(isolate_system))
-                        .route("/download/{file:.*}", web::get().to(mcap_downloader))
-                        .route(
-                            "/get-upload-credentials",
-                            web::get().to(get_upload_credentials),
-                        )
-                        // Authentication API routes
-                        .route(
-                            "/api/auth/login",
-                            web::post().to(auth_login::<ServerContext>),
-                        )
-                        .route(
-                            "/api/auth/status",
-                            web::get().to(auth_status::<ServerContext>),
-                        )
-                        .route(
-                            "/api/auth/logout",
-                            web::post().to(auth_logout::<ServerContext>),
-                        )
-                        // Upload API routes
-                        .route(
-                            "/api/uploads",
-                            web::post().to(start_upload_handler::<ServerContext>),
-                        )
-                        .route(
-                            "/api/uploads",
-                            web::get().to(list_uploads_handler::<ServerContext>),
-                        )
-                        .route(
-                            "/api/uploads/{id}",
-                            web::get().to(get_upload_handler::<ServerContext>),
-                        )
-                        .route(
-                            "/api/uploads/{id}",
-                            web::delete().to(cancel_upload_handler::<ServerContext>),
-                        )
-                        // Studio API routes
-                        .route(
-                            "/api/studio/projects",
-                            web::get().to(list_studio_projects::<ServerContext>),
-                        )
-                        .route(
-                            "/api/studio/projects/{id}/labels",
-                            web::get().to(list_project_labels::<ServerContext>),
-                        )
-                        .route(
-                            "/recorder-status",
-                            web::get().to(user_mode_check_recorder_status),
-                        )
-                        .route("/current-recording", web::get().to(get_current_recording))
-                        .service(
-                            web::resource("/ws/dropped")
-                                .route(web::get().to(websocket_handler_errors::<ServerContext>)),
-                        )
-                        .service(
-                            web::resource("/rt/detect/mask").route(
+                            ))
+                            .route("/config/service/status", web::post().to(get_all_services))
+                            .route("/config/services/update", web::post().to(update_service))
+                            .service(
+                                web::resource("/mcap/")
+                                    .route(web::get().to(mcap_websocket_handler)),
+                            )
+                            .service(
+                                web::resource("/ws/uploads")
+                                    .route(web::get().to(upload_websocket_handler)),
+                            )
+                            .route("/config/{service}", web::get().to(serve_config_page))
+                            .route("/config/{service}/details", web::get().to(get_config))
+                            .route("/config/{service}", web::post().to(set_config))
+                            .route("/{file:.*}", web::get().to(custom_file_handler)),
+                    )
+            } else {
+                App::new()
+                    .wrap(RedirectHttps::default())
+                    .app_data(state.clone())
+                    .app_data(web::Data::new(server_ctx))
+                    .service(
+                        web::scope("")
+                            .route("/", web::get().to(index))
+                            .route("/settings", web::get().to(serve_settings_page))
+                            .route(
+                                "/check-storage",
+                                web::get().to(check_storage_availability::<ServerContext>),
+                            )
+                            .route("/start", web::post().to(user_mode_start::<ServerContext>))
+                            .route("/stop", web::post().to(user_mode_stop))
+                            .route("/delete", web::post().to(delete))
+                            .route("/replay", web::post().to(start_replay))
+                            .route("/replay-end", web::post().to(stop_replay))
+                            .route(
+                                "/replay-status",
+                                web::get().to(user_mode_check_replay_status),
+                            )
+                            .route("/live-run", web::post().to(isolate_system))
+                            .route("/download/{file:.*}", web::get().to(mcap_downloader))
+                            .route(
+                                "/get-upload-credentials",
+                                web::get().to(get_upload_credentials),
+                            )
+                            // Authentication API routes
+                            .route(
+                                "/api/auth/login",
+                                web::post().to(auth_login::<ServerContext>),
+                            )
+                            .route(
+                                "/api/auth/status",
+                                web::get().to(auth_status::<ServerContext>),
+                            )
+                            .route(
+                                "/api/auth/logout",
+                                web::post().to(auth_logout::<ServerContext>),
+                            )
+                            // Upload API routes
+                            .route(
+                                "/api/uploads",
+                                web::post().to(start_upload_handler::<ServerContext>),
+                            )
+                            .route(
+                                "/api/uploads",
+                                web::get().to(list_uploads_handler::<ServerContext>),
+                            )
+                            .route(
+                                "/api/uploads/{id}",
+                                web::get().to(get_upload_handler::<ServerContext>),
+                            )
+                            .route(
+                                "/api/uploads/{id}",
+                                web::delete().to(cancel_upload_handler::<ServerContext>),
+                            )
+                            // Studio API routes
+                            .route(
+                                "/api/studio/projects",
+                                web::get().to(list_studio_projects::<ServerContext>),
+                            )
+                            .route(
+                                "/api/studio/projects/{id}/labels",
+                                web::get().to(list_project_labels::<ServerContext>),
+                            )
+                            .route(
+                                "/recorder-status",
+                                web::get().to(user_mode_check_recorder_status),
+                            )
+                            .route("/current-recording", web::get().to(get_current_recording))
+                            .service(
+                                web::resource("/ws/dropped").route(
+                                    web::get().to(websocket_handler_errors::<ServerContext>),
+                                ),
+                            )
+                            .service(web::resource("/rt/detect/mask").route(
                                 web::get().to(websocket_handler_high_priority::<ServerContext>),
-                            ),
-                        )
-                        .service(
-                            web::resource("/rt/{tail:.*}").route(
+                            ))
+                            .service(web::resource("/rt/{tail:.*}").route(
                                 web::get().to(websocket_handler_low_priority::<ServerContext>),
-                            ),
-                        )
-                        .route("/config/service/status", web::post().to(get_all_services))
-                        .route("/config/services/update", web::post().to(update_service))
-                        .service(
-                            web::resource("/mcap/").route(web::get().to(mcap_websocket_handler)),
-                        )
-                        .service(
-                            web::resource("/ws/uploads")
-                                .route(web::get().to(upload_websocket_handler)),
-                        )
-                        .route("/config/{service}", web::get().to(serve_config_page))
-                        .route(
-                            "/config/{service}/details",
-                            web::get().to(user_mode_get_config),
-                        )
-                        .route("/config/{service}", web::post().to(set_config))
-                        .route("/{file:.*}", web::get().to(custom_file_handler)),
-                )
-        }
-    })
-    .bind(&addrs_http[..])?
-    .bind_openssl(&addrs[..], builder)?
-    .workers(8)
-    .shutdown_timeout(5)
-    .run();
+                            ))
+                            .route("/config/service/status", web::post().to(get_all_services))
+                            .route("/config/services/update", web::post().to(update_service))
+                            .service(
+                                web::resource("/mcap/")
+                                    .route(web::get().to(mcap_websocket_handler)),
+                            )
+                            .service(
+                                web::resource("/ws/uploads")
+                                    .route(web::get().to(upload_websocket_handler)),
+                            )
+                            .route("/config/{service}", web::get().to(serve_config_page))
+                            .route(
+                                "/config/{service}/details",
+                                web::get().to(user_mode_get_config),
+                            )
+                            .route("/config/{service}", web::post().to(set_config))
+                            .route("/{file:.*}", web::get().to(custom_file_handler)),
+                    )
+            }
+        })
+        .bind(&addrs_http[..])?
+        .bind_openssl(&addrs[..], builder)?
+        .workers(8)
+        .shutdown_timeout(5)
+        .run();
 
     // Spawn signal handler task
     let server_handle = server.handle();

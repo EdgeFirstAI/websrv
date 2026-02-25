@@ -1,0 +1,88 @@
+# EdgeFirst Web UI Server Configuration
+#
+# This file is loaded by the systemd service as an EnvironmentFile. Every
+# variable here maps to a command-line flag of the same name (lower-case,
+# with dashes replaced by underscores). Command-line flags take precedence
+# over environment variables.
+#
+# Syntax rules (systemd EnvironmentFile):
+#   - Lines beginning with # or ; are comments.
+#   - KEY=VALUE pairs, one per line.
+#   - Quoting is optional; quotes are stripped by systemd.
+#   - No spaces around the '=' sign.
+
+# ---------------------------------------------------------------------------
+# Document Root
+# ---------------------------------------------------------------------------
+# Filesystem path to the directory containing the web UI static files
+# (HTML, CSS, JavaScript). The server serves these files at the root URL.
+DOCROOT="/usr/share/webui"
+
+# ---------------------------------------------------------------------------
+# System Mode
+# ---------------------------------------------------------------------------
+# When enabled, the server runs in system mode and auto-discovers Zenoh
+# topics for video, detection, and mask overlays via the EdgeFirst client
+# library. When disabled (false), topics are configured explicitly via the
+# MASK, DETECT, and H264 variables below.
+SYSTEM="false"
+
+# ---------------------------------------------------------------------------
+# Zenoh Topics (non-system mode)
+# ---------------------------------------------------------------------------
+# These topics are used when SYSTEM mode is disabled. They specify which
+# Zenoh key expressions to subscribe to for video and inference data.
+
+# Zenoh topic for the segmentation mask overlay (compressed mask data).
+MASK="/rt/model/mask_compressed"
+
+# Zenoh topic for 2D object detection bounding boxes.
+DETECT="/rt/model/boxes2d"
+
+# Zenoh topic for the H.264 video stream from the camera node.
+H264="/rt/camera/h264"
+
+# ---------------------------------------------------------------------------
+# HTTP / HTTPS Ports
+# ---------------------------------------------------------------------------
+# Ports the web server listens on. The server runs both HTTP and HTTPS
+# simultaneously. Use non-privileged ports (e.g. 8080/8443) when running
+# without root permissions.
+HTTP_PORT="80"
+HTTPS_PORT="443"
+
+# ---------------------------------------------------------------------------
+# SSL / TLS Certificates
+# ---------------------------------------------------------------------------
+# Directory searched for certificate (cert.pem) and private key (key.pem)
+# files. If no valid certificate is found, a self-signed certificate is
+# generated automatically.
+CERT_DIR="/etc/edgefirst/ssl"
+
+# Explicit paths to the SSL certificate and private key files. When set,
+# these override the automatic lookup in CERT_DIR. Leave empty to use the
+# directory-based discovery.
+CERT=""
+KEY=""
+
+# ---------------------------------------------------------------------------
+# Zenoh Networking
+# ---------------------------------------------------------------------------
+# Zenoh participant mode. In "peer" mode nodes discover each other via
+# multicast. Use "client" to connect to a Zenoh router, or "router" to act
+# as one.
+# Accepted values: peer, client, router
+MODE="peer"
+
+# Zenoh endpoint(s) to connect to. Required when MODE is "client".
+# Example: CONNECT="tcp/192.168.1.1:7447"
+CONNECT=""
+
+# Zenoh endpoint(s) to listen on. Useful when running as a router or when
+# peers need to reach this node on a specific address/port.
+LISTEN=""
+
+# Disable Zenoh multicast scouting (peer auto-discovery). Set to true when
+# operating in networks where multicast is unavailable or undesired, and use
+# CONNECT/LISTEN for explicit endpoint configuration instead.
+NO_MULTICAST_SCOUTING="false"

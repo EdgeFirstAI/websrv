@@ -121,7 +121,10 @@ jobs:
             cp artifacts/sbom/sbom.json \
                release-assets/edgefirst-websrv-${{ needs.prepare-release.outputs.version }}-sbom.json
           fi
-          
+
+          # Copy default configuration file
+          cp websrv.default release-assets/websrv.default
+
           echo "Release assets prepared:"
           ls -lh release-assets/
 
@@ -134,21 +137,22 @@ jobs:
 
             ## Downloads
 
-            - **Linux x86_64**: `edgefirst-websrv-${{ needs.prepare-release.outputs.version }}-linux-x86_64`
-            - **Linux ARM64**: `edgefirst-websrv-${{ needs.prepare-release.outputs.version }}-linux-aarch64`
-            - **SBOM**: `edgefirst-websrv-${{ needs.prepare-release.outputs.version }}-sbom.json`
+            | Platform | Binary |
+            |----------|--------|
+            | Linux x86_64 | `edgefirst-websrv-${{ needs.prepare-release.outputs.version }}-linux-x86_64` |
+            | Linux ARM64 | `edgefirst-websrv-${{ needs.prepare-release.outputs.version }}-linux-aarch64` |
+            | Configuration | `websrv.default` |
 
             ## Installation
 
             ```bash
-            # Download binary (replace URL with your platform)
+            # Download and install (ARM64 example)
             wget https://github.com/EdgeFirstAI/websrv/releases/download/v${{ needs.prepare-release.outputs.version }}/edgefirst-websrv-${{ needs.prepare-release.outputs.version }}-linux-aarch64
-
-            # Make executable
             chmod +x edgefirst-websrv-${{ needs.prepare-release.outputs.version }}-linux-aarch64
+            sudo mv edgefirst-websrv-${{ needs.prepare-release.outputs.version }}-linux-aarch64 /usr/local/bin/edgefirst-websrv
 
-            # Run
-            ./edgefirst-websrv-${{ needs.prepare-release.outputs.version }}-linux-aarch64 --help
+            # Install default configuration (optional)
+            sudo cp websrv.default /etc/default/websrv
             ```
 
             ## What's Changed

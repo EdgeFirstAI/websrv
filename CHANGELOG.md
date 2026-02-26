@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.8.2] - 2026-02-26
+
+### Changed
+
+- Use short environment variable names for systemd configuration
+- Add complete `websrv.default` reference file with all options documented
+
+### Fixed
+
+- Update NOTICE file dependency versions to match current Cargo.lock
+
+### Maintenance
+
+- Update Cargo.lock with latest dependency versions
+- Add `.github/copilot-instructions.md` project guidance
+
 ## [3.8.1] - 2026-02-03
 
 ### Fixed

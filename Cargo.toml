@@ -3,7 +3,7 @@ name = "edgefirst-websrv"
 description = "EdgeFirst Web UI Server"
 repository = "https://github.com/EdgeFirstAI/websrv"
 license = "Apache-2.0"
-version = "3.8.1"
+version = "3.8.2"
 edition = "2021"
 
 [profile.release]

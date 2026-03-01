@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.8.4] - 2026-03-01
+
+### Fixed
+
+- Filter empty `CONNECT` and `LISTEN` environment variables before passing to Zenoh endpoint parser to prevent panics
+
 ## [3.8.3] - 2026-03-01
 
 ### Fixed

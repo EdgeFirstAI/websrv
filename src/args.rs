@@ -32,7 +32,12 @@ pub type Boolean = bool; //Need this to be able to set bool to true/false in the
 #[command(author, version, about, long_about = None)]
 pub struct Args {
     /// The web document root for serving html pages
-    #[arg(short, long, env = "DOCROOT", default_value = "/usr/share/edgefirst/webui")]
+    #[arg(
+        short,
+        long,
+        env = "DOCROOT",
+        default_value = "/usr/share/edgefirst/webui"
+    )]
     pub docroot: String,
 
     /// Run the application in system mode

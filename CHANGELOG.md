@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.8.3] - 2026-03-01
+
+### Fixed
+
+- Default docroot path changed from `/usr/share/webui` to `/usr/share/edgefirst/webui`
+- Removed `SYSTEM` variable from `websrv.default` (system mode is configured via systemd unit file)
+
 ## [3.8.2] - 2026-02-26
 
 ### Changed

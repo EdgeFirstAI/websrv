@@ -11,7 +11,7 @@ The web frontend lives in a separate repository:
 [github.com/EdgeFirstAI/webui](https://github.com/EdgeFirstAI/webui). The two projects
 work hand-in-hand: **websrv** implements the server and **webui** implements the web
 interface served by the server. The compiled webui assets are served from the path
-configured via `--docroot` (default `/usr/share/webui`).
+configured via `--docroot` (default `/usr/share/edgefirst/webui`).
 
 ## Repository Structure
 

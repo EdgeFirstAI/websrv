@@ -16,22 +16,13 @@
 # ---------------------------------------------------------------------------
 # Filesystem path to the directory containing the web UI static files
 # (HTML, CSS, JavaScript). The server serves these files at the root URL.
-DOCROOT="/usr/share/webui"
+DOCROOT="/usr/share/edgefirst/webui"
 
 # ---------------------------------------------------------------------------
-# System Mode
+# Zenoh Topics
 # ---------------------------------------------------------------------------
-# When enabled, the server runs in system mode and auto-discovers Zenoh
-# topics for video, detection, and mask overlays via the EdgeFirst client
-# library. When disabled (false), topics are configured explicitly via the
-# MASK, DETECT, and H264 variables below.
-SYSTEM="false"
-
-# ---------------------------------------------------------------------------
-# Zenoh Topics (non-system mode)
-# ---------------------------------------------------------------------------
-# These topics are used when SYSTEM mode is disabled. They specify which
 # Zenoh key expressions to subscribe to for video and inference data.
+# These are used when the server is not running in system mode (--system).
 
 # Zenoh topic for the segmentation mask overlay (compressed mask data).
 MASK="/rt/model/mask_compressed"

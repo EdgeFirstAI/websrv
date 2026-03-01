@@ -13,10 +13,9 @@ name: Build
 on:
   push:
     branches: [ main, develop ]
-    tags: ['v*']
   pull_request:
     branches: [ main, develop ]
-  workflow_call:  # Allow this workflow to be called by other workflows
+  workflow_call:  # Allow this workflow to be called by other workflows (e.g. release.yml)
 
 env:
   CARGO_TERM_COLOR: always

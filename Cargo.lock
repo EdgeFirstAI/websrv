@@ -1514,7 +1514,7 @@ dependencies = [
 
 [[package]]
 name = "edgefirst-websrv"
-version = "3.8.4"
+version = "3.8.5"
 dependencies = [
  "actix",
  "actix-files",

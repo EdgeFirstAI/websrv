@@ -4,7 +4,6 @@
 //! Storage utilities for checking disk space and availability.
 
 use actix_web::{web, HttpResponse, Responder};
-use log::error;
 use serde::Serialize;
 use serde_json::json;
 use std::path::Path;
@@ -58,10 +57,9 @@ pub async fn check_storage_availability<T: StorageContext>(data: web::Data<T>) -
     let storage_dir = if data.is_system_mode() {
         match read_storage_directory() {
             Ok(dir) => dir,
-            Err(e) => {
-                error!("Error reading storage directory from config: {}", e);
-                return HttpResponse::InternalServerError().json(json!({
-                    "error": "Error reading storage directory from config"
+            Err(_) => {
+                return HttpResponse::NotFound().json(json!({
+                    "error": "No storage configured"
                 }));
             }
         }

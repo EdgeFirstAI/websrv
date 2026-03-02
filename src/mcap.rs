@@ -173,10 +173,9 @@ impl<T: McapContext + Unpin + 'static> actix::StreamHandler<Result<ws::Message, 
                 if arg_data.is_system_mode() {
                     directory = match read_storage_directory() {
                         Ok(dir) => dir,
-                        Err(e) => {
-                            error!("Error reading directory from config: {}", e);
+                        Err(_) => {
                             let response = serde_json::to_string(
-                                &serde_json::json!({"error": "Error reading directory from config"}),
+                                &serde_json::json!({"error": "No storage configured"}),
                             )
                             .unwrap();
                             ctx.text(response);

@@ -19,21 +19,6 @@
 DOCROOT="/usr/share/edgefirst/webui"
 
 # ---------------------------------------------------------------------------
-# Zenoh Topics
-# ---------------------------------------------------------------------------
-# Zenoh key expressions to subscribe to for video and inference data.
-# These are used when the server is not running in system mode (--system).
-
-# Zenoh topic for the segmentation mask overlay (compressed mask data).
-MASK="/rt/model/mask_compressed"
-
-# Zenoh topic for 2D object detection bounding boxes.
-DETECT="/rt/model/boxes2d"
-
-# Zenoh topic for the H.264 video stream from the camera node.
-H264="/rt/camera/h264"
-
-# ---------------------------------------------------------------------------
 # HTTP / HTTPS Ports
 # ---------------------------------------------------------------------------
 # Ports the web server listens on. The server runs both HTTP and HTTPS
@@ -49,12 +34,6 @@ HTTPS_PORT="443"
 # files. If no valid certificate is found, a self-signed certificate is
 # generated automatically.
 CERT_DIR="/etc/edgefirst/ssl"
-
-# Explicit paths to the SSL certificate and private key files. When set,
-# these override the automatic lookup in CERT_DIR. Leave empty to use the
-# directory-based discovery.
-CERT=""
-KEY=""
 
 # ---------------------------------------------------------------------------
 # Zenoh Networking

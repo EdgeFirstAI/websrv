@@ -27,6 +27,60 @@ pub struct ServiceAction {
 }
 
 // ============================================================================
+// Service Name Resolution
+// ============================================================================
+
+const EDGEFIRST_PREFIX: &str = "edgefirst-";
+
+/// Return the alternate service name by toggling the `edgefirst-` prefix.
+fn alternate_name(name: &str) -> String {
+    if let Some(short) = name.strip_prefix(EDGEFIRST_PREFIX) {
+        short.to_string()
+    } else {
+        format!("{}{}", EDGEFIRST_PREFIX, name)
+    }
+}
+
+/// Resolve a service name to whichever systemd unit actually exists.
+///
+/// Tries the given name first; if systemctl reports it as not loaded
+/// (i.e. the unit file is missing), tries the alternate name with or
+/// without the `edgefirst-` prefix. Returns the name that resolved.
+pub fn resolve_service_name(name: &str) -> String {
+    // Check if the primary name has a loaded unit
+    if is_unit_loaded(name) {
+        return name.to_string();
+    }
+
+    let alt = alternate_name(name);
+    if is_unit_loaded(&alt) {
+        debug!("Service '{}' not found, using '{}'", name, alt);
+        return alt;
+    }
+
+    // Neither found — return original so callers get the expected error
+    name.to_string()
+}
+
+/// Check whether systemd knows about a unit (i.e. its unit file exists).
+fn is_unit_loaded(name: &str) -> bool {
+    let output = Command::new("systemctl")
+        .arg("show")
+        .arg("--property=LoadState")
+        .arg(name)
+        .output();
+
+    match output {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            // LoadState=loaded means the unit file exists
+            stdout.trim() == "LoadState=loaded"
+        }
+        Err(_) => false,
+    }
+}
+
+// ============================================================================
 // Handlers
 // ============================================================================
 
@@ -45,14 +99,16 @@ pub async fn get_all_services(params: web::Json<Value>) -> impl Responder {
         let decoded_service = percent_decode(service.as_bytes())
             .decode_utf8_lossy()
             .to_string();
+        let resolved = resolve_service_name(&decoded_service);
+
         let status_output = Command::new("systemctl")
             .arg("is-active")
-            .arg(&decoded_service)
+            .arg(&resolved)
             .output();
 
         let enabled_output = Command::new("systemctl")
             .arg("is-enabled")
-            .arg(&decoded_service)
+            .arg(&resolved)
             .output();
 
         let status = match status_output {
@@ -89,17 +145,17 @@ pub async fn get_all_services(params: web::Json<Value>) -> impl Responder {
 
 /// Update a service (start, stop, enable, disable)
 pub async fn update_service(params: web::Json<ServiceAction>) -> impl Responder {
-    let service_name = &params.service;
+    let service_name = resolve_service_name(&params.service);
     let action = &params.action;
 
     let mut command = Command::new("sudo");
     command.arg("systemctl");
 
     match action.as_str() {
-        "start" => command.arg("start").arg(service_name),
-        "stop" => command.arg("stop").arg(service_name),
-        "enable" => command.arg("enable").arg(service_name),
-        "disable" => command.arg("disable").arg(service_name),
+        "start" => command.arg("start").arg(&service_name),
+        "stop" => command.arg("stop").arg(&service_name),
+        "enable" => command.arg("enable").arg(&service_name),
+        "disable" => command.arg("disable").arg(&service_name),
         _ => return HttpResponse::BadRequest().body("Invalid action"),
     };
 
@@ -131,9 +187,10 @@ pub async fn update_service(params: web::Json<ServiceAction>) -> impl Responder 
 
 /// Get status of a single service
 pub async fn get_service_status(service_name: &str) -> Result<String, String> {
+    let resolved = resolve_service_name(service_name);
     let status_output = Command::new("systemctl")
         .arg("is-active")
-        .arg(service_name)
+        .arg(&resolved)
         .output()
         .map_err(|e| format!("Error checking service status: {:?}", e))?;
 
@@ -150,9 +207,10 @@ pub async fn get_service_status(service_name: &str) -> Result<String, String> {
 
 /// Check if a service is enabled
 pub async fn is_service_enabled(service_name: &str) -> Result<bool, String> {
+    let resolved = resolve_service_name(service_name);
     let enabled_output = Command::new("systemctl")
         .arg("is-enabled")
-        .arg(service_name)
+        .arg(&resolved)
         .output()
         .map_err(|e| format!("Error checking if service is enabled: {:?}", e))?;
 
@@ -184,5 +242,25 @@ mod tests {
             // Just verify these are valid string values
             assert!(!action.is_empty());
         }
+    }
+
+    #[test]
+    fn test_alternate_name_adds_prefix() {
+        assert_eq!(alternate_name("recorder"), "edgefirst-recorder");
+        assert_eq!(alternate_name("camera"), "edgefirst-camera");
+    }
+
+    #[test]
+    fn test_alternate_name_strips_prefix() {
+        assert_eq!(alternate_name("edgefirst-recorder"), "recorder");
+        assert_eq!(alternate_name("edgefirst-camera"), "camera");
+    }
+
+    #[test]
+    fn test_alternate_name_roundtrip() {
+        let original = "model";
+        let prefixed = alternate_name(original);
+        assert_eq!(prefixed, "edgefirst-model");
+        assert_eq!(alternate_name(&prefixed), original);
     }
 }

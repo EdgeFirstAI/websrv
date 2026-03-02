@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.8.5] - 2026-03-02
+
+### Fixed
+
+- Return HTTP 404 instead of 500 when storage configuration is missing (no recorder installed)
+- MCAP WebSocket listing returns clear "No storage configured" message instead of generic config error
+- Service monitor resolves both `edgefirst-<name>` and `<name>` systemd unit names automatically
+- Expand environment variables (`$HOME`, `${VAR}`) in STORAGE path from `/etc/default/recorder`
+
+### Changed
+
+- Remove unused Zenoh topic and SSL cert/key options from `websrv.default`
+
 ## [3.8.4] - 2026-03-01
 
 ### Fixed

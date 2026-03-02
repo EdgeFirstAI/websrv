@@ -69,30 +69,30 @@ pub async fn get_config(path: web::Path<ConfigPath>) -> impl Responder {
 pub async fn check_service_status(service_name: &str) -> Result<String, String> {
     use std::process::Command;
 
+    use crate::services::resolve_service_name;
+
+    let resolved = resolve_service_name(service_name);
     let service_status = Command::new("systemctl")
         .arg("is-active")
-        .arg(service_name)
+        .arg(&resolved)
         .output()
         .map_err(|e| format!("Error checking service status: {:?}", e))?;
 
     let status = String::from_utf8_lossy(&service_status.stdout)
         .trim()
         .to_string();
-    debug!("{:?} service is {:?}", service_name, status);
+    debug!("{:?} service is {:?}", resolved, status);
     if status == "active" && service_name != "webui" {
         Command::new("systemctl")
             .arg("restart")
-            .arg(service_name)
+            .arg(&resolved)
             .output()
             .map_err(|e| format!("Error restarting service: {:?}", e))?;
-        Ok(format!(
-            "Service '{}' restarted successfully.",
-            service_name
-        ))
+        Ok(format!("Service '{}' restarted successfully.", resolved))
     } else {
         Ok(format!(
             "Service '{}' is not running. No action taken.",
-            service_name
+            resolved
         ))
     }
 }
@@ -150,13 +150,24 @@ pub fn parse_uploader_credentials(content: &str) -> io::Result<UploadCredentials
     Ok(UploadCredentials { url, jwt, topic })
 }
 
+/// Expand shell-style environment variables (`$VAR` and `${VAR}`) in a string.
+fn expand_env_vars(input: &str) -> String {
+    let re = Regex::new(r"\$\{([^}]+)\}|\$([A-Za-z_][A-Za-z0-9_]*)").unwrap();
+    re.replace_all(input, |caps: &regex::Captures| {
+        let var_name = caps.get(1).or_else(|| caps.get(2)).unwrap().as_str();
+        std::env::var(var_name).unwrap_or_default()
+    })
+    .to_string()
+}
+
 /// Parse storage directory from config file content
 pub fn parse_storage_directory(content: &str) -> io::Result<String> {
     for line in content.lines() {
         if line.starts_with("STORAGE") {
             let parts: Vec<&str> = line.split('=').collect();
             if parts.len() == 2 {
-                return Ok(parts[1].trim().trim_matches('"').to_string());
+                let raw = parts[1].trim().trim_matches('"');
+                return Ok(expand_env_vars(raw));
             }
         }
     }
@@ -416,6 +427,43 @@ ANOTHER=123
         let content = "";
         let result = parse_storage_directory(content);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_storage_directory_env_var() {
+        std::env::set_var("TEST_WEBSRV_HOME", "/home/testuser");
+        let content = r#"STORAGE="$TEST_WEBSRV_HOME/recordings""#;
+        let result = parse_storage_directory(content);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "/home/testuser/recordings");
+        std::env::remove_var("TEST_WEBSRV_HOME");
+    }
+
+    #[test]
+    fn test_parse_storage_directory_env_var_braces() {
+        std::env::set_var("TEST_WEBSRV_HOME2", "/home/testuser");
+        let content = r#"STORAGE="${TEST_WEBSRV_HOME2}/recordings""#;
+        let result = parse_storage_directory(content);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "/home/testuser/recordings");
+        std::env::remove_var("TEST_WEBSRV_HOME2");
+    }
+
+    #[test]
+    fn test_expand_env_vars_no_vars() {
+        assert_eq!(
+            expand_env_vars("/media/DATA/recordings"),
+            "/media/DATA/recordings"
+        );
+    }
+
+    #[test]
+    fn test_expand_env_vars_unset_var() {
+        std::env::remove_var("THIS_VAR_SHOULD_NOT_EXIST_EVER");
+        assert_eq!(
+            expand_env_vars("$THIS_VAR_SHOULD_NOT_EXIST_EVER/data"),
+            "/data"
+        );
     }
 
     // ========================================================================

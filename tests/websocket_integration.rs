@@ -46,7 +46,7 @@ async fn test_websocket_receives_zenoh_message() {
         .expect("Failed to open Zenoh session");
 
     let ctx = Arc::new(TestContext {
-        err_stream: Arc::new(MessageStream::new(Box::new(|| {}))),
+        err_stream: Arc::new(MessageStream::new()),
         zenoh_session: zenoh_session.clone(),
         shutdown: CancellationToken::new(),
     });

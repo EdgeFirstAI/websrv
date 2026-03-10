@@ -145,9 +145,7 @@ pub trait McapContext: Send + Sync + 'static {
 // ============================================================================
 
 /// GET /mcap - List MCAP files in storage directory
-pub async fn list_mcap_files<T: McapContext>(
-    State(data): State<Arc<T>>,
-) -> impl IntoResponse {
+pub async fn list_mcap_files<T: McapContext>(State(data): State<Arc<T>>) -> impl IntoResponse {
     let directory = if data.is_system_mode() {
         match read_storage_directory() {
             Ok(dir) => dir,
@@ -163,82 +161,74 @@ pub async fn list_mcap_files<T: McapContext>(
         data.storage_path().to_string()
     };
 
-    match std::fs::read_dir(&directory) {
-        Ok(entries) => {
-            let files: Vec<FileInfo> = entries
-                .filter_map(Result::ok)
-                .filter_map(|entry| {
-                    if let Some(extension) = entry.path().extension() {
-                        if extension == "mcap" {
-                            let metadata = entry.metadata().ok()?;
-                            let size = metadata.len();
-                            let created = metadata
-                                .created()
-                                .ok()?
-                                .duration_since(UNIX_EPOCH)
-                                .ok()?
-                                .as_secs();
+    let dir_clone = directory.clone();
+    let result = tokio::task::spawn_blocking(move || -> Option<Vec<FileInfo>> {
+        let entries = std::fs::read_dir(&dir_clone).ok()?;
+        let files: Vec<FileInfo> = entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                if let Some(extension) = entry.path().extension() {
+                    if extension == "mcap" {
+                        let metadata = entry.metadata().ok()?;
+                        let size = metadata.len();
+                        let created = metadata
+                            .created()
+                            .ok()?
+                            .duration_since(UNIX_EPOCH)
+                            .ok()?
+                            .as_secs();
 
-                            let (topics_info, average_video_length) =
-                                match read_mcap_info(Utf8Path::from_path(&entry.path())?) {
-                                    Ok(info) => info,
-                                    Err(_) => (HashMap::new(), 0.0),
-                                };
+                        let (topics_info, average_video_length) =
+                            match read_mcap_info(Utf8Path::from_path(&entry.path())?) {
+                                Ok(info) => info,
+                                Err(_) => (HashMap::new(), 0.0),
+                            };
 
-                            Some(FileInfo {
-                                name: entry.file_name().to_string_lossy().to_string(),
-                                size: size / (1024 * 1024),
-                                created: DateTime::from_timestamp(created as i64, 0)
-                                    .unwrap()
-                                    .with_timezone(&chrono::Local)
-                                    .format("%Y-%m-%d %H:%M:%S")
-                                    .to_string(),
-                                topics: topics_info,
-                                average_video_length,
-                            })
-                        } else {
-                            None
-                        }
+                        Some(FileInfo {
+                            name: entry.file_name().to_string_lossy().to_string(),
+                            size: size / (1024 * 1024),
+                            created: DateTime::from_timestamp(created as i64, 0)
+                                .unwrap()
+                                .with_timezone(&chrono::Local)
+                                .format("%Y-%m-%d %H:%M:%S")
+                                .to_string(),
+                            topics: topics_info,
+                            average_video_length,
+                        })
                     } else {
                         None
                     }
-                })
-                .collect();
-
-            let response = if files.is_empty() {
-                DirectoryResponse {
-                    dir_name: directory,
-                    files: None,
-                    message: Some("No MCAP files found".to_string()),
-                    topics: None,
+                } else {
+                    None
                 }
-            } else {
-                DirectoryResponse {
-                    dir_name: directory,
-                    files: Some(files),
-                    message: None,
-                    topics: None,
-                }
-            };
-
-            axum::Json(response).into_response()
-        }
-        Err(_) => {
-            axum::Json(DirectoryResponse {
-                dir_name: directory,
-                files: None,
-                message: Some("No MCAP files found".to_string()),
-                topics: None,
             })
-            .into_response()
-        }
-    }
+            .collect();
+        Some(files)
+    })
+    .await;
+
+    let files = result.ok().flatten();
+
+    let response = match files {
+        Some(files) if !files.is_empty() => DirectoryResponse {
+            dir_name: directory,
+            files: Some(files),
+            message: None,
+            topics: None,
+        },
+        _ => DirectoryResponse {
+            dir_name: directory,
+            files: None,
+            message: Some("No MCAP files found".to_string()),
+            topics: None,
+        },
+    };
+
+    axum::Json(response).into_response()
 }
 
 /// MCAP file download handler
-pub async fn mcap_downloader(
-    Path(path): Path<String>,
-) -> impl IntoResponse {
+pub async fn mcap_downloader(Path(path): Path<String>) -> impl IntoResponse {
     // axum 0.8 wildcard captures include leading slash; strip it
     let path = path.strip_prefix('/').unwrap_or(&path).to_string();
     let file_path = StdPath::new(&path);
@@ -254,12 +244,39 @@ pub async fn mcap_downloader(
             .into_response();
     }
 
+    // Path traversal protection: canonicalize and verify within storage directory
+    let canonical = match file_path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => {
+            return (StatusCode::NOT_FOUND, format!("File {:?} not found", path)).into_response();
+        }
+    };
+    let allowed_base = match read_storage_directory() {
+        Ok(dir) => match StdPath::new(&dir).canonicalize() {
+            Ok(p) => p,
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Storage directory not accessible",
+                )
+                    .into_response();
+            }
+        },
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Storage directory not configured",
+            )
+                .into_response();
+        }
+    };
+    if !canonical.starts_with(&allowed_base) {
+        return (StatusCode::FORBIDDEN, "Access denied").into_response();
+    }
+    let file_path = canonical.as_path();
+
     if !file_path.exists() || !file_path.is_file() {
-        return (
-            StatusCode::NOT_FOUND,
-            format!("File {:?} not found", path),
-        )
-            .into_response();
+        return (StatusCode::NOT_FOUND, format!("File {:?} not found", path)).into_response();
     }
 
     let file = match tokio::fs::File::open(file_path).await {

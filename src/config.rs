@@ -225,6 +225,19 @@ pub async fn set_config(Json(params): Json<Value>) -> impl IntoResponse {
         return (StatusCode::BAD_REQUEST, "Missing fileName").into_response();
     };
 
+    // Validate fileName to prevent path traversal
+    if file_name.contains('/') || file_name.contains("..") {
+        error!("Invalid fileName: path traversal attempt detected");
+        return (StatusCode::BAD_REQUEST, "Invalid fileName").into_response();
+    }
+    if !file_name
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
+        error!("Invalid fileName: contains disallowed characters");
+        return (StatusCode::BAD_REQUEST, "Invalid fileName").into_response();
+    }
+
     let service_name = file_name.clone();
 
     let config_file_path = resolve_config_file(&file_name);
@@ -269,7 +282,11 @@ pub async fn set_config(Json(params): Json<Value>) -> impl IntoResponse {
         },
         Err(e) => {
             error!("Error saving configuration: {:?}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, "Error saving configuration").into_response()
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Error saving configuration",
+            )
+                .into_response()
         }
     }
 }

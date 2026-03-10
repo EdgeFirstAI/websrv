@@ -10,7 +10,7 @@
 
 use axum::extract::State;
 use axum::response::IntoResponse;
-use cdr::{CdrLe, Infinite};
+
 use futures::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
@@ -56,14 +56,19 @@ pub struct WebSocketMessage {
 /// Manages WebSocket message broadcasting via tokio::sync::broadcast channels
 pub struct MessageStream {
     tx: broadcast::Sender<Broadcast>,
-    on_err: Box<dyn Fn() + Send + Sync>,
+}
+
+impl Default for MessageStream {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MessageStream {
     /// Create a new MessageStream with a broadcast channel
-    pub fn new(on_err: Box<dyn Fn() + Send + Sync>) -> Self {
+    pub fn new() -> Self {
         let (tx, _) = broadcast::channel(64);
-        MessageStream { tx, on_err }
+        MessageStream { tx }
     }
 
     /// Subscribe to the broadcast channel
@@ -71,11 +76,15 @@ impl MessageStream {
         self.tx.subscribe()
     }
 
-    /// Broadcast a message to all subscribers
+    /// Broadcast a message to all subscribers.
+    ///
+    /// Note: `broadcast::Sender::send` returns `Err` only when there are
+    /// **no active receivers** (e.g., before any client subscribes).  This is
+    /// not the same as a dropped/lagged message — that is signaled by
+    /// `RecvError::Lagged(n)` on the receiver side.  We silently ignore the
+    /// no-subscriber case since it is expected during startup.
     pub fn broadcast(&self, message: Broadcast) {
-        if self.tx.send(message).is_err() {
-            (self.on_err)();
-        }
+        let _ = self.tx.send(message);
     }
 }
 
@@ -235,21 +244,22 @@ pub async fn websocket_handler<T: WebSocketContext>(
         if use_compression { "on" } else { "off" }
     );
 
-    let (response, ws_future) = ws.upgrade(options).unwrap();
+    let (response, ws_future) = match ws.upgrade(options) {
+        Ok(pair) => pair,
+        Err(e) => {
+            error!("WebSocket upgrade failed for {topic}: {e}");
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("WebSocket upgrade failed: {e}"),
+            )
+                .into_response();
+        }
+    };
 
-    let err_stream = ctx.err_stream().clone();
     let zenoh_session = ctx.zenoh_session().clone();
     let global_shutdown = ctx.shutdown_token();
 
-    let video_stream = Arc::new(MessageStream::new(Box::new({
-        let err_stream = err_stream.clone();
-        let topic = topic.clone();
-        move || {
-            let msg = format!("{{\"dropped_topic\": \"{}\"}}", topic);
-            let msg = cdr::serialize::<_, _, CdrLe>(&msg, Infinite).unwrap();
-            err_stream.broadcast(Broadcast::Binary(msg));
-        }
-    })));
+    let video_stream = Arc::new(MessageStream::new());
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
@@ -331,7 +341,7 @@ pub async fn websocket_handler<T: WebSocketContext>(
         let _ = shutdown_tx.send(());
     });
 
-    response
+    response.into_response()
 }
 
 /// WebSocket handler for `/ws/dropped` error stream.
@@ -344,7 +354,17 @@ pub async fn websocket_handler_errors<T: WebSocketContext>(
 ) -> impl IntoResponse {
     let options = Options::default().with_compression_level(yawc::CompressionLevel::fast());
 
-    let (response, ws_future) = ws.upgrade(options).unwrap();
+    let (response, ws_future) = match ws.upgrade(options) {
+        Ok(pair) => pair,
+        Err(e) => {
+            error!("WebSocket upgrade failed for /ws/dropped: {e}");
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("WebSocket upgrade failed: {e}"),
+            )
+                .into_response();
+        }
+    };
     let err_stream = ctx.err_stream().clone();
 
     tokio::spawn(async move {
@@ -389,7 +409,7 @@ pub async fn websocket_handler_errors<T: WebSocketContext>(
         }
     });
 
-    response
+    response.into_response()
 }
 
 #[cfg(test)]
@@ -427,7 +447,7 @@ mod tests {
 
     #[test]
     fn test_message_stream_broadcast() {
-        let stream = MessageStream::new(Box::new(|| {}));
+        let stream = MessageStream::new();
         let mut rx = stream.subscribe();
         stream.broadcast(Broadcast::Text("test".to_string()));
         let msg = rx.try_recv().unwrap();

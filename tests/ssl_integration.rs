@@ -62,10 +62,37 @@ fn test_certificate_pem_format_valid() {
 
     // Verify base64 content is present (PEM body should have content between markers)
     let cert_lines: Vec<&str> = cert_pem.lines().collect();
-    assert!(cert_lines.len() > 2, "Certificate PEM should have content between markers");
+    assert!(
+        cert_lines.len() > 2,
+        "Certificate PEM should have content between markers"
+    );
 
     let key_lines: Vec<&str> = key_pem.lines().collect();
-    assert!(key_lines.len() > 2, "Key PEM should have content between markers");
+    assert!(
+        key_lines.len() > 2,
+        "Key PEM should have content between markers"
+    );
+
+    // Verify rustls can actually parse the PEM (catches invalid base64,
+    // unsupported key types like encrypted PKCS#8, etc.)
+    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .expect("rustls should parse certificate PEM");
+    assert!(
+        !certs.is_empty(),
+        "At least one certificate should be present"
+    );
+
+    let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+        .expect("rustls should parse key PEM")
+        .expect("A usable private key should be present");
+
+    // Verify we can build a ServerConfig (the actual runtime operation)
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .expect("rustls ServerConfig should accept the generated cert+key");
 }
 
 #[test]

@@ -751,10 +751,7 @@ async fn test_check_storage_availability() {
     let client = create_client();
     let base_url = get_base_url();
 
-    let result = client
-        .get(format!("{}/api/storage", base_url))
-        .send()
-        .await;
+    let result = client.get(format!("{}/api/storage", base_url)).send().await;
 
     match result {
         Ok(response) => {
@@ -903,7 +900,10 @@ async fn test_stop_recording() {
     let client = create_client();
     let base_url = get_base_url();
 
-    let result = client.post(format!("{}/api/recorder/stop", base_url)).send().await;
+    let result = client
+        .post(format!("{}/api/recorder/stop", base_url))
+        .send()
+        .await;
 
     match result {
         Ok(response) => {
@@ -990,7 +990,10 @@ async fn test_stop_replay() {
     let client = create_client();
     let base_url = get_base_url();
 
-    let result = client.post(format!("{}/api/replay/stop", base_url)).send().await;
+    let result = client
+        .post(format!("{}/api/replay/stop", base_url))
+        .send()
+        .await;
 
     match result {
         Ok(response) => {
@@ -1196,7 +1199,10 @@ async fn test_download_nonexistent_file() {
     let base_url = get_base_url();
 
     let result = client
-        .get(format!("{}/api/recordings/download/nonexistent_file.mcap", base_url))
+        .get(format!(
+            "{}/api/recordings/download/nonexistent_file.mcap",
+            base_url
+        ))
         .send()
         .await;
 
@@ -1216,7 +1222,10 @@ async fn test_download_non_mcap_file() {
     let base_url = get_base_url();
 
     let result = client
-        .get(format!("{}/api/recordings/download/some_file.txt", base_url))
+        .get(format!(
+            "{}/api/recordings/download/some_file.txt",
+            base_url
+        ))
         .send()
         .await;
 
@@ -1359,10 +1368,7 @@ async fn test_recording_workflow_status_check() {
 
     // Step 1: Check storage availability
     println!("Step 1: Checking storage...");
-    let result = client
-        .get(format!("{}/api/storage", base_url))
-        .send()
-        .await;
+    let result = client.get(format!("{}/api/storage", base_url)).send().await;
 
     match result {
         Ok(response) => {

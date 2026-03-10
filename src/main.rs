@@ -30,9 +30,10 @@ use edgefirst_websrv::{
     config::{get_config, read_storage_directory, set_config},
     mcap::{list_mcap_files, mcap_downloader, McapContext},
     recording::{
-        check_recorder_status, check_replay_status, delete as recording_delete, get_current_recording,
-        isolate_system, start, start_replay, stop, stop_replay, user_mode_check_recorder_status,
-        user_mode_check_replay_status, user_mode_start, user_mode_stop, RecordingContext,
+        check_recorder_status, check_replay_status, delete as recording_delete,
+        get_current_recording, isolate_system, start, start_replay, stop, stop_replay,
+        user_mode_check_recorder_status, user_mode_check_replay_status, user_mode_start,
+        user_mode_stop, RecordingContext,
     },
     services::{get_all_services, update_service},
     shutdown::ShutdownCoordinator,
@@ -134,7 +135,17 @@ async fn websocket_handler_uploads(
     State(ctx): State<Arc<ServerContext>>,
 ) -> impl IntoResponse {
     let options = yawc::Options::default().with_compression_level(yawc::CompressionLevel::fast());
-    let (response, ws_future) = ws.upgrade(options).unwrap();
+    let (response, ws_future) = match ws.upgrade(options) {
+        Ok(pair) => pair,
+        Err(e) => {
+            log::error!("WebSocket upgrade failed for /ws/uploads: {e}");
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("WebSocket upgrade failed: {e}"),
+            )
+                .into_response();
+        }
+    };
     let stream = ctx.upload_progress_stream.clone();
 
     tokio::spawn(async move {
@@ -179,7 +190,7 @@ async fn websocket_handler_uploads(
         }
     });
 
-    response
+    response.into_response()
 }
 
 // ============================================================================
@@ -212,7 +223,10 @@ async fn redirect_to_https(headers: HeaderMap, uri: Uri) -> Redirect {
 fn common_routes(ctx: Arc<ServerContext>) -> Router {
     Router::new()
         // Storage
-        .route("/api/storage", get(check_storage_availability::<ServerContext>))
+        .route(
+            "/api/storage",
+            get(check_storage_availability::<ServerContext>),
+        )
         // Recordings: list, delete, download
         .route(
             "/api/recordings",
@@ -234,8 +248,7 @@ fn common_routes(ctx: Arc<ServerContext>) -> Router {
         )
         .route(
             "/api/uploads/{id}",
-            get(get_upload_handler::<ServerContext>)
-                .delete(cancel_upload_handler::<ServerContext>),
+            get(get_upload_handler::<ServerContext>).delete(cancel_upload_handler::<ServerContext>),
         )
         // Studio
         .route(
@@ -252,7 +265,10 @@ fn common_routes(ctx: Arc<ServerContext>) -> Router {
         .route("/api/services/status", post(get_all_services))
         .route("/api/services/update", post(update_service))
         // WebSocket: error stream and upload progress
-        .route("/api/ws/dropped", get(websocket_handler_errors::<ServerContext>))
+        .route(
+            "/api/ws/dropped",
+            get(websocket_handler_errors::<ServerContext>),
+        )
         .route("/api/ws/uploads", get(websocket_handler_uploads))
         // WebSocket: Zenoh real-time topic bridge
         .route("/api/rt/{*topic}", get(websocket_handler::<ServerContext>))
@@ -275,7 +291,10 @@ fn system_routes(ctx: Arc<ServerContext>) -> Router {
 /// Routes for user mode only.
 fn user_routes(ctx: Arc<ServerContext>) -> Router {
     Router::new()
-        .route("/api/recorder/start", post(user_mode_start::<ServerContext>))
+        .route(
+            "/api/recorder/start",
+            post(user_mode_start::<ServerContext>),
+        )
         .route("/api/recorder/stop", post(user_mode_stop::<ServerContext>))
         .route("/api/recorder/status", get(user_mode_check_recorder_status))
         .route("/api/recorder/current", get(get_current_recording))
@@ -355,7 +374,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Initialize upload progress broadcaster and manager
-    let upload_broadcaster = Arc::new(MessageStream::new(Box::new(|| {})));
+    let upload_broadcaster = Arc::new(MessageStream::new());
     let upload_manager = Arc::new(UploadManager::new(storage_path, upload_broadcaster.clone()));
 
     if let Err(e) = upload_manager.initialize().await {
@@ -374,7 +393,7 @@ async fn main() -> anyhow::Result<()> {
     // Build server context
     let ctx = Arc::new(ServerContext {
         args: args.clone(),
-        err_stream: Arc::new(MessageStream::new(Box::new(|| {}))),
+        err_stream: Arc::new(MessageStream::new()),
         upload_manager: upload_manager.clone(),
         upload_progress_stream: upload_broadcaster,
         zenoh_session: zenoh_session.clone(),
@@ -386,9 +405,10 @@ async fn main() -> anyhow::Result<()> {
     // Force HTTP/1.1 only — WebSocket upgrade requires HTTP/1.1 and does not
     // work with the HTTP/2 CONNECT mechanism used by browsers.
     let tls_config = {
-        let certs = rustls_pemfile::certs(&mut &cert_result.cert_pem[..])
-            .collect::<Result<Vec<_>, _>>()?;
-        let key = rustls_pemfile::private_key(&mut &cert_result.key_pem[..])?.unwrap();
+        let certs =
+            rustls_pemfile::certs(&mut &cert_result.cert_pem[..]).collect::<Result<Vec<_>, _>>()?;
+        let key = rustls_pemfile::private_key(&mut &cert_result.key_pem[..])?
+            .ok_or_else(|| anyhow::anyhow!("No private key found in TLS key PEM data"))?;
         let mut config = rustls::ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(certs, key)?;

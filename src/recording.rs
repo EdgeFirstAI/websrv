@@ -147,12 +147,12 @@ pub async fn start<T: RecordingContext>(State(data): State<Arc<T>>) -> impl Into
         Ok(p) => p,
         Err(e) => {
             let error_message = format!("Failed to start recorder: {:?}", e);
-            info!("{}", error_message);
+            error!("{}", error_message);
             return (
-                StatusCode::OK,
+                StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({
-                    "status": "started",
-                    "message": "Recording started successfully"
+                    "status": "error",
+                    "message": error_message
                 })),
             )
                 .into_response();
@@ -205,9 +205,7 @@ pub async fn start<T: RecordingContext>(State(data): State<Arc<T>>) -> impl Into
 }
 
 /// Start recording (user mode)
-pub async fn user_mode_start<T: RecordingContext>(
-    State(data): State<Arc<T>>,
-) -> impl IntoResponse {
+pub async fn user_mode_start<T: RecordingContext>(State(data): State<Arc<T>>) -> impl IntoResponse {
     let status_str = user_mode_check_recorder_status().await;
     debug!("Current recorder status: {}", status_str);
 

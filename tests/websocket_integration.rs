@@ -53,7 +53,7 @@ async fn test_websocket_receives_zenoh_message() {
 
     // Build a minimal router with only the WebSocket route
     let app = Router::new()
-        .route("/rt/{*topic}", get(websocket_handler::<TestContext>))
+        .route("/api/rt/{*topic}", get(websocket_handler::<TestContext>))
         .with_state(ctx.clone());
 
     // Bind to a random port
@@ -67,8 +67,8 @@ async fn test_websocket_receives_zenoh_message() {
         axum::serve(listener, app).await.unwrap();
     });
 
-    // Connect a WebSocket client to /rt/test/topic
-    let url = format!("ws://{addr}/rt/test/topic");
+    // Connect a WebSocket client to /api/rt/test/topic
+    let url = format!("ws://{addr}/api/rt/test/topic");
     let (mut ws, _response) = tokio_tungstenite::connect_async(&url)
         .await
         .expect("Failed to connect WebSocket");

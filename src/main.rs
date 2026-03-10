@@ -212,25 +212,22 @@ async fn redirect_to_https(headers: HeaderMap, uri: Uri) -> Redirect {
 fn common_routes(ctx: Arc<ServerContext>) -> Router {
     Router::new()
         // Storage
+        .route("/api/storage", get(check_storage_availability::<ServerContext>))
+        // Recordings: list, delete, download
         .route(
-            "/check-storage",
-            get(check_storage_availability::<ServerContext>),
+            "/api/recordings",
+            get(list_mcap_files::<ServerContext>).delete(recording_delete),
         )
-        // Recording (shared, no state needed)
-        .route("/delete", post(recording_delete))
-        .route("/replay", post(start_replay))
-        .route("/replay-end", post(stop_replay))
-        .route("/live-run", post(isolate_system))
-        .route("/current-recording", get(get_current_recording))
-        // MCAP download
-        .route("/download/{*path}", get(mcap_downloader))
-        // MCAP listing
-        .route("/mcap", get(list_mcap_files::<ServerContext>))
-        // Auth API
+        .route("/api/recordings/download/{*path}", get(mcap_downloader))
+        // Replay
+        .route("/api/replay", post(start_replay))
+        .route("/api/replay/stop", post(stop_replay))
+        .route("/api/replay/config", post(isolate_system))
+        // Auth
         .route("/api/auth/login", post(auth_login::<ServerContext>))
         .route("/api/auth/status", get(auth_status::<ServerContext>))
         .route("/api/auth/logout", post(auth_logout::<ServerContext>))
-        // Upload API
+        // Uploads
         .route(
             "/api/uploads",
             post(start_upload_handler::<ServerContext>).get(list_uploads_handler::<ServerContext>),
@@ -240,7 +237,7 @@ fn common_routes(ctx: Arc<ServerContext>) -> Router {
             get(get_upload_handler::<ServerContext>)
                 .delete(cancel_upload_handler::<ServerContext>),
         )
-        // Studio API
+        // Studio
         .route(
             "/api/studio/projects",
             get(list_studio_projects::<ServerContext>),
@@ -249,38 +246,42 @@ fn common_routes(ctx: Arc<ServerContext>) -> Router {
             "/api/studio/projects/{id}/labels",
             get(list_project_labels::<ServerContext>),
         )
-        // Service config (POST only in common; GET /details split into mode routes)
-        .route("/config/{service}", post(set_config))
-        .route("/config/service/status", post(get_all_services))
-        .route("/config/services/update", post(update_service))
-        // WebSocket: error stream and real-time topics
-        .route("/ws/dropped", get(websocket_handler_errors::<ServerContext>))
-        .route("/ws/uploads", get(websocket_handler_uploads))
-        .route("/rt/{*topic}", get(websocket_handler::<ServerContext>))
+        // Service config: GET reads, POST writes
+        .route("/api/config/{service}", post(set_config))
+        // Services: status and enable/disable
+        .route("/api/services/status", post(get_all_services))
+        .route("/api/services/update", post(update_service))
+        // WebSocket: error stream and upload progress
+        .route("/api/ws/dropped", get(websocket_handler_errors::<ServerContext>))
+        .route("/api/ws/uploads", get(websocket_handler_uploads))
+        // WebSocket: Zenoh real-time topic bridge
+        .route("/api/rt/{*topic}", get(websocket_handler::<ServerContext>))
         .with_state(ctx)
 }
 
 /// Routes for system mode only.
 fn system_routes(ctx: Arc<ServerContext>) -> Router {
     Router::new()
-        .route("/start", post(start::<ServerContext>))
-        .route("/stop", post(stop::<ServerContext>))
-        .route("/recorder-status", get(check_recorder_status))
-        .route("/replay-status", get(check_replay_status))
+        .route("/api/recorder/start", post(start::<ServerContext>))
+        .route("/api/recorder/stop", post(stop::<ServerContext>))
+        .route("/api/recorder/status", get(check_recorder_status))
+        .route("/api/recorder/current", get(get_current_recording))
+        .route("/api/replay/status", get(check_replay_status))
         // System mode: config details returns raw service config
-        .route("/config/{service}/details", get(get_config))
+        .route("/api/config/{service}", get(get_config))
         .with_state(ctx)
 }
 
 /// Routes for user mode only.
 fn user_routes(ctx: Arc<ServerContext>) -> Router {
     Router::new()
-        .route("/start", post(user_mode_start::<ServerContext>))
-        .route("/stop", post(user_mode_stop::<ServerContext>))
-        .route("/recorder-status", get(user_mode_check_recorder_status))
-        .route("/replay-status", get(user_mode_check_replay_status))
+        .route("/api/recorder/start", post(user_mode_start::<ServerContext>))
+        .route("/api/recorder/stop", post(user_mode_stop::<ServerContext>))
+        .route("/api/recorder/status", get(user_mode_check_recorder_status))
+        .route("/api/recorder/current", get(get_current_recording))
+        .route("/api/replay/status", get(user_mode_check_replay_status))
         // User mode: config details returns WebUISettings JSON
-        .route("/config/{service}/details", get(user_mode_get_config))
+        .route("/api/config/{service}", get(user_mode_get_config))
         .with_state(ctx)
 }
 

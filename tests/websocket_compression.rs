@@ -102,7 +102,7 @@ async fn receive_messages(
         bytes_read: wire_bytes.clone(),
     };
 
-    let url: url::Url = format!("ws://{addr}/rt/{topic}").parse().unwrap();
+    let url: url::Url = format!("ws://{addr}/api/rt/{topic}").parse().unwrap();
 
     let options = if compressed {
         yawc::Options::default().with_compression_level(yawc::CompressionLevel::fast())
@@ -150,7 +150,7 @@ async fn test_websocket_compression_ratio() {
 
     // Build server
     let app = Router::new()
-        .route("/rt/{*topic}", get(websocket_handler::<TestContext>))
+        .route("/api/rt/{*topic}", get(websocket_handler::<TestContext>))
         .with_state(ctx.clone());
 
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -290,7 +290,7 @@ async fn test_compress_false_disables_compression() {
     });
 
     let app = Router::new()
-        .route("/rt/{*topic}", get(websocket_handler::<TestContext>))
+        .route("/api/rt/{*topic}", get(websocket_handler::<TestContext>))
         .with_state(ctx.clone());
 
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -322,7 +322,7 @@ async fn test_compress_false_disables_compression() {
         };
 
         // URL includes ?compress=false to tell the server to skip compression
-        let url: url::Url = format!("ws://{addr}/rt/test/nocomp?compress=false")
+        let url: url::Url = format!("ws://{addr}/api/rt/test/nocomp?compress=false")
             .parse()
             .unwrap();
 

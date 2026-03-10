@@ -19,8 +19,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use log::{info, warn};
-use openssl::pkey::{PKey, Private};
-use openssl::x509::X509;
 use rcgen::{
     CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType,
     PKCS_ECDSA_P256_SHA256,
@@ -32,9 +30,6 @@ use crate::Args;
 const CERT_FILENAME: &str = "webui.crt";
 /// Default private key filename
 const KEY_FILENAME: &str = "webui.key";
-
-/// Embedded fallback certificate for development/CI environments
-const EMBEDDED_CERT_PEM: &[u8] = include_bytes!("../server.pem");
 
 /// Certificate source for logging purposes
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,8 +57,8 @@ impl std::fmt::Display for CertificateSource {
 
 /// Result of certificate loading/generation
 pub struct CertificateResult {
-    pub certificate: X509,
-    pub private_key: PKey<Private>,
+    pub cert_pem: Vec<u8>,
+    pub key_pem: Vec<u8>,
     pub source: CertificateSource,
 }
 
@@ -78,10 +73,10 @@ pub fn load_or_generate_certificate(args: &Args) -> anyhow::Result<CertificateRe
     // 1. Check for user-provided certificate paths
     if let (Some(cert_path), Some(key_path)) = (&args.cert, &args.key) {
         info!("Loading user-provided certificate from {:?}", cert_path);
-        let result = load_certificate_from_files(cert_path, key_path)?;
+        let (cert_pem, key_pem) = load_certificate_from_files(cert_path, key_path)?;
         return Ok(CertificateResult {
-            certificate: result.0,
-            private_key: result.1,
+            cert_pem,
+            key_pem,
             source: CertificateSource::UserProvided,
         });
     }
@@ -93,10 +88,10 @@ pub fn load_or_generate_certificate(args: &Args) -> anyhow::Result<CertificateRe
     if !args.generate_cert && cert_path.exists() && key_path.exists() {
         info!("Loading certificate from {:?}", args.cert_dir);
         match load_certificate_from_files(&cert_path, &key_path) {
-            Ok((cert, key)) => {
+            Ok((cert_pem, key_pem)) => {
                 return Ok(CertificateResult {
-                    certificate: cert,
-                    private_key: key,
+                    cert_pem,
+                    key_pem,
                     source: CertificateSource::CertDir,
                 });
             }
@@ -126,13 +121,9 @@ pub fn load_or_generate_certificate(args: &Args) -> anyhow::Result<CertificateRe
                 );
             }
 
-            // Parse the generated certificate for use
-            let certificate = X509::from_pem(cert_pem.as_bytes())?;
-            let private_key = PKey::private_key_from_pem(key_pem.as_bytes())?;
-
             return Ok(CertificateResult {
-                certificate,
-                private_key,
+                cert_pem: cert_pem.into_bytes(),
+                key_pem: key_pem.into_bytes(),
                 source: CertificateSource::Generated,
             });
         }
@@ -144,10 +135,10 @@ pub fn load_or_generate_certificate(args: &Args) -> anyhow::Result<CertificateRe
 
     // 4. Fallback to embedded certificate
     warn!("Using embedded fallback certificate (not recommended for production)");
-    let (cert, key) = load_embedded_certificate()?;
+    let (cert_pem, key_pem) = load_embedded_certificate()?;
     Ok(CertificateResult {
-        certificate: cert,
-        private_key: key,
+        cert_pem,
+        key_pem,
         source: CertificateSource::Embedded,
     })
 }
@@ -156,17 +147,10 @@ pub fn load_or_generate_certificate(args: &Args) -> anyhow::Result<CertificateRe
 pub fn load_certificate_from_files(
     cert_path: &Path,
     key_path: &Path,
-) -> anyhow::Result<(X509, PKey<Private>)> {
+) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
     let cert_pem = fs::read(cert_path)?;
     let key_pem = fs::read(key_path)?;
-
-    let certificate = X509::from_pem(&cert_pem)?;
-
-    // Try loading as unencrypted key first, then encrypted with empty passphrase
-    let private_key = PKey::private_key_from_pem(&key_pem)
-        .or_else(|_| PKey::private_key_from_pem_passphrase(&key_pem, b""))?;
-
-    Ok((certificate, private_key))
+    Ok((cert_pem, key_pem))
 }
 
 /// Generate a self-signed certificate for the given hostname.
@@ -238,11 +222,12 @@ fn save_certificate_to_dir(dir: &Path, cert_pem: &str, key_pem: &str) -> anyhow:
 }
 
 /// Load the embedded fallback certificate.
-fn load_embedded_certificate() -> anyhow::Result<(X509, PKey<Private>)> {
-    let certificate = X509::from_pem(EMBEDDED_CERT_PEM)?;
-    // The embedded certificate has an encrypted key with passphrase "password"
-    let private_key = PKey::private_key_from_pem_passphrase(EMBEDDED_CERT_PEM, b"password")?;
-    Ok((certificate, private_key))
+///
+/// Generates a self-signed certificate at runtime instead of using a static
+/// embedded PEM, since rustls does not support encrypted private keys.
+fn load_embedded_certificate() -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    let (cert_pem, key_pem) = generate_self_signed_certificate("localhost")?;
+    Ok((cert_pem.into_bytes(), key_pem.into_bytes()))
 }
 
 /// Get the device hostname for certificate generation.
@@ -266,50 +251,10 @@ mod tests {
     #[test]
     fn test_generate_self_signed_certificate() {
         let (cert_pem, key_pem) = generate_self_signed_certificate("test-device").unwrap();
-
-        // Verify PEM format
         assert!(cert_pem.contains("BEGIN CERTIFICATE"));
         assert!(cert_pem.contains("END CERTIFICATE"));
         assert!(key_pem.contains("BEGIN PRIVATE KEY"));
         assert!(key_pem.contains("END PRIVATE KEY"));
-
-        // Verify certificate can be parsed by OpenSSL
-        let cert = X509::from_pem(cert_pem.as_bytes()).unwrap();
-        let key = PKey::private_key_from_pem(key_pem.as_bytes()).unwrap();
-
-        // Verify subject CN
-        let subject = cert.subject_name();
-        let cn = subject
-            .entries_by_nid(openssl::nid::Nid::COMMONNAME)
-            .next()
-            .unwrap();
-        assert_eq!(cn.data().as_utf8().unwrap().to_string(), "test-device");
-
-        // Verify key is EC
-        assert!(key.ec_key().is_ok());
-
-        // Verify Subject Alternative Names include .local
-        let sans = cert.subject_alt_names().expect("SANs should exist");
-        let san_dns_names: Vec<_> = sans.iter().filter_map(|n| n.dnsname()).collect();
-        assert!(
-            san_dns_names.contains(&"test-device.local"),
-            "SANs should include hostname.local"
-        );
-        assert!(
-            san_dns_names.contains(&"test-device"),
-            "SANs should include hostname"
-        );
-        assert!(
-            san_dns_names.contains(&"localhost"),
-            "SANs should include localhost"
-        );
-    }
-
-    #[test]
-    fn test_load_embedded_certificate() {
-        let (cert, key) = load_embedded_certificate().unwrap();
-        assert!(cert.public_key().is_ok());
-        assert!(key.public_key_to_pem().is_ok());
     }
 
     #[test]
@@ -318,5 +263,12 @@ mod tests {
         assert_eq!(CertificateSource::CertDir.to_string(), "cert-dir");
         assert_eq!(CertificateSource::Generated.to_string(), "auto-generated");
         assert_eq!(CertificateSource::Embedded.to_string(), "embedded fallback");
+    }
+
+    #[test]
+    fn test_load_embedded_certificate() {
+        let (cert, key) = load_embedded_certificate().unwrap();
+        assert!(String::from_utf8_lossy(&cert).contains("BEGIN CERTIFICATE"));
+        assert!(String::from_utf8_lossy(&key).contains("BEGIN PRIVATE KEY"));
     }
 }

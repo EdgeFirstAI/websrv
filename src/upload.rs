@@ -8,14 +8,17 @@
 //! - Status file persistence for power-loss recovery
 //! - WebSocket progress broadcasting
 
-use actix_web::{web, HttpResponse, Responder};
+use axum::extract::{Json, Path, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use std::path::Path as StdPath;
 use chrono::{DateTime, Utc};
 use edgefirst_client::{Client, Progress, ProjectID, SnapshotID};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
@@ -337,7 +340,7 @@ impl UploadManager {
 
     /// Generate the status file path for a given MCAP file
     /// Returns: /path/to/file.mcap.upload-status.json
-    pub fn get_status_file_path(mcap_path: &Path) -> PathBuf {
+    pub fn get_status_file_path(mcap_path: &StdPath) -> PathBuf {
         let mut status_path = mcap_path.to_path_buf();
         let new_extension = match mcap_path.extension() {
             Some(ext) => format!("{}.upload-status.json", ext.to_string_lossy()),
@@ -365,7 +368,7 @@ impl UploadManager {
     }
 
     /// Read the upload status from a JSON file
-    pub async fn read_status_file(path: &Path) -> anyhow::Result<UploadStatus> {
+    pub async fn read_status_file(path: &StdPath) -> anyhow::Result<UploadStatus> {
         let path = path.to_path_buf();
         tokio::task::spawn_blocking(move || {
             let content = std::fs::read_to_string(&path)
@@ -378,12 +381,12 @@ impl UploadManager {
     }
 
     /// Scan storage directory for upload status files
-    async fn scan_status_files(storage_path: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    async fn scan_status_files(storage_path: &StdPath) -> anyhow::Result<Vec<PathBuf>> {
         let storage_path = storage_path.to_path_buf();
         tokio::task::spawn_blocking(move || {
             let mut status_files = Vec::new();
 
-            fn scan_dir(dir: &Path, status_files: &mut Vec<PathBuf>) -> std::io::Result<()> {
+            fn scan_dir(dir: &StdPath, status_files: &mut Vec<PathBuf>) -> std::io::Result<()> {
                 if dir.is_dir() {
                     for entry in std::fs::read_dir(dir)? {
                         let entry = entry?;
@@ -496,7 +499,7 @@ impl UploadManager {
     }
 
     /// Delete the status file for a completed upload
-    pub async fn delete_status_file(mcap_path: &Path) {
+    pub async fn delete_status_file(mcap_path: &StdPath) {
         let status_path = Self::get_status_file_path(mcap_path);
         if status_path.exists() {
             match tokio::task::spawn_blocking({
@@ -916,15 +919,15 @@ pub async fn upload_worker(
 // ============================================================================
 
 /// Trait for accessing upload manager from server context
-pub trait UploadContext {
+pub trait UploadContext: Send + Sync + 'static {
     fn upload_manager(&self) -> &Arc<UploadManager>;
 }
 
 /// POST /api/uploads - Start a new upload
 pub async fn start_upload_handler<T: UploadContext>(
-    body: web::Json<StartUploadRequest>,
-    data: web::Data<T>,
-) -> impl Responder {
+    State(data): State<Arc<T>>,
+    Json(body): Json<StartUploadRequest>,
+) -> impl IntoResponse {
     info!("Start upload request for: {}", body.mcap_path);
 
     let mcap_path = PathBuf::from(&body.mcap_path);
@@ -936,74 +939,100 @@ pub async fn start_upload_handler<T: UploadContext>(
     {
         Ok(upload_id) => {
             info!("Upload started with ID: {}", upload_id.0);
-            HttpResponse::Accepted().json(StartUploadResponse {
-                upload_id,
-                status: "queued".to_string(),
-            })
+            (
+                StatusCode::ACCEPTED,
+                Json(StartUploadResponse {
+                    upload_id,
+                    status: "queued".to_string(),
+                }),
+            )
+                .into_response()
         }
         Err(e) => {
             error!("Failed to start upload: {}", e);
-            HttpResponse::BadRequest().json(UploadErrorResponse {
-                error: format!("{}", e),
-            })
+            (
+                StatusCode::BAD_REQUEST,
+                Json(UploadErrorResponse {
+                    error: format!("{}", e),
+                }),
+            )
+                .into_response()
         }
     }
 }
 
 /// GET /api/uploads - List all uploads
-pub async fn list_uploads_handler<T: UploadContext>(data: web::Data<T>) -> impl Responder {
+pub async fn list_uploads_handler<T: UploadContext>(
+    State(data): State<Arc<T>>,
+) -> impl IntoResponse {
     let uploads = data.upload_manager().list_uploads().await;
-    HttpResponse::Ok().json(uploads)
+    Json(uploads).into_response()
 }
 
 /// GET /api/uploads/{id} - Get a specific upload
 pub async fn get_upload_handler<T: UploadContext>(
-    path: web::Path<String>,
-    data: web::Data<T>,
-) -> impl Responder {
-    let id_str = path.into_inner();
-
+    State(data): State<Arc<T>>,
+    Path(id_str): Path<String>,
+) -> impl IntoResponse {
     // Parse the UUID
     match Uuid::parse_str(&id_str) {
         Ok(uuid) => {
             let upload_id = UploadId(uuid);
             match data.upload_manager().get_upload(upload_id).await {
-                Some(upload) => HttpResponse::Ok().json(upload),
-                None => HttpResponse::NotFound().json(UploadErrorResponse {
-                    error: "Upload not found".to_string(),
-                }),
+                Some(upload) => (StatusCode::OK, Json(upload)).into_response(),
+                None => (
+                    StatusCode::NOT_FOUND,
+                    Json(UploadErrorResponse {
+                        error: "Upload not found".to_string(),
+                    }),
+                )
+                    .into_response(),
             }
         }
-        Err(_) => HttpResponse::BadRequest().json(UploadErrorResponse {
-            error: "Invalid upload ID format".to_string(),
-        }),
+        Err(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(UploadErrorResponse {
+                error: "Invalid upload ID format".to_string(),
+            }),
+        )
+            .into_response(),
     }
 }
 
 /// DELETE /api/uploads/{id} - Cancel an upload
 pub async fn cancel_upload_handler<T: UploadContext>(
-    path: web::Path<String>,
-    data: web::Data<T>,
-) -> impl Responder {
-    let id_str = path.into_inner();
-
+    State(data): State<Arc<T>>,
+    Path(id_str): Path<String>,
+) -> impl IntoResponse {
     // Parse the UUID
     match Uuid::parse_str(&id_str) {
         Ok(uuid) => {
             let upload_id = UploadId(uuid);
             match data.upload_manager().cancel_upload(upload_id).await {
-                Ok(()) => HttpResponse::Ok().json(json!({
-                    "status": "cancelled",
-                    "message": "Upload cancelled successfully"
-                })),
-                Err(e) => HttpResponse::NotFound().json(UploadErrorResponse {
-                    error: format!("{}", e),
-                }),
+                Ok(()) => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "status": "cancelled",
+                        "message": "Upload cancelled successfully"
+                    })),
+                )
+                    .into_response(),
+                Err(e) => (
+                    StatusCode::NOT_FOUND,
+                    Json(UploadErrorResponse {
+                        error: format!("{}", e),
+                    }),
+                )
+                    .into_response(),
             }
         }
-        Err(_) => HttpResponse::BadRequest().json(UploadErrorResponse {
-            error: "Invalid upload ID format".to_string(),
-        }),
+        Err(_) => (
+            StatusCode::BAD_REQUEST,
+            Json(UploadErrorResponse {
+                error: "Invalid upload ID format".to_string(),
+            }),
+        )
+            .into_response(),
     }
 }
 

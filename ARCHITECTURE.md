@@ -2,15 +2,16 @@
 
 ## Executive Summary
 
-Maivin WebSrv is a high-performance web-based user interface server for monitoring and controlling the EdgeFirst Maivin platform. Built on Actix-web with OpenSSL-based TLS support, it provides a comprehensive web interface for managing MCAP recordings, controlling system services, monitoring real-time data streams via Zenoh, and uploading snapshots to EdgeFirst Studio.
+Maivin WebSrv is a high-performance web-based user interface server for monitoring and controlling the EdgeFirst Maivin platform. Built on axum with rustls-based TLS support, it provides a comprehensive web interface for managing MCAP recordings, controlling system services, monitoring real-time data streams via Zenoh, and uploading snapshots to EdgeFirst Studio.
 
 **Key Technologies:**
-- **Web Framework**: Actix-web 4.12.1 with 8-worker Tokio runtime
-- **Security**: HTTPS/TLS via OpenSSL with flexible certificate management
-- **Real-time Communication**: WebSocket (binary streaming) + Zenoh 1.6.2
+- **Web Framework**: axum 0.8 with 8-worker Tokio runtime
+- **Security**: HTTPS/TLS via rustls with flexible certificate management
+- **Real-time Communication**: WebSocket (yawc with permessage-deflate) + Zenoh 1.6.2
 - **Data Format**: MCAP (robotics recording format)
-- **Concurrency**: Tokio async/await with Arc/Mutex/RwLock synchronization
+- **Concurrency**: Tokio async/await with Arc/Mutex synchronization
 - **Service Management**: systemd integration (system mode) or process-based (user mode)
+- **Deployment**: systemd socket activation support for non-root operation
 
 ## System Architecture
 
@@ -1118,6 +1119,220 @@ sequenceDiagram
 - Memory-mapped reads for MCAP analysis (kernel page cache)
 - Asynchronous file operations to avoid blocking Tokio workers
 
+## System Integration Guide
+
+This section is intended for system integrators and package maintainers who deploy
+websrv on production devices. The websrv binary itself is portable and requires no
+special handling — all deployment-specific behavior is controlled through CLI
+arguments, environment variables, and systemd unit configuration.
+
+### Operating Modes
+
+Websrv has two modes that determine how it manages recordings, configuration, and
+service control.
+
+#### System Mode (`--system`)
+
+Intended for production deployments where EdgeFirst services are managed by systemd.
+
+- **Service control**: Uses `systemctl start/stop/enable/disable` for recorder,
+  replay, and other EdgeFirst services
+- **Configuration**: Reads and writes `/etc/default/{service}` files (recorder,
+  uploader, camera, model, etc.)
+- **Storage path**: Read from `/etc/default/recorder` (`STORAGE_DIR` variable),
+  with fallback to `--storage-path`
+- **WebUI config endpoint**: `GET /config/{service}/details` returns the raw
+  key-value content of `/etc/default/{service}`
+
+#### User Mode (default)
+
+Intended for development, testing, or single-user installations.
+
+- **Service control**: Spawns `maivin-recorder` directly as a child process;
+  tracks it via `Mutex<Option<Child>>`
+- **Configuration**: All settings come from command-line arguments
+- **Storage path**: Uses `--storage-path` (defaults to `.`)
+- **WebUI config endpoint**: `GET /config/{service}/details` returns the CLI
+  arguments as JSON (`WebUISettings`)
+
+#### Handler Routing by Mode
+
+| Function | System Mode | User Mode |
+|----------|-------------|-----------|
+| Start recording | `systemctl start recorder` | `Command::new("maivin-recorder")` |
+| Stop recording | `systemctl stop recorder` | Kill child process |
+| Recorder status | `systemctl is-active recorder` | Check child process alive |
+| Replay status | `systemctl is-active replay` | Check PID file |
+| Get config | Read `/etc/default/{service}` | Return `WebUISettings` JSON |
+| Set config | Write `/etc/default/{service}` | Write `/etc/default/{service}` |
+
+### Systemd Socket Activation
+
+Websrv supports systemd socket activation via the `listenfd` crate. This allows
+the server to bind privileged ports (80/443) without running as root — systemd
+binds the sockets and passes pre-bound file descriptors to the service process.
+
+**Detection is automatic**: when the `LISTEN_FDS` environment variable is present
+(set by systemd), websrv accepts the passed file descriptors. When absent, it
+binds ports directly using `--http-port` and `--https-port`. No CLI flag is needed.
+
+#### File Descriptor Assignment
+
+| FD Index | Purpose | Fallback |
+|----------|---------|----------|
+| 0 | HTTP listener (redirect to HTTPS) | Bind `[::]:{http_port}` |
+| 1 | HTTPS listener (main server) | Bind `[::]:{https_port}` |
+
+#### Example Socket Unit (`websrv.socket`)
+
+```ini
+[Unit]
+Description=EdgeFirst WebSrv Sockets
+
+[Socket]
+ListenStream=80
+ListenStream=443
+BindIPv6Only=both
+
+[Install]
+WantedBy=sockets.target
+```
+
+#### Example Service Override
+
+```ini
+# /etc/systemd/system/websrv.service.d/override.conf
+[Service]
+ExecStart=
+ExecStart=/usr/bin/edgefirst-websrv --system
+User=torizon
+```
+
+#### Important Notes
+
+- When socket activation is active, `--http-port` and `--https-port` are ignored
+  (systemd controls which ports are bound)
+- Stopping the service alone (`systemctl stop websrv.service`) does not close the
+  listening sockets — systemd will re-spawn the service on the next incoming
+  connection. To fully stop, also stop the socket unit:
+  `systemctl stop websrv.socket websrv.service`
+- The `set_nonblocking(true)` call is made automatically on activated listeners
+  before converting them to async Tokio listeners
+
+### TLS Certificate Management
+
+The server requires HTTPS for browser security features (WebSocket upgrade, WebGL,
+hardware video decoding). Certificates are resolved using a priority chain:
+
+| Priority | Source | CLI / Env | Use Case |
+|----------|--------|-----------|----------|
+| 1 | Explicit cert/key files | `--cert` + `--key` | CA-signed production certs |
+| 2 | Existing files in cert-dir | `--cert-dir` / `CERT_DIR` | Persistent device certs |
+| 3 | Auto-generated self-signed | (saved to cert-dir) | First-run on new devices |
+| 4 | In-memory self-signed | (not persisted) | cert-dir not writable |
+
+**Default cert-dir**: `/etc/edgefirst/ssl` (regardless of user). Override with
+`--cert-dir` or the `CERT_DIR` environment variable.
+
+**File names**: `webui.crt` (mode 0644) and `webui.key` (mode 0600).
+
+**Force regeneration**: `--generate-cert` skips loading existing certs and
+generates a new self-signed certificate.
+
+**When running as a non-root user**: The default `/etc/edgefirst/ssl` is typically
+not writable. The system integrator should either:
+- Create the directory with appropriate ownership/permissions before first run
+- Set `CERT_DIR` in the service unit to a user-writable path (e.g.,
+  `/home/torizon/.config/edgefirst/ssl`)
+- Provide explicit cert/key paths via `--cert` and `--key`
+
+If none of these are done, the server still starts — it generates an in-memory
+certificate on each startup, but the certificate won't persist across restarts
+(browsers will see a new certificate fingerprint each time).
+
+### Configuration Files (`/etc/default/*`)
+
+In system mode, websrv reads and writes service configuration files under
+`/etc/default/`. These are standard shell-style `KEY=VALUE` files.
+
+| File | Used By | Key Variables |
+|------|---------|---------------|
+| `recorder` | Recording control | `STORAGE_DIR`, `CAMERA_TOPIC`, `TAG` |
+| `uploader` | Studio uploads | `URL`, `JWT`, `TOPIC` |
+| `camera` | Camera service | `JPEG`, `H264_TOPIC`, etc. |
+| `model` | Inference service | `MODEL`, `MASK_COMPRESSION`, etc. |
+| `{service}` | Any EdgeFirst service | Service-specific variables |
+
+**Dual naming convention**: Config files can use either the generic
+`edgefirst-{service}` name or the short `{service}` name. The websrv
+resolver tries the requested name first, then falls back to the alternate:
+
+- Looking up `recorder` → tries `/etc/default/recorder`, then
+  `/etc/default/edgefirst-recorder`
+- Looking up `edgefirst-recorder` → tries `/etc/default/edgefirst-recorder`,
+  then `/etc/default/recorder`
+
+This supports two packaging conventions:
+
+| Convention | Config files | Service units | Used by |
+|------------|-------------|---------------|---------|
+| **Generic** (`edgefirst-` prefix) | `/etc/default/edgefirst-recorder` | `edgefirst-recorder.service` | Default packaging |
+| **Platform** (short name) | `/etc/default/recorder` | `recorder.service` | Maivin (symlinks) |
+
+On Maivin, binaries are still named `edgefirst-{service}` but the packaging
+includes symlinks for the short names, and config/service files use the
+unprefixed names since EdgeFirst services are the primary ones on the device.
+
+**Permission requirements**: The websrv process must have read/write access to
+these files. When running as root this is automatic. When running as a non-root
+user, the system integrator should ensure the files are writable — typically via
+a shared group (e.g., `edgefirst`) with group-write permissions.
+
+### Port Configuration
+
+| Argument | Env Var | Default | Notes |
+|----------|---------|---------|-------|
+| `--http-port` | `HTTP_PORT` | 80 | HTTP → HTTPS redirect only |
+| `--https-port` | `HTTPS_PORT` | 443 | Main HTTPS server |
+
+These are ignored when systemd socket activation is active.
+
+For non-root operation without socket activation, use unprivileged ports:
+
+```bash
+edgefirst-websrv --http-port 8080 --https-port 8443
+```
+
+### WebSocket Compression
+
+Permessage-deflate compression is enabled by default on all WebSocket connections.
+Pre-compressed topics (H.264 video, JPEG images) are automatically detected by
+the server and served without compression — deflating already-compressed data
+wastes CPU without reducing payload size.
+
+Auto-detection is based on the topic name containing `h264` or `jpeg`. Clients
+can also explicitly disable compression with the `?compress=false` query parameter.
+
+### Deployment Checklist
+
+For a system integrator deploying websrv on a new platform:
+
+1. **Choose the operating user**: root (simplest) or a specific user (more secure)
+2. **If non-root with privileged ports**: Create a `websrv.socket` unit and service
+   override with `User=`
+3. **Certificate directory**: Either create `/etc/edgefirst/ssl` owned by the
+   service user, or set `CERT_DIR` to a writable path
+4. **Configuration files**: Ensure `/etc/default/*` files are readable/writable by
+   the service user (shared group recommended)
+5. **Storage path**: When running as a non-root user, `$HOME` resolves to that
+   user's home directory — `STORAGE_DIR` in `/etc/default/recorder` should use an
+   absolute path or `$HOME` expansion
+6. **WebUI docroot**: Set `--docroot` or `DOCROOT` to the installed location of
+   the webui files (default: `/usr/share/edgefirst/webui`)
+7. **Studio tokens**: The `edgefirst-client` library stores login tokens under
+   `~/.config/EdgeFirst Studio/token` — the service user must match the user who
+   logged in, or tokens won't be found
+
 ## Future Enhancements
 
 ### Planned Features
@@ -1202,6 +1417,6 @@ sequenceDiagram
 
 ---
 
-**Document Version**: 1.0
-**Last Updated**: 2025-12-15
+**Document Version**: 1.1
+**Last Updated**: 2026-03-09
 **Author**: Sébastien Taylor <sebastien@au-zone.com>

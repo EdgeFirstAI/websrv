@@ -21,8 +21,8 @@ pub mod websocket;
 // Re-export commonly used types for convenience
 pub use args::{Args, WebUISettings};
 pub use auth::{AuthRequest, AuthResponse, AuthStatusResponse};
-pub use config::{read_storage_directory, read_uploader_credentials, UploadCredentials};
-pub use mcap::{DirectoryResponse, FileInfo, TopicInfo};
+pub use config::read_storage_directory;
+pub use mcap::{DirectoryResponse, FileInfo, TopicInfo, list_mcap_files};
 pub use recording::{extract_recording_filename, PlaybackParams, PlaybackResponse};
 pub use storage::{check_storage_availability, FormattedSize, StorageDetails};
 pub use studio::{LabelInfo, ProjectInfo};
@@ -30,4 +30,4 @@ pub use upload::{
     UploadErrorResponse, UploadId, UploadManager, UploadMode, UploadState, UploadStatus,
     UploadTask, UploadTaskInfo,
 };
-pub use websocket::{Broadcast, MessageStream};
+pub use websocket::{Broadcast, MessageStream, WebSocketContext, websocket_handler, websocket_handler_errors};

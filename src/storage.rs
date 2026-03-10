@@ -3,10 +3,13 @@
 
 //! Storage utilities for checking disk space and availability.
 
-use actix_web::{web, HttpResponse, Responder};
+use axum::extract::{Json, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use serde::Serialize;
 use serde_json::json;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::config::read_storage_directory;
 
@@ -47,20 +50,26 @@ pub struct StorageDetails {
 
 /// Server context trait for accessing application state
 /// This allows storage module to work with the server context without circular dependencies
-pub trait StorageContext {
+pub trait StorageContext: Send + Sync + 'static {
     fn is_system_mode(&self) -> bool;
     fn storage_path(&self) -> &str;
 }
 
 /// Check storage availability handler
-pub async fn check_storage_availability<T: StorageContext>(data: web::Data<T>) -> impl Responder {
+pub async fn check_storage_availability<T: StorageContext>(
+    State(data): State<Arc<T>>,
+) -> impl IntoResponse {
     let storage_dir = if data.is_system_mode() {
         match read_storage_directory() {
             Ok(dir) => dir,
             Err(_) => {
-                return HttpResponse::NotFound().json(json!({
-                    "error": "No storage configured"
-                }));
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "error": "No storage configured"
+                    })),
+                )
+                    .into_response();
             }
         }
     } else {
@@ -86,7 +95,7 @@ pub async fn check_storage_availability<T: StorageContext>(data: web::Data<T>) -
         total_space,
     };
 
-    HttpResponse::Ok().json(details)
+    Json(details).into_response()
 }
 
 #[cfg(test)]

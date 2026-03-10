@@ -4,29 +4,39 @@
 //! WebSocket handling for real-time streaming.
 //!
 //! Provides:
-//! - Message broadcasting to WebSocket clients
+//! - Message broadcasting to WebSocket clients via tokio::sync::broadcast
 //! - Zenoh subscription integration
-//! - Priority-based message handling
+//! - yawc-based WebSocket connections with RFC 7692 compression
 
-use actix::prelude::*;
-use actix_web::{web, HttpRequest, HttpResponse, Result};
-use actix_web_actors::ws;
+use axum::extract::State;
+use axum::response::IntoResponse;
 use cdr::{CdrLe, Infinite};
+use futures::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::sync::mpsc::{channel, Sender};
-use std::sync::{Arc, Mutex};
-use tokio::sync::oneshot;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{broadcast, oneshot};
 use tokio_util::sync::CancellationToken;
+use yawc::{
+    frame::{Frame, OpCode},
+    IncomingUpgrade, Options,
+};
+
+/// Timeout for sending a single WebSocket frame to a client.
+/// If a client isn't reading within this window, the connection is dropped.
+const SEND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Interval between server-initiated WebSocket ping frames.
+/// Detects dead connections when no data is flowing.
+const PING_INTERVAL: Duration = Duration::from_secs(30);
 
 // ============================================================================
 // Message Types
 // ============================================================================
 
 /// WebSocket broadcast message - Binary for CDR data, Text for JSON
-#[derive(Message, Clone)]
-#[rtype(result = "()")]
+#[derive(Clone)]
 pub enum Broadcast {
     Binary(Vec<u8>),
     Text(String),
@@ -39,143 +49,32 @@ pub struct WebSocketMessage {
     pub topic: String,
 }
 
-/// Service action request
-#[derive(Deserialize)]
-pub struct ServiceAction {
-    pub service: String,
-    pub action: String,
-}
-
 // ============================================================================
 // Message Stream
 // ============================================================================
 
-/// Manages WebSocket client connections and broadcasting
+/// Manages WebSocket message broadcasting via tokio::sync::broadcast channels
 pub struct MessageStream {
-    clients: Arc<Mutex<Vec<Recipient<Broadcast>>>>,
-    pub on_exit: Sender<String>,
+    tx: broadcast::Sender<Broadcast>,
     on_err: Box<dyn Fn() + Send + Sync>,
-    high_priority: bool,
 }
 
 impl MessageStream {
-    /// Create a new MessageStream
-    pub fn new(
-        on_exit: Sender<String>,
-        on_err: Box<dyn Fn() + Send + Sync>,
-        high_priority: bool,
-    ) -> Self {
-        MessageStream {
-            clients: Arc::new(Mutex::new(Vec::new())),
-            on_exit,
-            on_err,
-            high_priority,
-        }
+    /// Create a new MessageStream with a broadcast channel
+    pub fn new(on_err: Box<dyn Fn() + Send + Sync>) -> Self {
+        let (tx, _) = broadcast::channel(64);
+        MessageStream { tx, on_err }
     }
 
-    /// Add a WebSocket client
-    pub fn add_client(&self, client: Recipient<Broadcast>) {
-        self.clients.lock().unwrap().push(client);
+    /// Subscribe to the broadcast channel
+    pub fn subscribe(&self) -> broadcast::Receiver<Broadcast> {
+        self.tx.subscribe()
     }
 
-    /// Broadcast a message to all connected clients
+    /// Broadcast a message to all subscribers
     pub fn broadcast(&self, message: Broadcast) {
-        for client in self.clients.lock().unwrap().iter() {
-            if self.high_priority {
-                client.do_send(message.clone());
-            } else {
-                let res = client.try_send(message.clone());
-                if res.is_err() {
-                    (self.on_err)();
-                }
-            }
-        }
-    }
-}
-
-// ============================================================================
-// WebSocket Actor
-// ============================================================================
-
-/// WebSocket actor for handling client connections
-pub struct MyWebSocket {
-    video_stream: Arc<MessageStream>,
-    capacity: usize,
-    shutdown_tx: Option<oneshot::Sender<()>>,
-}
-
-impl MyWebSocket {
-    /// Create a new WebSocket with zenoh shutdown signaling
-    pub fn new(
-        video_stream: Arc<MessageStream>,
-        capacity: usize,
-        shutdown_tx: oneshot::Sender<()>,
-    ) -> Self {
-        MyWebSocket {
-            video_stream,
-            capacity,
-            shutdown_tx: Some(shutdown_tx),
-        }
-    }
-
-    /// Create a WebSocket without zenoh shutdown signaling
-    /// Used for error streams and upload progress that don't have zenoh subscribers
-    pub fn without_zenoh(video_stream: Arc<MessageStream>, capacity: usize) -> Self {
-        MyWebSocket {
-            video_stream,
-            capacity,
-            shutdown_tx: None,
-        }
-    }
-}
-
-impl Actor for MyWebSocket {
-    type Context = ws::WebsocketContext<Self>;
-
-    fn started(&mut self, ctx: &mut Self::Context) {
-        if self.capacity > 0 {
-            ctx.set_mailbox_capacity(self.capacity);
-        }
-        self.video_stream.add_client(ctx.address().recipient());
-    }
-}
-
-impl Drop for MyWebSocket {
-    fn drop(&mut self) {
-        // Signal the zenoh listener to shutdown
-        if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.send(());
-        }
-        // Keep the old signal for backward compatibility
-        let _ = self.video_stream.on_exit.send("STOP".to_string());
-    }
-}
-
-impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for MyWebSocket {
-    fn handle(&mut self, msg: Result<ws::Message, ws::ProtocolError>, ctx: &mut Self::Context) {
-        match msg {
-            Ok(ws::Message::Text(text)) => {
-                if let Ok(message) = serde_json::from_str::<WebSocketMessage>(&text) {
-                    if message.action.as_str() == "subscribe" {
-                        let webpage_topic = message.topic.to_string();
-                        info!("Subscribed to topic: {}", webpage_topic);
-                        self.video_stream.on_exit.send(webpage_topic).unwrap();
-                    }
-                }
-            }
-            Ok(_) => (),
-            Err(_) => ctx.stop(),
-        }
-    }
-}
-
-impl Handler<Broadcast> for MyWebSocket {
-    type Result = ();
-
-    fn handle(&mut self, msg: Broadcast, ctx: &mut Self::Context) {
-        match msg {
-            Broadcast::Binary(data) => ctx.binary(data),
-            Broadcast::Text(data) => ctx.text(data),
+        if self.tx.send(message).is_err() {
+            (self.on_err)();
         }
     }
 }
@@ -258,13 +157,12 @@ pub async fn zenoh_listener(
 }
 
 // ============================================================================
-// WebSocket Handlers
+// WebSocket Context Trait
 // ============================================================================
 
-/// Trait for accessing WebSocket context
-pub trait WebSocketContext {
+/// Trait for accessing WebSocket context from application state
+pub trait WebSocketContext: Send + Sync + 'static {
     fn err_stream(&self) -> &Arc<MessageStream>;
-    fn err_count(&self) -> &AtomicI64;
     fn zenoh_session(&self) -> &zenoh::Session;
     /// Get the global shutdown token for graceful shutdown coordination.
     /// Returns None if graceful shutdown is not configured.
@@ -273,118 +171,225 @@ pub trait WebSocketContext {
     }
 }
 
-/// WebSocket handler for error stream
-pub async fn websocket_handler_errors<T: WebSocketContext>(
-    req: HttpRequest,
-    stream: web::Payload,
-    data: web::Data<T>,
-) -> Result<HttpResponse, actix_web::Error> {
-    ws::start(
-        MyWebSocket::without_zenoh(data.err_stream().clone(), 1),
-        &req,
-        stream,
-    )
-    .map_err(|e| {
-        error!("WebSocket connection failed: {:?}", e);
-        e
-    })
+// ============================================================================
+// Query Parameters
+// ============================================================================
+
+/// Query parameters for WebSocket connections.
+#[derive(Debug, Deserialize)]
+pub struct WsParams {
+    /// Enable permessage-deflate compression (default: true).
+    /// Set to `false` for pre-compressed streams (e.g. H.264) to skip deflate.
+    /// Note: topics containing "h264" or "jpeg" auto-disable compression
+    /// regardless of this parameter.
+    #[serde(default = "default_true")]
+    pub compress: bool,
 }
 
-/// WebSocket handler for high priority streams (e.g., detection masks)
-pub async fn websocket_handler_high_priority<T: WebSocketContext + 'static>(
-    req: HttpRequest,
-    stream: web::Payload,
-    data: web::Data<T>,
-) -> Result<HttpResponse, actix_web::Error> {
-    websocket_handler(req, stream, data, true).await
+fn default_true() -> bool {
+    true
 }
 
-/// WebSocket handler for low priority streams
-pub async fn websocket_handler_low_priority<T: WebSocketContext + 'static>(
-    req: HttpRequest,
-    stream: web::Payload,
-    data: web::Data<T>,
-) -> Result<HttpResponse, actix_web::Error> {
-    websocket_handler(req, stream, data, false).await
+/// Returns true if the topic carries pre-compressed data (H.264 video or JPEG
+/// images) where permessage-deflate would waste CPU without shrinking the payload.
+fn is_precompressed_topic(topic: &str) -> bool {
+    topic.contains("h264") || topic.contains("jpeg")
 }
 
-/// Generic WebSocket handler with priority setting
-pub async fn websocket_handler<T: WebSocketContext + 'static>(
-    req: HttpRequest,
-    stream: web::Payload,
-    data: web::Data<T>,
-    is_high_priority: bool,
-) -> Result<HttpResponse, actix_web::Error> {
-    let path = req.uri().path().to_owned();
-    let cleaned_path = if let Some(stripped) = path.strip_prefix('/') {
-        stripped.to_owned()
+// ============================================================================
+// WebSocket Handlers
+// ============================================================================
+
+/// WebSocket handler for `/rt/*topic` routes.
+///
+/// Creates a per-connection MessageStream, spawns a zenoh_listener, and
+/// manages the WebSocket connection loop forwarding broadcast messages to
+/// the client.
+///
+/// Supports an optional `?compress=false` query parameter to disable
+/// permessage-deflate compression for pre-compressed streams like H.264.
+pub async fn websocket_handler<T: WebSocketContext>(
+    ws: IncomingUpgrade,
+    State(ctx): State<Arc<T>>,
+    axum::extract::Path(topic): axum::extract::Path<String>,
+    axum::extract::Query(params): axum::extract::Query<WsParams>,
+) -> impl IntoResponse {
+    // axum 0.8 wildcard captures include leading slash; strip it and prepend
+    // "rt/" since the route prefix /rt/ is the Zenoh key expression namespace
+    let topic = format!(
+        "rt/{}",
+        topic
+            .strip_prefix('/')
+            .unwrap_or(&topic)
+            .trim_end_matches('/')
+    );
+    let use_compression = params.compress && !is_precompressed_topic(&topic);
+    let options = if use_compression {
+        Options::default().with_compression_level(yawc::CompressionLevel::fast())
     } else {
-        path.to_owned()
-    };
-    let cleaned_path = if cleaned_path.ends_with('/') {
-        cleaned_path[..cleaned_path.len() - 1].to_owned()
-    } else {
-        cleaned_path.clone()
+        Options::default().without_compression()
     };
 
-    let topic = cleaned_path.clone();
-    let (tx, _rx) = channel();
-
-    // Clone fields before moving into closure
-    let err_stream = data.err_stream().clone();
-    let err_count_val = data.err_count().load(Ordering::SeqCst);
-    let zenoh_session = data.zenoh_session().clone();
-
-    let video_stream = Arc::new(MessageStream::new(
-        tx,
-        Box::new({
-            let err_stream = err_stream.clone();
-            let topic = topic.clone();
-            move || {
-                let new_val = err_count_val + 1;
-                let msg = format!(
-                    "{{\"dropped frames\": {new_val}, \"dropped_topic\": \"{}\"}}",
-                    topic.clone()
-                );
-                let msg = cdr::serialize::<_, _, CdrLe>(&msg, Infinite).unwrap();
-                err_stream.broadcast(Broadcast::Binary(msg));
-            }
-        }),
-        is_high_priority,
-    ));
-    let video_stream_clone = video_stream.clone();
-
-    // Create shutdown channel for graceful zenoh listener termination
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-
-    let capacity = if is_high_priority { 16 } else { 1 };
-    let ws_result = ws::start(
-        MyWebSocket::new(video_stream, capacity, shutdown_tx),
-        &req,
-        stream,
+    info!(
+        "WebSocket {topic} — compression {}",
+        if use_compression { "on" } else { "off" }
     );
 
-    if ws_result.is_ok() {
-        // Get global shutdown token for graceful shutdown coordination
-        let global_shutdown = data.shutdown_token();
+    let (response, ws_future) = ws.upgrade(options).unwrap();
 
-        // Spawn zenoh listener as a tokio task instead of a separate thread
-        tokio::spawn(async move {
-            zenoh_listener(
-                video_stream_clone,
-                zenoh_session,
-                shutdown_rx,
-                global_shutdown,
-                cleaned_path,
-            )
-            .await;
-        });
-    }
+    let err_stream = ctx.err_stream().clone();
+    let zenoh_session = ctx.zenoh_session().clone();
+    let global_shutdown = ctx.shutdown_token();
 
-    ws_result.map_err(|e| {
-        error!("WebSocket connection failed: {:?}", e);
-        e
-    })
+    let video_stream = Arc::new(MessageStream::new(Box::new({
+        let err_stream = err_stream.clone();
+        let topic = topic.clone();
+        move || {
+            let msg = format!("{{\"dropped_topic\": \"{}\"}}", topic);
+            let msg = cdr::serialize::<_, _, CdrLe>(&msg, Infinite).unwrap();
+            err_stream.broadcast(Broadcast::Binary(msg));
+        }
+    })));
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
+    let video_stream_clone = video_stream.clone();
+    tokio::spawn(async move {
+        zenoh_listener(
+            video_stream_clone,
+            zenoh_session,
+            shutdown_rx,
+            global_shutdown,
+            topic,
+        )
+        .await;
+    });
+
+    tokio::spawn(async move {
+        let ws = match ws_future.await {
+            Ok(ws) => ws,
+            Err(e) => {
+                error!("WebSocket upgrade failed: {e}");
+                return;
+            }
+        };
+        let (mut sink, mut stream) = ws.split();
+        let mut rx = video_stream.subscribe();
+        let mut ping_interval = tokio::time::interval(PING_INTERVAL);
+        ping_interval.tick().await; // consume immediate first tick
+
+        loop {
+            tokio::select! {
+                msg = rx.recv() => {
+                    match msg {
+                        Ok(Broadcast::Binary(data)) => {
+                            match tokio::time::timeout(SEND_TIMEOUT, sink.send(Frame::binary(data))).await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(_)) => { debug!("WebSocket sink error, closing"); break; }
+                                Err(_) => { info!("WebSocket send timeout, dropping slow client"); break; }
+                            }
+                        }
+                        Ok(Broadcast::Text(text)) => {
+                            match tokio::time::timeout(SEND_TIMEOUT, sink.send(Frame::text(text))).await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(_)) => { debug!("WebSocket sink error, closing"); break; }
+                                Err(_) => { info!("WebSocket send timeout, dropping slow client"); break; }
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("WebSocket subscriber lagged by {n} messages, skipping to latest");
+                        }
+                        Err(_) => {
+                            debug!("Broadcast channel closed");
+                            break;
+                        }
+                    }
+                }
+                frame = stream.next() => {
+                    match frame {
+                        Some(frame) if frame.opcode() == OpCode::Close => {
+                            debug!("WebSocket close frame received");
+                            break;
+                        }
+                        None => {
+                            debug!("WebSocket stream ended (None)");
+                            break;
+                        }
+                        Some(_) => {}
+                    }
+                }
+                _ = ping_interval.tick() => {
+                    let ping = Frame::ping(&[][..]);
+                    match tokio::time::timeout(SEND_TIMEOUT, sink.send(ping)).await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(_)) => { debug!("Ping send error, closing"); break; }
+                        Err(_) => { info!("Ping timeout, dropping unresponsive client"); break; }
+                    }
+                }
+            }
+        }
+        let _ = shutdown_tx.send(());
+    });
+
+    response
+}
+
+/// WebSocket handler for `/ws/dropped` error stream.
+///
+/// Forwards messages from the global error stream to connected clients.
+/// No zenoh subscription is created.
+pub async fn websocket_handler_errors<T: WebSocketContext>(
+    ws: IncomingUpgrade,
+    State(ctx): State<Arc<T>>,
+) -> impl IntoResponse {
+    let options = Options::default().with_compression_level(yawc::CompressionLevel::fast());
+
+    let (response, ws_future) = ws.upgrade(options).unwrap();
+    let err_stream = ctx.err_stream().clone();
+
+    tokio::spawn(async move {
+        let Ok(ws) = ws_future.await else { return };
+        let (mut sink, mut stream) = ws.split();
+        let mut rx = err_stream.subscribe();
+        let mut ping_interval = tokio::time::interval(PING_INTERVAL);
+        ping_interval.tick().await;
+
+        loop {
+            tokio::select! {
+                msg = rx.recv() => {
+                    match msg {
+                        Ok(Broadcast::Binary(data)) => {
+                            match tokio::time::timeout(SEND_TIMEOUT, sink.send(Frame::binary(data))).await {
+                                Ok(Ok(())) => {}
+                                _ => break,
+                            }
+                        }
+                        Ok(Broadcast::Text(text)) => {
+                            match tokio::time::timeout(SEND_TIMEOUT, sink.send(Frame::text(text))).await {
+                                Ok(Ok(())) => {}
+                                _ => break,
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(_) => break,
+                    }
+                }
+                frame = stream.next() => {
+                    match frame {
+                        Some(frame) if frame.opcode() == OpCode::Close => break,
+                        None => break,
+                        _ => {}
+                    }
+                }
+                _ = ping_interval.tick() => {
+                    let ping = Frame::ping(&[][..]);
+                    if tokio::time::timeout(SEND_TIMEOUT, sink.send(ping)).await.is_err() { break; }
+                }
+            }
+        }
+    });
+
+    response
 }
 
 #[cfg(test)]
@@ -397,7 +402,6 @@ mod tests {
             action: "subscribe".to_string(),
             topic: "test/topic".to_string(),
         };
-
         let json = serde_json::to_string(&msg).expect("Failed to serialize");
         assert!(json.contains("\"action\":\"subscribe\""));
         assert!(json.contains("\"topic\":\"test/topic\""));
@@ -407,8 +411,29 @@ mod tests {
     fn test_websocket_message_deserialization() {
         let json = r#"{"action":"subscribe","topic":"rt/camera"}"#;
         let msg: WebSocketMessage = serde_json::from_str(json).expect("Failed to deserialize");
-
         assert_eq!(msg.action, "subscribe");
         assert_eq!(msg.topic, "rt/camera");
+    }
+
+    #[test]
+    fn test_broadcast_clone() {
+        let msg = Broadcast::Binary(vec![1, 2, 3]);
+        let cloned = msg.clone();
+        match cloned {
+            Broadcast::Binary(data) => assert_eq!(data, vec![1, 2, 3]),
+            _ => panic!("Expected Binary"),
+        }
+    }
+
+    #[test]
+    fn test_message_stream_broadcast() {
+        let stream = MessageStream::new(Box::new(|| {}));
+        let mut rx = stream.subscribe();
+        stream.broadcast(Broadcast::Text("test".to_string()));
+        let msg = rx.try_recv().unwrap();
+        match msg {
+            Broadcast::Text(s) => assert_eq!(s, "test"),
+            _ => panic!("Expected Text"),
+        }
     }
 }

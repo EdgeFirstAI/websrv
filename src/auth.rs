@@ -3,7 +3,9 @@
 
 //! Authentication handlers for EdgeFirst Studio integration.
 
-use actix_web::{web, HttpResponse, Responder};
+use axum::extract::{Json, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use log::{error, info};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -39,15 +41,15 @@ pub struct AuthStatusResponse {
 }
 
 /// Trait for accessing upload manager from server context
-pub trait AuthContext {
+pub trait AuthContext: Send + Sync + 'static {
     fn upload_manager(&self) -> &Arc<UploadManager>;
 }
 
 /// POST /api/auth/login - Authenticate with EdgeFirst Studio
 pub async fn auth_login<T: AuthContext>(
-    body: web::Json<AuthRequest>,
-    data: web::Data<T>,
-) -> impl Responder {
+    State(data): State<Arc<T>>,
+    Json(body): Json<AuthRequest>,
+) -> impl IntoResponse {
     info!(
         "Login request received for user: {} on server: {}",
         body.username, body.server
@@ -63,49 +65,65 @@ pub async fn auth_login<T: AuthContext>(
                 "User {} authenticated successfully on {}",
                 body.username, body.server
             );
-            HttpResponse::Ok().json(AuthResponse {
-                status: "ok".to_string(),
-                message: "Authentication successful".to_string(),
-            })
+            (
+                StatusCode::OK,
+                Json(AuthResponse {
+                    status: "ok".to_string(),
+                    message: "Authentication successful".to_string(),
+                }),
+            )
+                .into_response()
         }
         Err(e) => {
             // Log full error internally but return generic message to client
             error!("Authentication failed for user {}: {}", body.username, e);
-            HttpResponse::Unauthorized().json(AuthResponse {
-                status: "error".to_string(),
-                message: "Authentication failed. Please check your credentials.".to_string(),
-            })
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(AuthResponse {
+                    status: "error".to_string(),
+                    message: "Authentication failed. Please check your credentials.".to_string(),
+                }),
+            )
+                .into_response()
         }
     }
 }
 
 /// GET /api/auth/status - Check authentication status
-pub async fn auth_status<T: AuthContext>(data: web::Data<T>) -> impl Responder {
+pub async fn auth_status<T: AuthContext>(State(data): State<Arc<T>>) -> impl IntoResponse {
     let is_authenticated = data.upload_manager().is_authenticated().await;
     let username = data.upload_manager().get_username().await;
 
-    HttpResponse::Ok().json(AuthStatusResponse {
+    Json(AuthStatusResponse {
         authenticated: is_authenticated,
         username,
     })
 }
 
 /// POST /api/auth/logout - Logout from EdgeFirst Studio
-pub async fn auth_logout<T: AuthContext>(data: web::Data<T>) -> impl Responder {
+pub async fn auth_logout<T: AuthContext>(State(data): State<Arc<T>>) -> impl IntoResponse {
     match data.upload_manager().logout().await {
         Ok(()) => {
             info!("User logged out successfully");
-            HttpResponse::Ok().json(AuthResponse {
-                status: "ok".to_string(),
-                message: "Logged out successfully".to_string(),
-            })
+            (
+                StatusCode::OK,
+                Json(AuthResponse {
+                    status: "ok".to_string(),
+                    message: "Logged out successfully".to_string(),
+                }),
+            )
+                .into_response()
         }
         Err(e) => {
             error!("Logout failed: {}", e);
-            HttpResponse::InternalServerError().json(AuthResponse {
-                status: "error".to_string(),
-                message: format!("Logout failed: {}", e),
-            })
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(AuthResponse {
+                    status: "error".to_string(),
+                    message: format!("Logout failed: {}", e),
+                }),
+            )
+                .into_response()
         }
     }
 }

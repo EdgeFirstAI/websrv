@@ -7,7 +7,9 @@
 //! - Listing projects from EdgeFirst Studio
 //! - Getting auto-labeling labels (COCO 80 classes)
 
-use actix_web::{web, HttpResponse, Responder};
+use axum::extract::{Json, Path, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use log::error;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -32,12 +34,14 @@ pub struct LabelInfo {
 }
 
 /// Trait for accessing upload manager from server context
-pub trait StudioContext {
+pub trait StudioContext: Send + Sync + 'static {
     fn upload_manager(&self) -> &Arc<UploadManager>;
 }
 
 /// GET /api/studio/projects - List projects from EdgeFirst Studio
-pub async fn list_studio_projects<T: StudioContext>(data: web::Data<T>) -> impl Responder {
+pub async fn list_studio_projects<T: StudioContext>(
+    State(data): State<Arc<T>>,
+) -> impl IntoResponse {
     let client_lock = data.upload_manager().client.read().await;
 
     match &*client_lock {
@@ -50,18 +54,26 @@ pub async fn list_studio_projects<T: StudioContext>(data: web::Data<T>) -> impl 
                         name: p.name().to_string(),
                     })
                     .collect();
-                HttpResponse::Ok().json(project_infos)
+                (StatusCode::OK, Json(project_infos)).into_response()
             }
             Err(e) => {
                 error!("Failed to fetch projects: {}", e);
-                HttpResponse::InternalServerError().json(UploadErrorResponse {
-                    error: format!("Failed to fetch projects: {}", e),
-                })
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(UploadErrorResponse {
+                        error: format!("Failed to fetch projects: {}", e),
+                    }),
+                )
+                    .into_response()
             }
         },
-        None => HttpResponse::Unauthorized().json(UploadErrorResponse {
-            error: "Not authenticated with EdgeFirst Studio".to_string(),
-        }),
+        None => (
+            StatusCode::UNAUTHORIZED,
+            Json(UploadErrorResponse {
+                error: "Not authenticated with EdgeFirst Studio".to_string(),
+            }),
+        )
+            .into_response(),
     }
 }
 
@@ -71,19 +83,23 @@ pub async fn list_studio_projects<T: StudioContext>(data: web::Data<T>) -> impl 
 /// In the future this will be configurable; for now we return the standard COCO
 /// classes.
 pub async fn list_project_labels<T: StudioContext>(
-    _path: web::Path<String>,
-    data: web::Data<T>,
-) -> impl Responder {
+    State(data): State<Arc<T>>,
+    Path(_id): Path<String>,
+) -> impl IntoResponse {
     let client_lock = data.upload_manager().client.read().await;
 
     match &*client_lock {
         Some(_client) => {
             let coco_labels = get_coco_labels();
-            HttpResponse::Ok().json(coco_labels)
+            (StatusCode::OK, Json(coco_labels)).into_response()
         }
-        None => HttpResponse::Unauthorized().json(UploadErrorResponse {
-            error: "Not authenticated with EdgeFirst Studio".to_string(),
-        }),
+        None => (
+            StatusCode::UNAUTHORIZED,
+            Json(UploadErrorResponse {
+                error: "Not authenticated with EdgeFirst Studio".to_string(),
+            }),
+        )
+            .into_response(),
     }
 }
 

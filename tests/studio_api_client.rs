@@ -751,10 +751,7 @@ async fn test_check_storage_availability() {
     let client = create_client();
     let base_url = get_base_url();
 
-    let result = client
-        .get(format!("{}/check-storage", base_url))
-        .send()
-        .await;
+    let result = client.get(format!("{}/api/storage", base_url)).send().await;
 
     match result {
         Ok(response) => {
@@ -809,7 +806,7 @@ async fn test_recorder_status() {
     let base_url = get_base_url();
 
     let result = client
-        .get(format!("{}/recorder-status", base_url))
+        .get(format!("{}/api/recorder/status", base_url))
         .send()
         .await;
 
@@ -841,7 +838,7 @@ async fn test_current_recording() {
     let base_url = get_base_url();
 
     let result = client
-        .get(format!("{}/current-recording", base_url))
+        .get(format!("{}/api/recorder/current", base_url))
         .send()
         .await;
 
@@ -870,7 +867,7 @@ async fn test_start_recording() {
     let base_url = get_base_url();
 
     let result = client
-        .post(format!("{}/start", base_url))
+        .post(format!("{}/api/recorder/start", base_url))
         .json(&RecordingRequest {
             filename: Some("test_recording".to_string()),
         })
@@ -903,7 +900,10 @@ async fn test_stop_recording() {
     let client = create_client();
     let base_url = get_base_url();
 
-    let result = client.post(format!("{}/stop", base_url)).send().await;
+    let result = client
+        .post(format!("{}/api/recorder/stop", base_url))
+        .send()
+        .await;
 
     match result {
         Ok(response) => {
@@ -933,7 +933,7 @@ async fn test_replay_status() {
     let base_url = get_base_url();
 
     let result = client
-        .get(format!("{}/replay-status", base_url))
+        .get(format!("{}/api/replay/status", base_url))
         .send()
         .await;
 
@@ -963,7 +963,7 @@ async fn test_start_replay_invalid_file() {
     let base_url = get_base_url();
 
     let result = client
-        .post(format!("{}/replay", base_url))
+        .post(format!("{}/api/replay/start", base_url))
         .json(&ReplayRequest {
             file: "/nonexistent/file.mcap".to_string(),
         })
@@ -990,7 +990,10 @@ async fn test_stop_replay() {
     let client = create_client();
     let base_url = get_base_url();
 
-    let result = client.post(format!("{}/replay-end", base_url)).send().await;
+    let result = client
+        .post(format!("{}/api/replay/stop", base_url))
+        .send()
+        .await;
 
     match result {
         Ok(response) => {
@@ -1020,7 +1023,7 @@ async fn test_get_config_recorder() {
     let base_url = get_base_url();
 
     let result = client
-        .get(format!("{}/config/recorder/details", base_url))
+        .get(format!("{}/api/config/recorder", base_url))
         .send()
         .await;
 
@@ -1050,7 +1053,7 @@ async fn test_get_config_replayer() {
     let base_url = get_base_url();
 
     let result = client
-        .get(format!("{}/config/replayer/details", base_url))
+        .get(format!("{}/api/config/replayer", base_url))
         .send()
         .await;
 
@@ -1081,7 +1084,7 @@ async fn test_get_config_invalid_service() {
     let base_url = get_base_url();
 
     let result = client
-        .get(format!("{}/config/nonexistent_service/details", base_url))
+        .get(format!("{}/api/config/nonexistent_service", base_url))
         .send()
         .await;
 
@@ -1131,7 +1134,7 @@ async fn test_get_all_services_status() {
     let base_url = get_base_url();
 
     let result = client
-        .post(format!("{}/config/service/status", base_url))
+        .post(format!("{}/api/services/status", base_url))
         .json(&ServiceStatusRequest {
             services: vec!["recorder".to_string(), "replayer".to_string()],
         })
@@ -1167,7 +1170,7 @@ async fn test_update_service_status() {
     let base_url = get_base_url();
 
     let result = client
-        .post(format!("{}/config/services/update", base_url))
+        .post(format!("{}/api/services/update", base_url))
         .json(&ServiceUpdateRequest {
             service: "recorder".to_string(),
             action: "status".to_string(),
@@ -1196,7 +1199,10 @@ async fn test_download_nonexistent_file() {
     let base_url = get_base_url();
 
     let result = client
-        .get(format!("{}/download/nonexistent_file.mcap", base_url))
+        .get(format!(
+            "{}/api/recordings/download/nonexistent_file.mcap",
+            base_url
+        ))
         .send()
         .await;
 
@@ -1216,7 +1222,10 @@ async fn test_download_non_mcap_file() {
     let base_url = get_base_url();
 
     let result = client
-        .get(format!("{}/download/some_file.txt", base_url))
+        .get(format!(
+            "{}/api/recordings/download/some_file.txt",
+            base_url
+        ))
         .send()
         .await;
 
@@ -1246,7 +1255,7 @@ async fn test_delete_nonexistent_file() {
     let base_url = get_base_url();
 
     let result = client
-        .post(format!("{}/delete", base_url))
+        .delete(format!("{}/api/recordings", base_url))
         .json(&DeleteRequest {
             file: "/nonexistent/path/file.mcap".to_string(),
         })
@@ -1331,7 +1340,7 @@ async fn test_live_run_isolate() {
     let base_url = get_base_url();
 
     let result = client
-        .post(format!("{}/live-run", base_url))
+        .post(format!("{}/api/replay/config", base_url))
         .json(&IsolateRequest { isolate: false })
         .send()
         .await;
@@ -1359,10 +1368,7 @@ async fn test_recording_workflow_status_check() {
 
     // Step 1: Check storage availability
     println!("Step 1: Checking storage...");
-    let result = client
-        .get(format!("{}/check-storage", base_url))
-        .send()
-        .await;
+    let result = client.get(format!("{}/api/storage", base_url)).send().await;
 
     match result {
         Ok(response) => {
@@ -1388,7 +1394,7 @@ async fn test_recording_workflow_status_check() {
     // Step 2: Check recorder status (returns plain text)
     println!("Step 2: Checking recorder status...");
     let response = client
-        .get(format!("{}/recorder-status", base_url))
+        .get(format!("{}/api/recorder/status", base_url))
         .send()
         .await
         .expect("Failed to get recorder status");
@@ -1403,7 +1409,7 @@ async fn test_recording_workflow_status_check() {
     // Step 3: Check current recording
     println!("Step 3: Checking current recording...");
     let response = client
-        .get(format!("{}/current-recording", base_url))
+        .get(format!("{}/api/recorder/current", base_url))
         .send()
         .await
         .expect("Failed to get current recording");
@@ -1418,7 +1424,7 @@ async fn test_recording_workflow_status_check() {
     // Step 4: Check replay status (returns plain text)
     println!("Step 4: Checking replay status...");
     let response = client
-        .get(format!("{}/replay-status", base_url))
+        .get(format!("{}/api/replay/status", base_url))
         .send()
         .await
         .expect("Failed to get replay status");
@@ -1473,7 +1479,7 @@ async fn test_upload_preparation_flow() {
     // Step 2: Check storage
     println!("Step 2: Checking storage...");
     let response = client
-        .get(format!("{}/check-storage", base_url))
+        .get(format!("{}/api/storage", base_url))
         .send()
         .await
         .expect("Failed to check storage");
@@ -1570,7 +1576,7 @@ async fn check_websocket_endpoint(path: &str) -> Result<u16, String> {
 /// Test camera stream endpoint exists
 #[tokio::test]
 async fn test_websocket_camera_endpoint() {
-    match check_websocket_endpoint("/rt/camera/h264").await {
+    match check_websocket_endpoint("/api/rt/camera/h264").await {
         Ok(status) => {
             println!("Camera H264 endpoint status: {}", status);
             // WebSocket endpoints typically return 400 for non-WS requests or 101 for upgrades
@@ -1585,7 +1591,7 @@ async fn test_websocket_camera_endpoint() {
 /// Test detection mask endpoint exists
 #[tokio::test]
 async fn test_websocket_detection_mask_endpoint() {
-    match check_websocket_endpoint("/rt/detect/mask").await {
+    match check_websocket_endpoint("/api/rt/detect/mask").await {
         Ok(status) => {
             println!("Detection mask endpoint status: {}", status);
         }
@@ -1598,7 +1604,7 @@ async fn test_websocket_detection_mask_endpoint() {
 /// Test MCAP listing endpoint exists
 #[tokio::test]
 async fn test_websocket_mcap_endpoint() {
-    match check_websocket_endpoint("/mcap/").await {
+    match check_websocket_endpoint("/api/recordings/").await {
         Ok(status) => {
             println!("MCAP listing endpoint status: {}", status);
         }
@@ -1611,7 +1617,7 @@ async fn test_websocket_mcap_endpoint() {
 /// Test error stream endpoint exists
 #[tokio::test]
 async fn test_websocket_error_endpoint() {
-    match check_websocket_endpoint("/ws/error").await {
+    match check_websocket_endpoint("/api/ws/error").await {
         Ok(status) => {
             println!("Error stream endpoint status: {}", status);
         }
@@ -1624,7 +1630,7 @@ async fn test_websocket_error_endpoint() {
 /// Test upload progress WebSocket endpoint exists
 #[tokio::test]
 async fn test_websocket_upload_progress_endpoint() {
-    match check_websocket_endpoint("/ws/uploads").await {
+    match check_websocket_endpoint("/api/ws/uploads").await {
         Ok(status) => {
             println!("Upload progress endpoint status: {}", status);
         }
@@ -1639,9 +1645,9 @@ async fn test_websocket_upload_progress_endpoint() {
 #[tokio::test]
 async fn test_sensor_stream_endpoints() {
     let endpoints = vec![
-        ("/rt/camera/h264", "Camera H264"),
-        ("/rt/model/mask_compressed", "Model Mask"),
-        ("/rt/model/boxes2d", "Model Boxes2D"),
+        ("/api/rt/camera/h264", "Camera H264"),
+        ("/api/rt/model/mask_compressed", "Model Mask"),
+        ("/api/rt/model/boxes2d", "Model Boxes2D"),
     ];
 
     for (path, name) in endpoints {

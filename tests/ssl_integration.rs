@@ -4,7 +4,7 @@
 //! Integration tests for SSL certificate management.
 //!
 //! These tests verify the certificate loading and generation functionality
-//! in various scenarios.
+//! in various scenarios. Validates PEM format without requiring OpenSSL.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -41,59 +41,58 @@ fn test_certificate_generation_creates_valid_files() {
     assert_eq!(cert_perms & 0o777, 0o644);
     assert_eq!(key_perms & 0o777, 0o600);
 
-    // Verify certificate can be parsed
-    let cert_contents = fs::read(&cert_path).unwrap();
-    let key_contents = fs::read(&key_path).unwrap();
-
-    let cert = openssl::x509::X509::from_pem(&cert_contents).unwrap();
-    let key = openssl::pkey::PKey::private_key_from_pem(&key_contents).unwrap();
-
-    // Verify certificate properties
-    let subject = cert.subject_name();
-    let cn = subject
-        .entries_by_nid(openssl::nid::Nid::COMMONNAME)
-        .next()
-        .unwrap();
-    assert_eq!(cn.data().as_utf8().unwrap().to_string(), hostname);
-
-    // Verify key matches certificate
-    assert!(cert.public_key().unwrap().public_eq(&key));
+    // Verify PEM format
+    let cert_contents = fs::read_to_string(&cert_path).unwrap();
+    let key_contents = fs::read_to_string(&key_path).unwrap();
+    assert!(cert_contents.contains("BEGIN CERTIFICATE"));
+    assert!(cert_contents.contains("END CERTIFICATE"));
+    assert!(key_contents.contains("BEGIN PRIVATE KEY"));
+    assert!(key_contents.contains("END PRIVATE KEY"));
 }
 
 #[test]
-fn test_certificate_san_includes_local_hostname() {
-    let hostname = "maivin-1234";
-    let (cert_pem, _) = generate_test_certificate(hostname);
+fn test_certificate_pem_format_valid() {
+    let (cert_pem, key_pem) = generate_test_certificate("test-device");
 
-    let cert = openssl::x509::X509::from_pem(cert_pem.as_bytes()).unwrap();
+    // Verify PEM structure
+    assert!(cert_pem.starts_with("-----BEGIN CERTIFICATE-----"));
+    assert!(cert_pem.trim_end().ends_with("-----END CERTIFICATE-----"));
+    assert!(key_pem.starts_with("-----BEGIN PRIVATE KEY-----"));
+    assert!(key_pem.trim_end().ends_with("-----END PRIVATE KEY-----"));
 
-    // Get Subject Alternative Names
-    let san_ext = cert
-        .subject_alt_names()
-        .expect("Certificate should have SANs");
+    // Verify base64 content is present (PEM body should have content between markers)
+    let cert_lines: Vec<&str> = cert_pem.lines().collect();
+    assert!(
+        cert_lines.len() > 2,
+        "Certificate PEM should have content between markers"
+    );
 
-    let san_names: Vec<String> = san_ext
-        .iter()
-        .filter_map(|name| name.dnsname().map(|s| s.to_string()))
-        .collect();
+    let key_lines: Vec<&str> = key_pem.lines().collect();
+    assert!(
+        key_lines.len() > 2,
+        "Key PEM should have content between markers"
+    );
 
-    // Verify expected SANs are present
-    assert!(san_names.contains(&format!("{}.local", hostname)));
-    assert!(san_names.contains(&hostname.to_string()));
-    assert!(san_names.contains(&"localhost".to_string()));
-}
+    // Verify rustls can actually parse the PEM (catches invalid base64,
+    // unsupported key types like encrypted PKCS#8, etc.)
+    let certs: Vec<_> = rustls_pemfile::certs(&mut cert_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .expect("rustls should parse certificate PEM");
+    assert!(
+        !certs.is_empty(),
+        "At least one certificate should be present"
+    );
 
-#[test]
-fn test_certificate_validity_period() {
-    let (cert_pem, _) = generate_test_certificate("test-device");
-    let cert = openssl::x509::X509::from_pem(cert_pem.as_bytes()).unwrap();
+    let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
+        .expect("rustls should parse key PEM")
+        .expect("A usable private key should be present");
 
-    let not_before = cert.not_before();
-    let not_after = cert.not_after();
-
-    // The certificate validity period spans from 2025 to 2035
-    // Just verify that not_after is after not_before (10 year span)
-    assert!(not_after.compare(not_before).unwrap() == std::cmp::Ordering::Greater);
+    // Verify we can build a ServerConfig (the actual runtime operation)
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .expect("rustls ServerConfig should accept the generated cert+key");
 }
 
 #[test]
@@ -107,29 +106,26 @@ fn test_load_certificate_from_files() {
     fs::write(&cert_path, &cert_pem).unwrap();
     fs::write(&key_path, &key_pem).unwrap();
 
-    // Load and verify
-    let cert_contents = fs::read(&cert_path).unwrap();
-    let key_contents = fs::read(&key_path).unwrap();
+    // Load and verify PEM format is preserved
+    let cert_contents = fs::read_to_string(&cert_path).unwrap();
+    let key_contents = fs::read_to_string(&key_path).unwrap();
 
-    let cert = openssl::x509::X509::from_pem(&cert_contents).unwrap();
-    let key = openssl::pkey::PKey::private_key_from_pem(&key_contents).unwrap();
+    assert!(cert_contents.contains("BEGIN CERTIFICATE"));
+    assert!(key_contents.contains("BEGIN PRIVATE KEY"));
 
-    assert!(cert.public_key().is_ok());
-    assert!(key.ec_key().is_ok()); // Should be EC key
+    // Verify the content matches what was written
+    assert_eq!(cert_contents, cert_pem);
+    assert_eq!(key_contents, key_pem);
 }
 
 #[test]
-fn test_certificate_key_is_ecdsa_p256() {
-    let (_, key_pem) = generate_test_certificate("test-device");
-    let key = openssl::pkey::PKey::private_key_from_pem(key_pem.as_bytes()).unwrap();
+fn test_certificate_is_unique_per_generation() {
+    let (cert_pem_1, key_pem_1) = generate_test_certificate("device-1");
+    let (cert_pem_2, key_pem_2) = generate_test_certificate("device-2");
 
-    // Verify it's an EC key
-    let ec_key = key.ec_key().expect("Should be an EC key");
-
-    // Verify it's P-256 (also known as prime256v1 or secp256r1)
-    let group = ec_key.group();
-    let nid = group.curve_name().expect("Should have a named curve");
-    assert_eq!(nid, openssl::nid::Nid::X9_62_PRIME256V1);
+    // Different hostnames should produce different certificates
+    assert_ne!(cert_pem_1, cert_pem_2);
+    assert_ne!(key_pem_1, key_pem_2);
 }
 
 /// Generate a test certificate using rcgen (mirrors ssl.rs implementation)

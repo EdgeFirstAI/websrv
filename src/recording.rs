@@ -8,29 +8,16 @@
 //! - Starting/stopping replay
 //! - Checking recorder and replay status
 
-use actix_web::{web, HttpResponse, Responder};
+use axum::extract::{Json, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::Path;
 use std::process::Command;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use sysinfo::System;
-
-// ============================================================================
-// State
-// ============================================================================
-
-/// Application state for managing recorder process
-pub struct AppState {
-    pub process: Mutex<Option<std::process::Child>>,
-}
-
-/// Thread state for async operations
-#[allow(dead_code)]
-pub struct ThreadState {
-    pub is_running: Mutex<bool>,
-}
 
 // ============================================================================
 // Types
@@ -120,8 +107,14 @@ pub fn extract_recording_filename(status_output: &str) -> Option<String> {
 // Recording Handlers
 // ============================================================================
 
+/// Trait for accessing server context in recording handlers
+pub trait RecordingContext: Send + Sync + 'static {
+    fn storage_path(&self) -> &str;
+    fn process(&self) -> &Mutex<Option<std::process::Child>>;
+}
+
 /// Check recorder status (system mode)
-pub async fn check_recorder_status() -> impl Responder {
+pub async fn check_recorder_status() -> impl IntoResponse {
     let service_status = Command::new("systemctl")
         .arg("is-active")
         .arg("recorder")
@@ -132,18 +125,21 @@ pub async fn check_recorder_status() -> impl Responder {
             let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
             if status == "active" {
-                HttpResponse::Ok().body("Recorder is running")
+                "Recorder is running".into_response()
             } else {
-                HttpResponse::Ok().body("Recorder is not running")
+                "Recorder is not running".into_response()
             }
         }
-        Err(e) => HttpResponse::InternalServerError()
-            .body(format!("Error checking service status: {:?}", e)),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Error checking service status: {:?}", e),
+        )
+            .into_response(),
     }
 }
 
 /// Start recording (system mode)
-pub async fn start(data: web::Data<AppState>) -> impl Responder {
+pub async fn start<T: RecordingContext>(State(data): State<Arc<T>>) -> impl IntoResponse {
     let mut command = Command::new("sudo");
     command.arg("systemctl").arg("start").arg("recorder");
 
@@ -151,11 +147,15 @@ pub async fn start(data: web::Data<AppState>) -> impl Responder {
         Ok(p) => p,
         Err(e) => {
             let error_message = format!("Failed to start recorder: {:?}", e);
-            info!("{}", error_message);
-            return HttpResponse::Ok().json(json!({
-                "status": "started",
-                "message": "Recording started successfully"
-            }));
+            error!("{}", error_message);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "status": "error",
+                    "message": error_message
+                })),
+            )
+                .into_response();
         }
     };
 
@@ -164,7 +164,7 @@ pub async fn start(data: web::Data<AppState>) -> impl Responder {
 
     // Update the process in the mutex
     {
-        let mut process_guard = data.process.lock().unwrap();
+        let mut process_guard = data.process().lock().unwrap();
         *process_guard = Some(process);
     }
 
@@ -178,46 +178,50 @@ pub async fn start(data: web::Data<AppState>) -> impl Responder {
         error!("{}", error_message);
         // Clean up the process if verification fails
         {
-            let mut process_guard = data.process.lock().unwrap();
+            let mut process_guard = data.process().lock().unwrap();
             if let Some(mut process) = process_guard.take() {
                 let _ = process.kill();
             }
         }
-        return HttpResponse::InternalServerError().json(json!({
-            "status": "error",
-            "message": error_message
-        }));
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "status": "error",
+                "message": error_message
+            })),
+        )
+            .into_response();
     }
 
     info!("Recorder started with PID: {}", pid);
-    HttpResponse::Ok().json(json!({
-        "status": "started",
-        "message": "Recording started successfully"
-    }))
-}
-
-/// Trait for accessing server context in user mode
-pub trait RecordingContext {
-    fn storage_path(&self) -> &str;
+    (
+        StatusCode::OK,
+        Json(json!({
+            "status": "started",
+            "message": "Recording started successfully"
+        })),
+    )
+        .into_response()
 }
 
 /// Start recording (user mode)
-pub async fn user_mode_start<T: RecordingContext>(
-    data: web::Data<AppState>,
-    arg_data: web::Data<T>,
-) -> impl Responder {
+pub async fn user_mode_start<T: RecordingContext>(State(data): State<Arc<T>>) -> impl IntoResponse {
     let status_str = user_mode_check_recorder_status().await;
     debug!("Current recorder status: {}", status_str);
 
     if status_str == "Recorder is running" {
-        return HttpResponse::BadRequest().json(json!({
-            "status": "error",
-            "message": "Recorder is already running"
-        }));
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "status": "error",
+                "message": "Recorder is already running"
+            })),
+        )
+            .into_response();
     }
     let mut command = Command::new("edgefirst-recorder");
     command
-        .env("STORAGE", arg_data.storage_path())
+        .env("STORAGE", data.storage_path())
         .arg("--all-topics");
 
     debug!("Starting recorder with command: {:?}", command);
@@ -230,16 +234,20 @@ pub async fn user_mode_start<T: RecordingContext>(
         Err(e) => {
             let error_message = format!("Failed to start recorder: {:?}", e);
             error!("{}", error_message);
-            return HttpResponse::InternalServerError().json(json!({
-                "status": "error",
-                "message": error_message
-            }));
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "status": "error",
+                    "message": error_message
+                })),
+            )
+                .into_response();
         }
     };
 
     let pid = process.id();
     {
-        let mut process_guard = data.process.lock().unwrap();
+        let mut process_guard = data.process().lock().unwrap();
         *process_guard = Some(process);
     }
 
@@ -248,23 +256,27 @@ pub async fn user_mode_start<T: RecordingContext>(
         std::thread::sleep(std::time::Duration::from_millis(200));
         let status = user_mode_check_recorder_status().await;
         if status == "Recorder is running" {
-            return HttpResponse::Ok().json(json!({
-                "status": "started",
-                "message": "Recording started successfully"
-            }));
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "started",
+                    "message": "Recording started successfully"
+                })),
+            )
+                .into_response();
         }
     }
 
     let process_status = {
         let process = {
-            let mut process_guard = data.process.lock().unwrap();
+            let mut process_guard = data.process().lock().unwrap();
             process_guard.take()
         };
         if let Some(mut process) = process {
             let status = process.try_wait();
             // Put the process back if it's still running
             if let Ok(None) = status {
-                let mut process_guard = data.process.lock().unwrap();
+                let mut process_guard = data.process().lock().unwrap();
                 *process_guard = Some(process);
             }
             status
@@ -278,13 +290,17 @@ pub async fn user_mode_start<T: RecordingContext>(
             let error_message = format!("Recorder process exited with status: {:?}", status);
             error!("{}", error_message);
             {
-                let mut process_guard = data.process.lock().unwrap();
+                let mut process_guard = data.process().lock().unwrap();
                 *process_guard = None;
             }
-            HttpResponse::InternalServerError().json(json!({
-                "status": "error",
-                "message": error_message
-            }))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "status": "error",
+                    "message": error_message
+                })),
+            )
+                .into_response()
         }
         Ok(None) => {
             debug!("Creating PID file manually");
@@ -292,71 +308,87 @@ pub async fn user_mode_start<T: RecordingContext>(
                 let error_message = format!("Failed to create PID file: {:?}", e);
                 error!("{}", error_message);
                 {
-                    let mut process_guard = data.process.lock().unwrap();
+                    let mut process_guard = data.process().lock().unwrap();
                     if let Some(mut process) = process_guard.take() {
                         let _ = process.kill();
                     }
                 }
-                return HttpResponse::InternalServerError().json(json!({
-                    "status": "error",
-                    "message": error_message
-                }));
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "status": "error",
+                        "message": error_message
+                    })),
+                )
+                    .into_response();
             }
-            HttpResponse::Ok().json(json!({
-                "status": "started",
-                "message": "Recording started successfully"
-            }))
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "started",
+                    "message": "Recording started successfully"
+                })),
+            )
+                .into_response()
         }
         Err(e) => {
             let error_message = format!("Error checking process status: {:?}", e);
             error!("{}", error_message);
             {
-                let mut process_guard = data.process.lock().unwrap();
+                let mut process_guard = data.process().lock().unwrap();
                 *process_guard = None;
             }
-            HttpResponse::InternalServerError().json(json!({
-                "status": "error",
-                "message": error_message
-            }))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "status": "error",
+                    "message": error_message
+                })),
+            )
+                .into_response()
         }
     }
 }
 
 /// Stop recording (system mode)
-pub async fn stop(data: web::Data<AppState>) -> impl Responder {
+pub async fn stop<T: RecordingContext>(State(data): State<Arc<T>>) -> impl IntoResponse {
     let mut command = Command::new("sudo");
     command.arg("systemctl").arg("stop").arg("recorder");
 
     match command.status() {
         Ok(status) if status.success() => {
             {
-                let mut process_guard = data.process.lock().unwrap();
+                let mut process_guard = data.process().lock().unwrap();
                 *process_guard = None;
             }
             info!("Recorder service stopped");
-            HttpResponse::Ok().json(json!({
-                "status": "stopped",
-                "message": "Recording stopped successfully"
-            }))
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "stopped",
+                    "message": "Recording stopped successfully"
+                })),
+            )
+                .into_response()
         }
         Ok(status) => {
             let error_message = format!("Failed to stop recorder service: {:?}", status);
             error!("{}", error_message);
-            HttpResponse::InternalServerError().body(error_message)
+            (StatusCode::INTERNAL_SERVER_ERROR, error_message).into_response()
         }
         Err(e) => {
             let error_message = format!("Failed to run systemctl stop recorder: {:?}", e);
             error!("{}", error_message);
-            HttpResponse::InternalServerError().body(error_message)
+            (StatusCode::INTERNAL_SERVER_ERROR, error_message).into_response()
         }
     }
 }
 
 /// Stop recording (user mode)
-pub async fn user_mode_stop(data: web::Data<AppState>) -> impl Responder {
+pub async fn user_mode_stop<T: RecordingContext>(State(data): State<Arc<T>>) -> impl IntoResponse {
     let pid_file = Path::new("/var/run/edgefirst-recorder.pid");
     let process = {
-        let mut process_guard = data.process.lock().unwrap();
+        let mut process_guard = data.process().lock().unwrap();
         process_guard.take()
     };
 
@@ -385,14 +417,15 @@ pub async fn user_mode_stop(data: web::Data<AppState>) -> impl Responder {
     std::thread::sleep(std::time::Duration::from_secs(2));
 
     debug!("All recorder processes stopped successfully");
-    HttpResponse::Ok().json(json!({
+    Json(json!({
         "status": "stopped",
         "message": "Recording stopped successfully"
     }))
+    .into_response()
 }
 
 /// Delete a file
-pub async fn delete(params: web::Json<DeleteParams>) -> impl Responder {
+pub async fn delete(Json(params): Json<DeleteParams>) -> impl IntoResponse {
     let file_path = format!("{}/{}", params.directory, params.file);
     debug!("Attempting to delete file: {}", file_path);
 
@@ -405,29 +438,33 @@ pub async fn delete(params: web::Json<DeleteParams>) -> impl Responder {
         match command.status() {
             Ok(status) if status.success() => {
                 info!("File deleted successfully");
-                HttpResponse::Ok().json(json!({
-                    "status": "removed",
-                    "message": "File deleted successfully"
-                }))
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "status": "removed",
+                        "message": "File deleted successfully"
+                    })),
+                )
+                    .into_response()
             }
             Ok(status) => {
                 let error_message = format!("Failed to delete file: {:?}", status);
                 error!("{}", error_message);
-                HttpResponse::InternalServerError().body(error_message)
+                (StatusCode::INTERNAL_SERVER_ERROR, error_message).into_response()
             }
             Err(e) => {
                 let error_message = format!("Failed to run rm -rf: {:?}", e);
                 error!("{}", error_message);
-                HttpResponse::InternalServerError().body(error_message)
+                (StatusCode::INTERNAL_SERVER_ERROR, error_message).into_response()
             }
         }
     } else {
-        HttpResponse::NotFound().body("File not found")
+        (StatusCode::NOT_FOUND, "File not found").into_response()
     }
 }
 
 /// Get current recording filename
-pub async fn get_current_recording() -> impl Responder {
+pub async fn get_current_recording() -> impl IntoResponse {
     let status = Command::new("systemctl")
         .arg("status")
         .arg("recorder")
@@ -437,22 +474,34 @@ pub async fn get_current_recording() -> impl Responder {
         Ok(output) => {
             let status_str = String::from_utf8_lossy(&output.stdout);
             match extract_recording_filename(&status_str) {
-                Some(filename) => HttpResponse::Ok().json(json!({
-                    "status": "recording",
-                    "filename": filename
-                })),
-                None => HttpResponse::Ok().json(json!({
-                    "status": "not_recording",
-                    "filename": null
-                })),
+                Some(filename) => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "status": "recording",
+                        "filename": filename
+                    })),
+                )
+                    .into_response(),
+                None => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "status": "not_recording",
+                        "filename": null
+                    })),
+                )
+                    .into_response(),
             }
         }
         Err(e) => {
             error!("Error checking recorder status: {}", e);
-            HttpResponse::InternalServerError().json(json!({
-                "status": "error",
-                "message": format!("Error checking recorder status: {}", e)
-            }))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "status": "error",
+                    "message": format!("Error checking recorder status: {}", e)
+                })),
+            )
+                .into_response()
         }
     }
 }
@@ -462,16 +511,20 @@ pub async fn get_current_recording() -> impl Responder {
 // ============================================================================
 
 /// Start replay
-pub async fn start_replay(params: web::Json<PlaybackParams>) -> impl Responder {
+pub async fn start_replay(Json(params): Json<PlaybackParams>) -> impl IntoResponse {
     let file_path = format!("{}/{}", params.directory, params.file);
     debug!("Attempting to play MCAP file: {}", file_path);
 
     if !Path::new(&file_path).exists() {
-        return HttpResponse::NotFound().json(PlaybackResponse {
-            status: "error".to_string(),
-            message: "File not found".to_string(),
-            current_file: None,
-        });
+        return (
+            StatusCode::NOT_FOUND,
+            Json(PlaybackResponse {
+                status: "error".to_string(),
+                message: "File not found".to_string(),
+                current_file: None,
+            }),
+        )
+            .into_response();
     }
 
     let status = Command::new("systemctl")
@@ -483,20 +536,28 @@ pub async fn start_replay(params: web::Json<PlaybackParams>) -> impl Responder {
         Ok(output) => {
             let status_str = String::from_utf8_lossy(&output.stdout).trim().to_string();
             if status_str == "active" {
-                return HttpResponse::BadRequest().json(PlaybackResponse {
-                    status: "error".to_string(),
-                    message: "Replay service is already running".to_string(),
-                    current_file: None,
-                });
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(PlaybackResponse {
+                        status: "error".to_string(),
+                        message: "Replay service is already running".to_string(),
+                        current_file: None,
+                    }),
+                )
+                    .into_response();
             }
         }
         Err(e) => {
             error!("Error checking replay service status: {}", e);
-            return HttpResponse::InternalServerError().json(PlaybackResponse {
-                status: "error".to_string(),
-                message: format!("Error checking service status: {}", e),
-                current_file: None,
-            });
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(PlaybackResponse {
+                    status: "error".to_string(),
+                    message: format!("Error checking service status: {}", e),
+                    current_file: None,
+                }),
+            )
+                .into_response();
         }
     }
 
@@ -514,33 +575,45 @@ pub async fn start_replay(params: web::Json<PlaybackParams>) -> impl Responder {
                 "Replay service started successfully with file: {}",
                 file_path
             );
-            HttpResponse::Ok().json(PlaybackResponse {
-                status: "success".to_string(),
-                message: "Replay service started successfully".to_string(),
-                current_file: Some(params.file.clone()),
-            })
+            (
+                StatusCode::OK,
+                Json(PlaybackResponse {
+                    status: "success".to_string(),
+                    message: "Replay service started successfully".to_string(),
+                    current_file: Some(params.file.clone()),
+                }),
+            )
+                .into_response()
         }
         Ok(status) => {
             error!("Failed to start replay service: {:?}", status);
-            HttpResponse::InternalServerError().json(PlaybackResponse {
-                status: "error".to_string(),
-                message: "Failed to start replay service".to_string(),
-                current_file: None,
-            })
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(PlaybackResponse {
+                    status: "error".to_string(),
+                    message: "Failed to start replay service".to_string(),
+                    current_file: None,
+                }),
+            )
+                .into_response()
         }
         Err(e) => {
             error!("Error starting replay service: {}", e);
-            HttpResponse::InternalServerError().json(PlaybackResponse {
-                status: "error".to_string(),
-                message: format!("Error starting replay service: {}", e),
-                current_file: None,
-            })
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(PlaybackResponse {
+                    status: "error".to_string(),
+                    message: format!("Error starting replay service: {}", e),
+                    current_file: None,
+                }),
+            )
+                .into_response()
         }
     }
 }
 
 /// Stop replay
-pub async fn stop_replay() -> impl Responder {
+pub async fn stop_replay() -> impl IntoResponse {
     let result = Command::new("sudo")
         .arg("systemctl")
         .arg("stop")
@@ -550,40 +623,56 @@ pub async fn stop_replay() -> impl Responder {
     match result {
         Ok(status) if status.success() => {
             info!("Replay service stopped successfully");
-            HttpResponse::Ok().json(PlaybackResponse {
-                status: "success".to_string(),
-                message: "Replay service stopped successfully".to_string(),
-                current_file: None,
-            })
+            (
+                StatusCode::OK,
+                Json(PlaybackResponse {
+                    status: "success".to_string(),
+                    message: "Replay service stopped successfully".to_string(),
+                    current_file: None,
+                }),
+            )
+                .into_response()
         }
         Ok(status) => {
             error!("Failed to stop replay service: {:?}", status);
-            HttpResponse::InternalServerError().json(PlaybackResponse {
-                status: "error".to_string(),
-                message: "Failed to stop replay service".to_string(),
-                current_file: None,
-            })
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(PlaybackResponse {
+                    status: "error".to_string(),
+                    message: "Failed to stop replay service".to_string(),
+                    current_file: None,
+                }),
+            )
+                .into_response()
         }
         Err(e) => {
             error!("Error stopping replay service: {}", e);
-            HttpResponse::InternalServerError().json(PlaybackResponse {
-                status: "error".to_string(),
-                message: format!("Error stopping replay service: {}", e),
-                current_file: None,
-            })
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(PlaybackResponse {
+                    status: "error".to_string(),
+                    message: format!("Error stopping replay service: {}", e),
+                    current_file: None,
+                }),
+            )
+                .into_response()
         }
     }
 }
 
 /// Check replay status (user mode)
-pub async fn user_mode_check_replay_status() -> impl Responder {
+pub async fn user_mode_check_replay_status() -> impl IntoResponse {
     let pid_file = Path::new("/var/run/replay.pid");
 
     if !pid_file.exists() {
-        return HttpResponse::Ok().json(json!({
-            "status": "not_running",
-            "message": "Replay is not running"
-        }));
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "status": "not_running",
+                "message": "Replay is not running"
+            })),
+        )
+            .into_response();
     }
 
     match std::fs::read_to_string(pid_file) {
@@ -594,40 +683,60 @@ pub async fn user_mode_check_replay_status() -> impl Responder {
                 match status {
                     Ok(output) => {
                         if output.status.success() {
-                            HttpResponse::Ok().json(json!({
-                                "status": "running",
-                                "message": "Replay is running"
-                            }))
+                            (
+                                StatusCode::OK,
+                                Json(json!({
+                                    "status": "running",
+                                    "message": "Replay is running"
+                                })),
+                            )
+                                .into_response()
                         } else {
                             // Process exists but not running, clean up PID file
                             let _ = std::fs::remove_file(pid_file);
-                            HttpResponse::Ok().json(json!({
-                                "status": "not_running",
-                                "message": "Replay is not running"
-                            }))
+                            (
+                                StatusCode::OK,
+                                Json(json!({
+                                    "status": "not_running",
+                                    "message": "Replay is not running"
+                                })),
+                            )
+                                .into_response()
                         }
                     }
-                    Err(e) => HttpResponse::InternalServerError().json(json!({
-                        "status": "error",
-                        "message": format!("Error checking process status: {:?}", e)
-                    })),
+                    Err(e) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({
+                            "status": "error",
+                            "message": format!("Error checking process status: {:?}", e)
+                        })),
+                    )
+                        .into_response(),
                 }
             } else {
-                HttpResponse::InternalServerError().json(json!({
-                    "status": "error",
-                    "message": "Invalid PID in PID file"
-                }))
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({
+                        "status": "error",
+                        "message": "Invalid PID in PID file"
+                    })),
+                )
+                    .into_response()
             }
         }
-        Err(e) => HttpResponse::InternalServerError().json(json!({
-            "status": "error",
-            "message": format!("Error reading PID file: {:?}", e)
-        })),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "status": "error",
+                "message": format!("Error reading PID file: {:?}", e)
+            })),
+        )
+            .into_response(),
     }
 }
 
 /// Check replay status (system mode)
-pub async fn check_replay_status() -> impl Responder {
+pub async fn check_replay_status() -> impl IntoResponse {
     let service_status = Command::new("systemctl")
         .arg("is-active")
         .arg("replay")
@@ -638,18 +747,21 @@ pub async fn check_replay_status() -> impl Responder {
             let status = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
             if status == "active" {
-                HttpResponse::Ok().body("Replay is running")
+                "Replay is running".into_response()
             } else {
-                HttpResponse::Ok().body("Replay is not running")
+                "Replay is not running".into_response()
             }
         }
-        Err(e) => HttpResponse::InternalServerError()
-            .body(format!("Error checking service status: {:?}", e)),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Error checking service status: {:?}", e),
+        )
+            .into_response(),
     }
 }
 
 /// Isolate system to a target
-pub async fn isolate_system(params: web::Json<IsolateParams>) -> impl Responder {
+pub async fn isolate_system(Json(params): Json<IsolateParams>) -> impl IntoResponse {
     let target = format!("{}.target", params.target);
     debug!("Attempting to isolate system to target: {}", target);
 
@@ -662,24 +774,36 @@ pub async fn isolate_system(params: web::Json<IsolateParams>) -> impl Responder 
     match result {
         Ok(status) if status.success() => {
             info!("System successfully isolated to {}", target);
-            HttpResponse::Ok().json(json!({
-                "status": "success",
-                "message": format!("System isolated to {}", target)
-            }))
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "status": "success",
+                    "message": format!("System isolated to {}", target)
+                })),
+            )
+                .into_response()
         }
         Ok(status) => {
             error!("Failed to isolate system: {:?}", status);
-            HttpResponse::InternalServerError().json(json!({
-                "status": "error",
-                "message": format!("Failed to isolate system to {}", target)
-            }))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "status": "error",
+                    "message": format!("Failed to isolate system to {}", target)
+                })),
+            )
+                .into_response()
         }
         Err(e) => {
             error!("Error isolating system: {}", e);
-            HttpResponse::InternalServerError().json(json!({
-                "status": "error",
-                "message": format!("Error isolating system: {}", e)
-            }))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "status": "error",
+                    "message": format!("Error isolating system: {}", e)
+                })),
+            )
+                .into_response()
         }
     }
 }

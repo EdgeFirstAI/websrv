@@ -11,29 +11,29 @@
 
 mod ssl;
 
-use actix_files as fs;
-use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer, Responder, Result};
-use actix_web_actors::ws;
-use actix_web_lab::middleware::RedirectHttps;
+use axum::extract::State;
+use axum::http::{HeaderMap, Uri};
+use axum::response::{IntoResponse, Redirect};
+use axum::routing::{get, post};
+use axum::Router;
+use axum_server::tls_rustls::RustlsConfig;
 use clap::Parser;
-use log::{debug, error, info};
-use openssl::ssl::{SslAcceptor, SslMethod};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicI64;
-use std::sync::mpsc::channel;
+use listenfd::ListenFd;
+use log::{error, info};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tokio::runtime::Handle;
+use tower_http::services::ServeDir;
 
-// Import from the library
 use edgefirst_websrv::{
     args::{Args, WebUISettings},
     auth::{auth_login, auth_logout, auth_status, AuthContext},
-    config::{get_config, get_upload_credentials, read_storage_directory, set_config},
-    mcap::{mcap_downloader, McapContext, WebSocketSession},
+    config::{get_config, read_storage_directory, set_config},
+    mcap::{list_mcap_files, mcap_downloader, McapContext},
     recording::{
-        check_recorder_status, check_replay_status, delete, get_current_recording, isolate_system,
-        start, start_replay, stop, stop_replay, user_mode_check_recorder_status,
-        user_mode_check_replay_status, user_mode_start, user_mode_stop, AppState, RecordingContext,
+        check_recorder_status, check_replay_status, delete as recording_delete,
+        get_current_recording, isolate_system, start, start_replay, stop, stop_replay,
+        user_mode_check_recorder_status, user_mode_check_replay_status, user_mode_start,
+        user_mode_stop, RecordingContext,
     },
     services::{get_all_services, update_service},
     shutdown::ShutdownCoordinator,
@@ -44,8 +44,7 @@ use edgefirst_websrv::{
         UploadContext, UploadManager,
     },
     websocket::{
-        websocket_handler_errors, websocket_handler_high_priority, websocket_handler_low_priority,
-        MessageStream, WebSocketContext,
+        websocket_handler, websocket_handler_errors, Broadcast, MessageStream, WebSocketContext,
     },
 };
 
@@ -57,14 +56,13 @@ use edgefirst_websrv::{
 pub struct ServerContext {
     pub args: Args,
     pub err_stream: Arc<MessageStream>,
-    pub err_count: AtomicI64,
     pub upload_manager: Arc<UploadManager>,
     pub upload_progress_stream: Arc<MessageStream>,
     pub zenoh_session: zenoh::Session,
     pub shutdown_coordinator: ShutdownCoordinator,
+    pub process: Mutex<Option<std::process::Child>>,
 }
 
-// Implement all required traits for ServerContext
 impl AuthContext for ServerContext {
     fn upload_manager(&self) -> &Arc<UploadManager> {
         &self.upload_manager
@@ -97,6 +95,10 @@ impl RecordingContext for ServerContext {
     fn storage_path(&self) -> &str {
         &self.args.storage_path
     }
+
+    fn process(&self) -> &Mutex<Option<std::process::Child>> {
+        &self.process
+    }
 }
 
 impl McapContext for ServerContext {
@@ -114,10 +116,6 @@ impl WebSocketContext for ServerContext {
         &self.err_stream
     }
 
-    fn err_count(&self) -> &AtomicI64 {
-        &self.err_count
-    }
-
     fn zenoh_session(&self) -> &zenoh::Session {
         &self.zenoh_session
     }
@@ -128,117 +126,218 @@ impl WebSocketContext for ServerContext {
 }
 
 // ============================================================================
-// Page Handlers
+// Upload WebSocket Handler
 // ============================================================================
 
-async fn index(data: web::Data<ServerContext>) -> Result<fs::NamedFile> {
-    let base_path = PathBuf::from(&data.args.docroot);
-
-    let data_path = if base_path.is_dir() {
-        base_path.join("index.html")
-    } else {
-        base_path
-    };
-
-    debug!("{:?}", data_path);
-
-    match fs::NamedFile::open(data_path) {
-        Ok(file) => Ok(file),
-        Err(_) => {
-            error!("Index file not found");
-            Err(actix_web::error::ErrorNotFound("Index file not found"))
+/// WebSocket handler for `/ws/uploads` — forwards from upload_progress_stream.
+async fn websocket_handler_uploads(
+    ws: yawc::IncomingUpgrade,
+    State(ctx): State<Arc<ServerContext>>,
+) -> impl IntoResponse {
+    let options = yawc::Options::default().with_compression_level(yawc::CompressionLevel::fast());
+    let (response, ws_future) = match ws.upgrade(options) {
+        Ok(pair) => pair,
+        Err(e) => {
+            log::error!("WebSocket upgrade failed for /ws/uploads: {e}");
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("WebSocket upgrade failed: {e}"),
+            )
+                .into_response();
         }
-    }
-}
-
-async fn custom_file_handler(
-    req: HttpRequest,
-    data: web::Data<ServerContext>,
-) -> actix_web::Result<fs::NamedFile> {
-    let path: String = req.match_info().query("file").parse().unwrap();
-    let base_path = Path::new(&data.args.docroot);
-
-    let file_path = base_path.join(&path);
-
-    if file_path.exists() && file_path.is_file() {
-        return Ok(fs::NamedFile::open(file_path)?);
-    }
-
-    let html_path = base_path.join(format!("{}.html", path));
-    if html_path.exists() && html_path.is_file() {
-        return Ok(fs::NamedFile::open(html_path)?);
-    }
-
-    Err(actix_web::error::ErrorNotFound(format!(
-        "File {:?} not found",
-        path
-    )))
-}
-
-async fn serve_settings_page(data: web::Data<ServerContext>) -> Result<fs::NamedFile> {
-    let base_path = PathBuf::from(&data.args.docroot);
-
-    let file_path = if base_path.is_dir() {
-        base_path.join("config/settings.html")
-    } else {
-        base_path
     };
-    debug!("{:?}", file_path);
-    Ok(fs::NamedFile::open(file_path)?)
-}
+    let stream = ctx.upload_progress_stream.clone();
 
-async fn serve_config_page(
-    data: web::Data<ServerContext>,
-    path: web::Path<String>,
-) -> Result<fs::NamedFile> {
-    let service = path.into_inner();
-    let base_path = PathBuf::from(&data.args.docroot);
+    tokio::spawn(async move {
+        let Ok(ws) = ws_future.await else { return };
+        let (mut sink, mut incoming) = futures::StreamExt::split(ws);
+        let mut rx = stream.subscribe();
+        let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        ping_interval.tick().await;
 
-    let file_path = if base_path.is_dir() {
-        base_path.join(format!("config/{}.html", service))
-    } else {
-        base_path
-    };
-    debug!("{:?}", file_path);
-    Ok(fs::NamedFile::open(file_path)?)
-}
+        loop {
+            tokio::select! {
+                msg = rx.recv() => {
+                    match msg {
+                        Ok(Broadcast::Binary(data)) => {
+                            match tokio::time::timeout(std::time::Duration::from_secs(5), futures::SinkExt::send(&mut sink, yawc::frame::Frame::binary(data))).await {
+                                Ok(Ok(())) => {}
+                                _ => break,
+                            }
+                        }
+                        Ok(Broadcast::Text(text)) => {
+                            match tokio::time::timeout(std::time::Duration::from_secs(5), futures::SinkExt::send(&mut sink, yawc::frame::Frame::text(text))).await {
+                                Ok(Ok(())) => {}
+                                _ => break,
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(_) => break,
+                    }
+                }
+                frame = futures::StreamExt::next(&mut incoming) => {
+                    match frame {
+                        Some(frame) if frame.opcode() == yawc::frame::OpCode::Close => break,
+                        None => break,
+                        _ => {}
+                    }
+                }
+                _ = ping_interval.tick() => {
+                    let ping = yawc::frame::Frame::ping(&[][..]);
+                    if tokio::time::timeout(std::time::Duration::from_secs(5), futures::SinkExt::send(&mut sink, ping)).await.is_err() { break; }
+                }
+            }
+        }
+    });
 
-async fn user_mode_get_config(data: web::Data<ServerContext>) -> HttpResponse {
-    HttpResponse::Ok().json(WebUISettings::from(data.args.clone()))
+    response.into_response()
 }
 
 // ============================================================================
-// MCAP WebSocket Handler
+// User Mode Config Handler
 // ============================================================================
 
-async fn mcap_websocket_handler(req: HttpRequest, stream: web::Payload) -> impl Responder {
-    let data = req.app_data::<web::Data<ServerContext>>().unwrap().clone();
-    ws::start(
-        WebSocketSession {
-            context: Some(data),
-        },
-        &req,
-        stream,
-    )
+/// GET /config/:service/details (user mode) — returns WebUISettings as JSON.
+async fn user_mode_get_config(State(ctx): State<Arc<ServerContext>>) -> impl IntoResponse {
+    axum::Json(WebUISettings::from(ctx.args.clone()))
 }
 
-/// WebSocket handler for upload progress updates
-async fn upload_websocket_handler(
-    req: HttpRequest,
-    stream: web::Payload,
-    data: web::Data<ServerContext>,
-) -> Result<HttpResponse, actix_web::Error> {
-    use edgefirst_websrv::websocket::MyWebSocket;
+// ============================================================================
+// HTTP → HTTPS Redirect
+// ============================================================================
 
-    ws::start(
-        MyWebSocket::without_zenoh(data.upload_progress_stream.clone(), 16),
-        &req,
-        stream,
-    )
-    .map_err(|e| {
-        error!("Upload WebSocket connection failed: {:?}", e);
-        e
-    })
+async fn redirect_to_https(headers: HeaderMap, uri: Uri) -> Redirect {
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost");
+    let https_uri = format!("https://{host}{uri}");
+    Redirect::permanent(&https_uri)
+}
+
+// ============================================================================
+// Router Construction
+// ============================================================================
+
+/// Routes shared between system mode and user mode.
+fn common_routes(ctx: Arc<ServerContext>) -> Router {
+    Router::new()
+        // Storage
+        .route(
+            "/api/storage",
+            get(check_storage_availability::<ServerContext>),
+        )
+        // Recordings: list, delete, download
+        .route(
+            "/api/recordings",
+            get(list_mcap_files::<ServerContext>).delete(recording_delete),
+        )
+        .route("/api/recordings/download/{*path}", get(mcap_downloader))
+        // Replay
+        .route("/api/replay", post(start_replay))
+        .route("/api/replay/stop", post(stop_replay))
+        .route("/api/replay/config", post(isolate_system))
+        // Auth
+        .route("/api/auth/login", post(auth_login::<ServerContext>))
+        .route("/api/auth/status", get(auth_status::<ServerContext>))
+        .route("/api/auth/logout", post(auth_logout::<ServerContext>))
+        // Uploads
+        .route(
+            "/api/uploads",
+            post(start_upload_handler::<ServerContext>).get(list_uploads_handler::<ServerContext>),
+        )
+        .route(
+            "/api/uploads/{id}",
+            get(get_upload_handler::<ServerContext>).delete(cancel_upload_handler::<ServerContext>),
+        )
+        // Studio
+        .route(
+            "/api/studio/projects",
+            get(list_studio_projects::<ServerContext>),
+        )
+        .route(
+            "/api/studio/projects/{id}/labels",
+            get(list_project_labels::<ServerContext>),
+        )
+        // Service config: GET reads, POST writes
+        .route("/api/config/{service}", post(set_config))
+        // Services: status and enable/disable
+        .route("/api/services/status", post(get_all_services))
+        .route("/api/services/update", post(update_service))
+        // WebSocket: error stream and upload progress
+        .route(
+            "/api/ws/dropped",
+            get(websocket_handler_errors::<ServerContext>),
+        )
+        .route("/api/ws/uploads", get(websocket_handler_uploads))
+        // WebSocket: Zenoh real-time topic bridge
+        .route("/api/rt/{*topic}", get(websocket_handler::<ServerContext>))
+        .with_state(ctx)
+}
+
+/// Routes for system mode only.
+fn system_routes(ctx: Arc<ServerContext>) -> Router {
+    Router::new()
+        .route("/api/recorder/start", post(start::<ServerContext>))
+        .route("/api/recorder/stop", post(stop::<ServerContext>))
+        .route("/api/recorder/status", get(check_recorder_status))
+        .route("/api/recorder/current", get(get_current_recording))
+        .route("/api/replay/status", get(check_replay_status))
+        // System mode: config details returns raw service config
+        .route("/api/config/{service}", get(get_config))
+        .with_state(ctx)
+}
+
+/// Routes for user mode only.
+fn user_routes(ctx: Arc<ServerContext>) -> Router {
+    Router::new()
+        .route(
+            "/api/recorder/start",
+            post(user_mode_start::<ServerContext>),
+        )
+        .route("/api/recorder/stop", post(user_mode_stop::<ServerContext>))
+        .route("/api/recorder/status", get(user_mode_check_recorder_status))
+        .route("/api/recorder/current", get(get_current_recording))
+        .route("/api/replay/status", get(user_mode_check_replay_status))
+        // User mode: config details returns WebUISettings JSON
+        .route("/api/config/{service}", get(user_mode_get_config))
+        .with_state(ctx)
+}
+
+/// Assemble the full router for system or user mode, with ServeDir fallback.
+fn build_router(ctx: Arc<ServerContext>, is_system: bool) -> Router {
+    let docroot = ctx.args.docroot.clone();
+
+    let mut router = common_routes(ctx.clone());
+    if is_system {
+        router = router.merge(system_routes(ctx));
+    } else {
+        router = router.merge(user_routes(ctx));
+    }
+
+    // Static file fallback: serve the webui from docroot.
+    // When a file isn't found, try appending .html (e.g. /camera -> camera.html).
+    let html_fallback = {
+        let docroot = docroot.clone();
+        axum::routing::any(move |uri: Uri| {
+            let docroot = docroot.clone();
+            async move {
+                let path = uri.path().trim_start_matches('/');
+                let html_path = PathBuf::from(&docroot).join(format!("{path}.html"));
+                if html_path.is_file() {
+                    let body = tokio::fs::read(&html_path).await.unwrap_or_default();
+                    axum::http::Response::builder()
+                        .header("content-type", "text/html")
+                        .body(axum::body::Body::from(body))
+                        .unwrap()
+                        .into_response()
+                } else {
+                    axum::http::StatusCode::NOT_FOUND.into_response()
+                }
+            }
+        })
+    };
+    router.fallback_service(ServeDir::new(docroot).fallback(html_fallback))
 }
 
 // ============================================================================
@@ -246,33 +345,22 @@ async fn upload_websocket_handler(
 // ============================================================================
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
-async fn main() -> std::io::Result<()> {
+async fn main() -> anyhow::Result<()> {
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("Failed to install default CryptoProvider");
+
     let args = Args::parse();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let handle = Handle::current();
-
-    // Load or generate SSL certificate
-    let cert_result = ssl::load_or_generate_certificate(&args)
-        .expect("Failed to load or generate SSL certificate");
+    // Load or generate TLS certificate
+    let cert_result = ssl::load_or_generate_certificate(&args)?;
     info!("Using {} certificate", cert_result.source);
-
-    let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls()).unwrap();
-    builder
-        .set_private_key(&cert_result.private_key)
-        .expect("Failed to set private key");
-    builder
-        .set_certificate(&cert_result.certificate)
-        .expect("Failed to set certificate");
 
     let hostname = ssl::get_device_hostname();
     info!("To visualize navigate to https://{} ", hostname);
-    let state = web::Data::new(AppState {
-        process: Mutex::new(None),
-    });
 
-    // Initialize UploadManager
-    // In system mode, read storage path from /etc/default/recorder
+    // Determine storage path (system mode reads from /etc/default/recorder)
     let storage_path = if args.system {
         match read_storage_directory() {
             Ok(dir) => PathBuf::from(dir),
@@ -284,11 +372,11 @@ async fn main() -> std::io::Result<()> {
     } else {
         PathBuf::from(&args.storage_path)
     };
-    let (upload_tx, _) = channel();
-    let upload_broadcaster = Arc::new(MessageStream::new(upload_tx, Box::new(|| {}), false));
+
+    // Initialize upload progress broadcaster and manager
+    let upload_broadcaster = Arc::new(MessageStream::new());
     let upload_manager = Arc::new(UploadManager::new(storage_path, upload_broadcaster.clone()));
 
-    // Initialize upload manager (scan for incomplete uploads from previous session)
     if let Err(e) = upload_manager.initialize().await {
         error!("Failed to initialize upload manager: {}", e);
     }
@@ -302,272 +390,111 @@ async fn main() -> std::io::Result<()> {
     // Create shutdown coordinator for graceful shutdown
     let shutdown_coordinator = ShutdownCoordinator::new();
 
-    // Clone session for cleanup after server stops
-    let zenoh_session_cleanup = zenoh_session.clone();
+    // Build server context
+    let ctx = Arc::new(ServerContext {
+        args: args.clone(),
+        err_stream: Arc::new(MessageStream::new()),
+        upload_manager: upload_manager.clone(),
+        upload_progress_stream: upload_broadcaster,
+        zenoh_session: zenoh_session.clone(),
+        shutdown_coordinator: shutdown_coordinator.clone(),
+        process: Mutex::new(None),
+    });
 
-    // Binding to [::] will also bind to 0.0.0.0
-    // Use configurable ports (defaults: 443 HTTPS, 80 HTTP)
+    // Build TLS config from PEM bytes.
+    // Force HTTP/1.1 only — WebSocket upgrade requires HTTP/1.1 and does not
+    // work with the HTTP/2 CONNECT mechanism used by browsers.
+    let tls_config = {
+        let certs =
+            rustls_pemfile::certs(&mut &cert_result.cert_pem[..]).collect::<Result<Vec<_>, _>>()?;
+        let key = rustls_pemfile::private_key(&mut &cert_result.key_pem[..])?
+            .ok_or_else(|| anyhow::anyhow!("No private key found in TLS key PEM data"))?;
+        let mut config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)?;
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        RustlsConfig::from_config(Arc::new(config))
+    };
+
     let https_port = args.https_port;
     let http_port = args.http_port;
-    let addrs: Vec<std::net::SocketAddr> = vec![
-        format!("[::]:{}", https_port).parse().unwrap(),
-        format!("0.0.0.0:{}", https_port).parse().unwrap(),
-    ];
-    let addrs_http: Vec<std::net::SocketAddr> = vec![
-        format!("[::]:{}", http_port).parse().unwrap(),
-        format!("0.0.0.0:{}", http_port).parse().unwrap(),
-    ];
+
+    // Build the application router
+    let is_system = args.system;
+    let app = build_router(ctx, is_system);
+
+    // Check for systemd socket activation (fd 0 = HTTP, fd 1 = HTTPS)
+    let mut listenfd = ListenFd::from_env();
+
+    // HTTP listener: socket activation fd 0, or direct bind
+    let http_listener = match listenfd.take_tcp_listener(0)? {
+        Some(listener) => {
+            listener.set_nonblocking(true)?;
+            info!("Using socket-activated HTTP listener");
+            tokio::net::TcpListener::from_std(listener)?
+        }
+        None => {
+            let addr: std::net::SocketAddr = format!("[::]:{}", http_port).parse()?;
+            tokio::net::TcpListener::bind(addr).await?
+        }
+    };
+
+    // HTTPS listener: socket activation fd 1, or direct bind
+    let https_server = match listenfd.take_tcp_listener(1)? {
+        Some(listener) => {
+            listener.set_nonblocking(true)?;
+            info!("Using socket-activated HTTPS listener");
+            axum_server::from_tcp_rustls(listener, tls_config)
+        }
+        None => {
+            let addr: std::net::SocketAddr = format!("[::]:{}", https_port).parse()?;
+            axum_server::bind_rustls(addr, tls_config)
+        }
+    };
+
     info!(
         "Listening on HTTPS port {} and HTTP port {}",
         https_port, http_port
     );
 
-    // Clone for cleanup after server stops
-    let upload_manager_cleanup = upload_manager.clone();
-    let shutdown_coord_for_signal = shutdown_coordinator.clone();
-
-    let server =
-        HttpServer::new(move || {
-            let (tx, _) = channel();
-
-            let server_ctx = ServerContext {
-                args: args.clone(),
-                err_stream: Arc::new(MessageStream::new(tx, Box::new(|| {}), false)),
-                err_count: AtomicI64::new(0),
-                upload_manager: upload_manager.clone(),
-                upload_progress_stream: upload_broadcaster.clone(),
-                zenoh_session: zenoh_session.clone(),
-                shutdown_coordinator: shutdown_coordinator.clone(),
-            };
-            let _handle = handle.clone();
-
-            if args.system {
-                App::new()
-                    .wrap(RedirectHttps::default())
-                    .app_data(state.clone())
-                    .app_data(web::Data::new(server_ctx))
-                    .service(
-                        web::scope("")
-                            .route("/", web::get().to(index))
-                            .route("/settings", web::get().to(serve_settings_page))
-                            .route(
-                                "/check-storage",
-                                web::get().to(check_storage_availability::<ServerContext>),
-                            )
-                            .route("/start", web::post().to(start))
-                            .route("/stop", web::post().to(stop))
-                            .route("/delete", web::post().to(delete))
-                            .route("/replay", web::post().to(start_replay))
-                            .route("/replay-end", web::post().to(stop_replay))
-                            .route("/replay-status", web::get().to(check_replay_status))
-                            .route("/live-run", web::post().to(isolate_system))
-                            .route("/download/{file:.*}", web::get().to(mcap_downloader))
-                            .route(
-                                "/get-upload-credentials",
-                                web::get().to(get_upload_credentials),
-                            )
-                            // Authentication API routes
-                            .route(
-                                "/api/auth/login",
-                                web::post().to(auth_login::<ServerContext>),
-                            )
-                            .route(
-                                "/api/auth/status",
-                                web::get().to(auth_status::<ServerContext>),
-                            )
-                            .route(
-                                "/api/auth/logout",
-                                web::post().to(auth_logout::<ServerContext>),
-                            )
-                            // Upload API routes
-                            .route(
-                                "/api/uploads",
-                                web::post().to(start_upload_handler::<ServerContext>),
-                            )
-                            .route(
-                                "/api/uploads",
-                                web::get().to(list_uploads_handler::<ServerContext>),
-                            )
-                            .route(
-                                "/api/uploads/{id}",
-                                web::get().to(get_upload_handler::<ServerContext>),
-                            )
-                            .route(
-                                "/api/uploads/{id}",
-                                web::delete().to(cancel_upload_handler::<ServerContext>),
-                            )
-                            // Studio API routes
-                            .route(
-                                "/api/studio/projects",
-                                web::get().to(list_studio_projects::<ServerContext>),
-                            )
-                            .route(
-                                "/api/studio/projects/{id}/labels",
-                                web::get().to(list_project_labels::<ServerContext>),
-                            )
-                            .route("/recorder-status", web::get().to(check_recorder_status))
-                            .route("/current-recording", web::get().to(get_current_recording))
-                            .service(
-                                web::resource("/ws/dropped").route(
-                                    web::get().to(websocket_handler_errors::<ServerContext>),
-                                ),
-                            )
-                            .service(web::resource("/rt/detect/mask").route(
-                                web::get().to(websocket_handler_high_priority::<ServerContext>),
-                            ))
-                            .service(web::resource("/rt/{tail:.*}").route(
-                                web::get().to(websocket_handler_low_priority::<ServerContext>),
-                            ))
-                            .route("/config/service/status", web::post().to(get_all_services))
-                            .route("/config/services/update", web::post().to(update_service))
-                            .service(
-                                web::resource("/mcap/")
-                                    .route(web::get().to(mcap_websocket_handler)),
-                            )
-                            .service(
-                                web::resource("/ws/uploads")
-                                    .route(web::get().to(upload_websocket_handler)),
-                            )
-                            .route("/config/{service}", web::get().to(serve_config_page))
-                            .route("/config/{service}/details", web::get().to(get_config))
-                            .route("/config/{service}", web::post().to(set_config))
-                            .route("/{file:.*}", web::get().to(custom_file_handler)),
-                    )
-            } else {
-                App::new()
-                    .wrap(RedirectHttps::default())
-                    .app_data(state.clone())
-                    .app_data(web::Data::new(server_ctx))
-                    .service(
-                        web::scope("")
-                            .route("/", web::get().to(index))
-                            .route("/settings", web::get().to(serve_settings_page))
-                            .route(
-                                "/check-storage",
-                                web::get().to(check_storage_availability::<ServerContext>),
-                            )
-                            .route("/start", web::post().to(user_mode_start::<ServerContext>))
-                            .route("/stop", web::post().to(user_mode_stop))
-                            .route("/delete", web::post().to(delete))
-                            .route("/replay", web::post().to(start_replay))
-                            .route("/replay-end", web::post().to(stop_replay))
-                            .route(
-                                "/replay-status",
-                                web::get().to(user_mode_check_replay_status),
-                            )
-                            .route("/live-run", web::post().to(isolate_system))
-                            .route("/download/{file:.*}", web::get().to(mcap_downloader))
-                            .route(
-                                "/get-upload-credentials",
-                                web::get().to(get_upload_credentials),
-                            )
-                            // Authentication API routes
-                            .route(
-                                "/api/auth/login",
-                                web::post().to(auth_login::<ServerContext>),
-                            )
-                            .route(
-                                "/api/auth/status",
-                                web::get().to(auth_status::<ServerContext>),
-                            )
-                            .route(
-                                "/api/auth/logout",
-                                web::post().to(auth_logout::<ServerContext>),
-                            )
-                            // Upload API routes
-                            .route(
-                                "/api/uploads",
-                                web::post().to(start_upload_handler::<ServerContext>),
-                            )
-                            .route(
-                                "/api/uploads",
-                                web::get().to(list_uploads_handler::<ServerContext>),
-                            )
-                            .route(
-                                "/api/uploads/{id}",
-                                web::get().to(get_upload_handler::<ServerContext>),
-                            )
-                            .route(
-                                "/api/uploads/{id}",
-                                web::delete().to(cancel_upload_handler::<ServerContext>),
-                            )
-                            // Studio API routes
-                            .route(
-                                "/api/studio/projects",
-                                web::get().to(list_studio_projects::<ServerContext>),
-                            )
-                            .route(
-                                "/api/studio/projects/{id}/labels",
-                                web::get().to(list_project_labels::<ServerContext>),
-                            )
-                            .route(
-                                "/recorder-status",
-                                web::get().to(user_mode_check_recorder_status),
-                            )
-                            .route("/current-recording", web::get().to(get_current_recording))
-                            .service(
-                                web::resource("/ws/dropped").route(
-                                    web::get().to(websocket_handler_errors::<ServerContext>),
-                                ),
-                            )
-                            .service(web::resource("/rt/detect/mask").route(
-                                web::get().to(websocket_handler_high_priority::<ServerContext>),
-                            ))
-                            .service(web::resource("/rt/{tail:.*}").route(
-                                web::get().to(websocket_handler_low_priority::<ServerContext>),
-                            ))
-                            .route("/config/service/status", web::post().to(get_all_services))
-                            .route("/config/services/update", web::post().to(update_service))
-                            .service(
-                                web::resource("/mcap/")
-                                    .route(web::get().to(mcap_websocket_handler)),
-                            )
-                            .service(
-                                web::resource("/ws/uploads")
-                                    .route(web::get().to(upload_websocket_handler)),
-                            )
-                            .route("/config/{service}", web::get().to(serve_config_page))
-                            .route(
-                                "/config/{service}/details",
-                                web::get().to(user_mode_get_config),
-                            )
-                            .route("/config/{service}", web::post().to(set_config))
-                            .route("/{file:.*}", web::get().to(custom_file_handler)),
-                    )
-            }
-        })
-        .bind(&addrs_http[..])?
-        .bind_openssl(&addrs[..], builder)?
-        .workers(8)
-        .shutdown_timeout(5)
-        .run();
-
-    // Spawn signal handler task
-    let server_handle = server.handle();
+    // Spawn HTTP → HTTPS redirect server
     tokio::spawn(async move {
-        shutdown_coord_for_signal.wait_for_signal().await;
-        info!("Stopping HTTP server...");
-        server_handle.stop(true).await;
+        let redirect_app = Router::new().fallback(redirect_to_https);
+        axum::serve(http_listener, redirect_app.into_make_service())
+            .await
+            .expect("HTTP redirect server failed");
     });
 
-    // Run the server
-    let server_result = server.await;
+    // axum-server handle for graceful shutdown
+    let handle = axum_server::Handle::new();
+    let handle_clone = handle.clone();
+
+    // Spawn signal handler for graceful shutdown
+    tokio::spawn(async move {
+        shutdown_coordinator.wait_for_signal().await;
+        info!("Stopping HTTPS server...");
+        handle_clone.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+    });
+
+    // Start HTTPS server
+    https_server
+        .handle(handle)
+        .serve(app.into_make_service())
+        .await?;
 
     // Graceful shutdown cleanup
-    info!("HTTP server stopped, performing cleanup...");
+    info!("HTTPS server stopped, performing cleanup...");
 
-    // Cancel all active uploads
-    let cancelled = upload_manager_cleanup.cancel_all_uploads().await;
+    let cancelled = upload_manager.cancel_all_uploads().await;
     if cancelled > 0 {
         info!("Cancelled {} active upload(s)", cancelled);
     }
 
-    // Close Zenoh session explicitly
     info!("Closing Zenoh session...");
-    if let Err(e) = zenoh_session_cleanup.close().await {
+    if let Err(e) = zenoh_session.close().await {
         error!("Failed to close Zenoh session: {}", e);
     }
 
     info!("Graceful shutdown complete");
-    server_result
+    Ok(())
 }

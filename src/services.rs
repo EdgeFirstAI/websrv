@@ -8,7 +8,9 @@
 //! - Starting/stopping services
 //! - Enabling/disabling services
 
-use actix_web::{web, HttpResponse, Responder};
+use axum::extract::Json;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use log::{debug, error};
 use percent_encoding::percent_decode;
 use serde::Deserialize;
@@ -85,7 +87,7 @@ fn is_unit_loaded(name: &str) -> bool {
 // ============================================================================
 
 /// Get status of all requested services
-pub async fn get_all_services(params: web::Json<Value>) -> impl Responder {
+pub async fn get_all_services(Json(params): Json<Value>) -> impl IntoResponse {
     let services = match params["services"].as_array() {
         Some(arr) => arr
             .iter()
@@ -140,11 +142,11 @@ pub async fn get_all_services(params: web::Json<Value>) -> impl Responder {
             "enabled": enabled,
         }));
     }
-    HttpResponse::Ok().json(service_statuses)
+    Json(service_statuses).into_response()
 }
 
 /// Update a service (start, stop, enable, disable)
-pub async fn update_service(params: web::Json<ServiceAction>) -> impl Responder {
+pub async fn update_service(Json(params): Json<ServiceAction>) -> impl IntoResponse {
     let service_name = resolve_service_name(&params.service);
     let action = &params.action;
 
@@ -156,23 +158,24 @@ pub async fn update_service(params: web::Json<ServiceAction>) -> impl Responder 
         "stop" => command.arg("stop").arg(&service_name),
         "enable" => command.arg("enable").arg(&service_name),
         "disable" => command.arg("disable").arg(&service_name),
-        _ => return HttpResponse::BadRequest().body("Invalid action"),
+        _ => return (StatusCode::BAD_REQUEST, "Invalid action").into_response(),
     };
 
     debug!("Executing: sudo systemctl {} {}", action, service_name);
 
     match command.status() {
-        Ok(status) if status.success() => HttpResponse::Ok().body(format!(
-            "Service '{}' {}d successfully.",
-            service_name, action
-        )),
+        Ok(status) if status.success() => (
+            StatusCode::OK,
+            format!("Service '{}' {}d successfully.", service_name, action),
+        )
+            .into_response(),
         Ok(status) => {
             let error_message = format!(
                 "Failed to {} service '{}': {:?}",
                 action, service_name, status
             );
             error!("{}", error_message);
-            HttpResponse::InternalServerError().body(error_message)
+            (StatusCode::INTERNAL_SERVER_ERROR, error_message).into_response()
         }
         Err(e) => {
             let error_message = format!(
@@ -180,45 +183,9 @@ pub async fn update_service(params: web::Json<ServiceAction>) -> impl Responder 
                 action, service_name, e
             );
             error!("{}", error_message);
-            HttpResponse::InternalServerError().body(error_message)
+            (StatusCode::INTERNAL_SERVER_ERROR, error_message).into_response()
         }
     }
-}
-
-/// Get status of a single service
-pub async fn get_service_status(service_name: &str) -> Result<String, String> {
-    let resolved = resolve_service_name(service_name);
-    let status_output = Command::new("systemctl")
-        .arg("is-active")
-        .arg(&resolved)
-        .output()
-        .map_err(|e| format!("Error checking service status: {:?}", e))?;
-
-    let status = String::from_utf8_lossy(&status_output.stdout)
-        .trim()
-        .to_string();
-
-    Ok(if status == "active" {
-        "running".to_string()
-    } else {
-        "not running".to_string()
-    })
-}
-
-/// Check if a service is enabled
-pub async fn is_service_enabled(service_name: &str) -> Result<bool, String> {
-    let resolved = resolve_service_name(service_name);
-    let enabled_output = Command::new("systemctl")
-        .arg("is-enabled")
-        .arg(&resolved)
-        .output()
-        .map_err(|e| format!("Error checking if service is enabled: {:?}", e))?;
-
-    let enabled_str = String::from_utf8_lossy(&enabled_output.stdout)
-        .trim()
-        .to_string();
-
-    Ok(enabled_str == "enabled")
 }
 
 #[cfg(test)]

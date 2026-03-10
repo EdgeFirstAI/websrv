@@ -3,34 +3,48 @@
 
 //! Configuration file reading and service configuration management.
 
-use actix_web::{web, HttpResponse, Responder};
+use axum::extract::{Json, Path};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use log::{debug, error};
 use regex::Regex;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 use std::io;
 
-/// Upload credentials for DVE integration
-#[derive(Serialize, Debug)]
-pub struct UploadCredentials {
-    pub url: String,
-    pub jwt: String,
-    pub topic: String,
+const EDGEFIRST_PREFIX: &str = "edgefirst-";
+
+/// Resolve a config file path under `/etc/default/`, supporting both
+/// `edgefirst-{service}` and `{service}` naming conventions.
+///
+/// Tries the given name first; if the file doesn't exist, tries the
+/// alternate name with or without the `edgefirst-` prefix.
+/// Returns the path that exists, or the original path if neither does.
+fn resolve_config_file(service: &str) -> String {
+    let primary = format!("/etc/default/{}", service);
+    if std::path::Path::new(&primary).exists() {
+        return primary;
+    }
+
+    let alt_name = if let Some(short) = service.strip_prefix(EDGEFIRST_PREFIX) {
+        short.to_string()
+    } else {
+        format!("{}{}", EDGEFIRST_PREFIX, service)
+    };
+    let alternate = format!("/etc/default/{}", alt_name);
+    if std::path::Path::new(&alternate).exists() {
+        debug!("Config '{}' not found, using '{}'", primary, alternate);
+        return alternate;
+    }
+
+    // Neither found — return original so callers get the expected error
+    primary
 }
 
-/// Read uploader credentials from /etc/default/uploader
-pub fn read_uploader_credentials() -> io::Result<UploadCredentials> {
-    let file_path = "/etc/default/uploader";
-    let content = std::fs::read_to_string(file_path)?;
-    let credentials = parse_uploader_credentials(&content)?;
-    debug!("Topic = {:?}", credentials.topic);
-    Ok(credentials)
-}
-
-/// Read storage directory from /etc/default/recorder
+/// Read storage directory from /etc/default/recorder (or edgefirst-recorder)
 pub fn read_storage_directory() -> io::Result<String> {
-    let file_path = "/etc/default/recorder";
-    let content = std::fs::read_to_string(file_path)?;
+    let file_path = resolve_config_file("recorder");
+    let content = std::fs::read_to_string(&file_path)?;
     let storage_dir = parse_storage_directory(&content)?;
     debug!("MCAP Directory: {:?}", storage_dir);
     Ok(storage_dir)
@@ -42,27 +56,15 @@ pub struct ConfigPath {
     pub service: String,
 }
 
-/// Handler to get upload credentials
-pub async fn get_upload_credentials() -> impl Responder {
-    match read_uploader_credentials() {
-        Ok(credentials) => HttpResponse::Ok().json(credentials),
-        Err(err) => {
-            let error_message = err.to_string();
-            error!("{:?}", error_message);
-            HttpResponse::BadRequest().body(error_message)
-        }
-    }
-}
-
 /// Get service configuration from /etc/default/{service}
-pub async fn get_config(path: web::Path<ConfigPath>) -> impl Responder {
+pub async fn get_config(Path(path): Path<ConfigPath>) -> impl IntoResponse {
     let service_name = &path.service;
-    let config_file_path = format!("/etc/default/{}", service_name);
+    let config_file_path = resolve_config_file(service_name);
 
     let config_content = std::fs::read_to_string(&config_file_path).unwrap_or_default();
     let config_map = parse_config_content(&config_content);
 
-    HttpResponse::Ok().json(serde_json::Value::Object(config_map))
+    Json(serde_json::Value::Object(config_map)).into_response()
 }
 
 /// Check service status and restart if active
@@ -82,7 +84,7 @@ pub async fn check_service_status(service_name: &str) -> Result<String, String> 
         .trim()
         .to_string();
     debug!("{:?} service is {:?}", resolved, status);
-    if status == "active" && service_name != "webui" {
+    if status == "active" {
         Command::new("systemctl")
             .arg("restart")
             .arg(&resolved)
@@ -100,55 +102,6 @@ pub async fn check_service_status(service_name: &str) -> Result<String, String> 
 // ============================================================================
 // Internal parsing functions (extracted for testability)
 // ============================================================================
-
-/// Parse uploader credentials from config file content
-pub fn parse_uploader_credentials(content: &str) -> io::Result<UploadCredentials> {
-    let mut url = String::new();
-    let mut jwt = String::new();
-    let mut topic = String::new();
-
-    for line in content.lines() {
-        if line.starts_with("URL") {
-            let parts: Vec<&str> = line.split('=').collect();
-            if parts.len() == 2 {
-                url = parts[1].trim().trim_matches('"').to_string();
-            }
-        } else if line.starts_with("JWT") {
-            let parts: Vec<&str> = line.split('=').collect();
-            if parts.len() == 2 {
-                jwt = parts[1].trim().trim_matches('"').to_string();
-            }
-        } else if line.starts_with("TOPIC") {
-            let parts: Vec<&str> = line.split('=').collect();
-            if parts.len() == 2 {
-                topic = parts[1].trim().trim_matches('"').to_string();
-            }
-        }
-    }
-
-    if url.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Found empty string for URL",
-        ));
-    }
-
-    if jwt.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Found empty string for JWT",
-        ));
-    }
-
-    if topic.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Found empty string for TOPIC",
-        ));
-    }
-
-    Ok(UploadCredentials { url, jwt, topic })
-}
 
 /// Expand shell-style environment variables (`$VAR` and `${VAR}`) in a string.
 fn expand_env_vars(input: &str) -> String {
@@ -259,22 +212,35 @@ pub fn update_config_content(
 }
 
 /// Set service configuration in /etc/default/{service}
-pub async fn set_config(params: web::Json<Value>) -> impl Responder {
+pub async fn set_config(Json(params): Json<Value>) -> impl IntoResponse {
     let file_name = if let Some(file_name_value) = params.get("fileName") {
         if let Some(file_name) = file_name_value.as_str() {
-            file_name
+            file_name.to_string()
         } else {
             error!("fileName is not a string");
-            return HttpResponse::BadRequest().body("Invalid fileName");
+            return (StatusCode::BAD_REQUEST, "Invalid fileName").into_response();
         }
     } else {
         error!("fileName not found in JSON");
-        return HttpResponse::BadRequest().body("Missing fileName");
+        return (StatusCode::BAD_REQUEST, "Missing fileName").into_response();
     };
 
-    let service_name = file_name;
+    // Validate fileName to prevent path traversal
+    if file_name.contains('/') || file_name.contains("..") {
+        error!("Invalid fileName: path traversal attempt detected");
+        return (StatusCode::BAD_REQUEST, "Invalid fileName").into_response();
+    }
+    if !file_name
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+    {
+        error!("Invalid fileName: contains disallowed characters");
+        return (StatusCode::BAD_REQUEST, "Invalid fileName").into_response();
+    }
 
-    let config_file_path = format!("/etc/default/{}", file_name);
+    let service_name = file_name.clone();
+
+    let config_file_path = resolve_config_file(&file_name);
     debug!("Configuration file path: {}", config_file_path.clone());
     debug!("{:?}", params);
 
@@ -282,7 +248,11 @@ pub async fn set_config(params: web::Json<Value>) -> impl Responder {
         Ok(content) => content,
         Err(e) => {
             error!("Error reading configuration file: {:?}", e);
-            return HttpResponse::InternalServerError().body("Error reading configuration file");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Error reading configuration file",
+            )
+                .into_response();
         }
     };
 
@@ -295,17 +265,28 @@ pub async fn set_config(params: web::Json<Value>) -> impl Responder {
     let updated_config = update_config_content(&config_content, &config_map);
 
     match std::fs::write(config_file_path.clone(), updated_config) {
-        Ok(_) => match check_service_status(service_name).await {
-            Ok(_) => HttpResponse::Ok()
-                .body("Configuration saved successfully and service status checked."),
+        Ok(_) => match check_service_status(&service_name).await {
+            Ok(_) => (
+                StatusCode::OK,
+                "Configuration saved successfully and service status checked.",
+            )
+                .into_response(),
             Err(e) => {
                 error!("{}", e);
-                HttpResponse::InternalServerError().body("Error handling service status")
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Error handling service status",
+                )
+                    .into_response()
             }
         },
         Err(e) => {
             error!("Error saving configuration: {:?}", e);
-            HttpResponse::InternalServerError().body("Error saving configuration")
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Error saving configuration",
+            )
+                .into_response()
         }
     }
 }
@@ -313,80 +294,6 @@ pub async fn set_config(params: web::Json<Value>) -> impl Responder {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ========================================================================
-    // UploadCredentials parsing tests
-    // ========================================================================
-
-    #[test]
-    fn test_parse_uploader_credentials_valid() {
-        let content = r#"
-URL=https://studio.example.com/api
-JWT=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.test
-TOPIC=my/upload/topic
-"#;
-        let result = parse_uploader_credentials(content);
-        assert!(result.is_ok());
-        let creds = result.unwrap();
-        assert_eq!(creds.url, "https://studio.example.com/api");
-        assert_eq!(creds.jwt, "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.test");
-        assert_eq!(creds.topic, "my/upload/topic");
-    }
-
-    #[test]
-    fn test_parse_uploader_credentials_with_quotes() {
-        let content = r#"
-URL="https://studio.example.com/api"
-JWT="my-jwt-token"
-TOPIC="uploads/data"
-"#;
-        let result = parse_uploader_credentials(content);
-        assert!(result.is_ok());
-        let creds = result.unwrap();
-        assert_eq!(creds.url, "https://studio.example.com/api");
-        assert_eq!(creds.jwt, "my-jwt-token");
-        assert_eq!(creds.topic, "uploads/data");
-    }
-
-    #[test]
-    fn test_parse_uploader_credentials_missing_url() {
-        let content = r#"
-JWT=token
-TOPIC=topic
-"#;
-        let result = parse_uploader_credentials(content);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("URL"));
-    }
-
-    #[test]
-    fn test_parse_uploader_credentials_missing_jwt() {
-        let content = r#"
-URL=https://example.com
-TOPIC=topic
-"#;
-        let result = parse_uploader_credentials(content);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("JWT"));
-    }
-
-    #[test]
-    fn test_parse_uploader_credentials_missing_topic() {
-        let content = r#"
-URL=https://example.com
-JWT=token
-"#;
-        let result = parse_uploader_credentials(content);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("TOPIC"));
-    }
-
-    #[test]
-    fn test_parse_uploader_credentials_empty_content() {
-        let content = "";
-        let result = parse_uploader_credentials(content);
-        assert!(result.is_err());
-    }
 
     // ========================================================================
     // Storage directory parsing tests
@@ -596,27 +503,48 @@ KEY2=value2
     }
 
     // ========================================================================
-    // Struct serialization tests
+    // Struct deserialization tests
     // ========================================================================
-
-    #[test]
-    fn test_upload_credentials_serialization() {
-        let creds = UploadCredentials {
-            url: "https://example.com".to_string(),
-            jwt: "token123".to_string(),
-            topic: "my/topic".to_string(),
-        };
-
-        let json = serde_json::to_string(&creds).expect("Failed to serialize");
-        assert!(json.contains("\"url\":\"https://example.com\""));
-        assert!(json.contains("\"jwt\":\"token123\""));
-        assert!(json.contains("\"topic\":\"my/topic\""));
-    }
 
     #[test]
     fn test_config_path_deserialization() {
         let json = r#"{"service": "recorder"}"#;
         let path: ConfigPath = serde_json::from_str(json).expect("Failed to deserialize");
         assert_eq!(path.service, "recorder");
+    }
+
+    // ========================================================================
+    // Config file resolution tests
+    // ========================================================================
+
+    #[test]
+    fn test_resolve_config_file_neither_exists() {
+        // When neither file exists, returns the primary path
+        let result = resolve_config_file("nonexistent-test-service-xyz");
+        assert_eq!(result, "/etc/default/nonexistent-test-service-xyz");
+    }
+
+    #[test]
+    fn test_resolve_config_file_adds_prefix() {
+        // When given "recorder", alternate is "edgefirst-recorder"
+        let service = "recorder";
+        let alt = if let Some(short) = service.strip_prefix(EDGEFIRST_PREFIX) {
+            short.to_string()
+        } else {
+            format!("{}{}", EDGEFIRST_PREFIX, service)
+        };
+        assert_eq!(alt, "edgefirst-recorder");
+    }
+
+    #[test]
+    fn test_resolve_config_file_strips_prefix() {
+        // When given "edgefirst-recorder", alternate is "recorder"
+        let service = "edgefirst-recorder";
+        let alt = if let Some(short) = service.strip_prefix(EDGEFIRST_PREFIX) {
+            short.to_string()
+        } else {
+            format!("{}{}", EDGEFIRST_PREFIX, service)
+        };
+        assert_eq!(alt, "recorder");
     }
 }

@@ -8,26 +8,22 @@
 //! - Memory-mapping MCAP files
 //! - Streaming MCAP downloads
 
-use actix_web::{
-    http::header::ContentLength,
-    web::{self, Bytes},
-    HttpRequest, HttpResponse, Responder,
-};
-use actix_web_actors::ws;
 use anyhow::{Context, Result};
-use async_stream::stream;
+use axum::body::Body;
+use axum::extract::{Path, State};
+use axum::http::{header, StatusCode};
+use axum::response::{IntoResponse, Response};
 use camino::Utf8Path;
 use chrono::DateTime;
 use log::{debug, error};
 use mcap::Summary;
 use memmap::Mmap;
-use mime::Mime;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::path::Path;
-use std::str::FromStr;
+use std::path::Path as StdPath;
+use std::sync::Arc;
 use std::time::UNIX_EPOCH;
-use tokio::io::AsyncReadExt as _;
+use tokio_util::io::ReaderStream;
 
 use crate::config::read_storage_directory;
 
@@ -135,186 +131,175 @@ pub fn read_mcap_info<P: AsRef<Utf8Path>>(path: P) -> Result<(HashMap<String, To
 }
 
 // ============================================================================
-// WebSocket Session for MCAP Directory Listing
+// Context Trait
 // ============================================================================
 
 /// Trait for accessing server context
-pub trait McapContext {
+pub trait McapContext: Send + Sync + 'static {
     fn is_system_mode(&self) -> bool;
     fn storage_path(&self) -> &str;
-}
-
-/// WebSocket session for MCAP file listing
-pub struct WebSocketSession<T> {
-    pub context: Option<web::Data<T>>,
-}
-
-impl<T: McapContext + Unpin + 'static> actix::Actor for WebSocketSession<T> {
-    type Context = ws::WebsocketContext<Self>;
-}
-
-impl<T: McapContext + Unpin + 'static> actix::StreamHandler<Result<ws::Message, ws::ProtocolError>>
-    for WebSocketSession<T>
-{
-    fn handle(&mut self, msg: Result<ws::Message, ws::ProtocolError>, ctx: &mut Self::Context) {
-        let arg_data = match &self.context {
-            Some(data) => data,
-            None => {
-                error!("ServerContext not initialized");
-                return;
-            }
-        };
-
-        match msg {
-            Ok(ws::Message::Text(text)) => {
-                debug!("Received message: {}", text);
-                let mut directory: String = arg_data.storage_path().to_string();
-
-                if arg_data.is_system_mode() {
-                    directory = match read_storage_directory() {
-                        Ok(dir) => dir,
-                        Err(_) => {
-                            let response = serde_json::to_string(
-                                &serde_json::json!({"error": "No storage configured"}),
-                            )
-                            .unwrap();
-                            ctx.text(response);
-                            return;
-                        }
-                    };
-                }
-
-                debug!("Listing files in directory: {}", directory.clone());
-
-                match std::fs::read_dir(&directory) {
-                    Ok(entries) => {
-                        let files: Vec<FileInfo> = entries
-                            .filter_map(Result::ok)
-                            .filter_map(|entry| {
-                                if let Some(extension) = entry.path().extension() {
-                                    if extension == "mcap" {
-                                        let metadata = entry.metadata().ok()?;
-                                        let size = metadata.len();
-                                        let created = metadata
-                                            .created()
-                                            .ok()?
-                                            .duration_since(UNIX_EPOCH)
-                                            .ok()?
-                                            .as_secs();
-
-                                        let (topics_info, average_video_length) =
-                                            match read_mcap_info(Utf8Path::from_path(
-                                                &entry.path(),
-                                            )?) {
-                                                Ok(info) => info,
-                                                Err(_) => (HashMap::new(), 0.0),
-                                            };
-
-                                        Some(FileInfo {
-                                            name: entry.file_name().to_string_lossy().to_string(),
-                                            size: size / (1024 * 1024),
-                                            created: DateTime::from_timestamp(created as i64, 0)
-                                                .unwrap()
-                                                .with_timezone(&chrono::Local)
-                                                .format("%Y-%m-%d %H:%M:%S")
-                                                .to_string(),
-                                            topics: topics_info,
-                                            average_video_length,
-                                        })
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect();
-
-                        let response = if files.is_empty() {
-                            DirectoryResponse {
-                                dir_name: directory.clone(),
-                                files: None,
-                                message: Some("No MCAP files found".to_string()),
-                                topics: None,
-                            }
-                        } else {
-                            DirectoryResponse {
-                                dir_name: directory.clone(),
-                                files: Some(files),
-                                message: None,
-                                topics: None,
-                            }
-                        };
-
-                        let response = serde_json::to_string(&response).unwrap();
-                        ctx.text(response);
-                    }
-                    Err(e) => {
-                        debug!("Directory not found: {}", e);
-                        let response = serde_json::to_string(&DirectoryResponse {
-                            dir_name: directory.clone(),
-                            files: None,
-                            message: Some("No MCAP files found".to_string()),
-                            topics: None,
-                        })
-                        .unwrap();
-                        ctx.text(response);
-                    }
-                }
-            }
-            Ok(ws::Message::Ping(msg)) => ctx.pong(&msg),
-            Ok(ws::Message::Close(reason)) => ctx.close(reason),
-            _ => (),
-        }
-    }
 }
 
 // ============================================================================
 // HTTP Handlers
 // ============================================================================
 
+/// GET /mcap - List MCAP files in storage directory
+pub async fn list_mcap_files<T: McapContext>(State(data): State<Arc<T>>) -> impl IntoResponse {
+    let directory = if data.is_system_mode() {
+        match read_storage_directory() {
+            Ok(dir) => dir,
+            Err(_) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    axum::Json(serde_json::json!({"error": "No storage configured"})),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        data.storage_path().to_string()
+    };
+
+    let dir_clone = directory.clone();
+    let result = tokio::task::spawn_blocking(move || -> Option<Vec<FileInfo>> {
+        let entries = std::fs::read_dir(&dir_clone).ok()?;
+        let files: Vec<FileInfo> = entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                if let Some(extension) = entry.path().extension() {
+                    if extension == "mcap" {
+                        let metadata = entry.metadata().ok()?;
+                        let size = metadata.len();
+                        let created = metadata
+                            .created()
+                            .ok()?
+                            .duration_since(UNIX_EPOCH)
+                            .ok()?
+                            .as_secs();
+
+                        let (topics_info, average_video_length) =
+                            match read_mcap_info(Utf8Path::from_path(&entry.path())?) {
+                                Ok(info) => info,
+                                Err(_) => (HashMap::new(), 0.0),
+                            };
+
+                        Some(FileInfo {
+                            name: entry.file_name().to_string_lossy().to_string(),
+                            size: size / (1024 * 1024),
+                            created: DateTime::from_timestamp(created as i64, 0)
+                                .unwrap()
+                                .with_timezone(&chrono::Local)
+                                .format("%Y-%m-%d %H:%M:%S")
+                                .to_string(),
+                            topics: topics_info,
+                            average_video_length,
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
+        Some(files)
+    })
+    .await;
+
+    let files = result.ok().flatten();
+
+    let response = match files {
+        Some(files) if !files.is_empty() => DirectoryResponse {
+            dir_name: directory,
+            files: Some(files),
+            message: None,
+            topics: None,
+        },
+        _ => DirectoryResponse {
+            dir_name: directory,
+            files: None,
+            message: Some("No MCAP files found".to_string()),
+            topics: None,
+        },
+    };
+
+    axum::Json(response).into_response()
+}
+
 /// MCAP file download handler
-pub async fn mcap_downloader(req: HttpRequest) -> impl Responder {
-    let path: String = req.match_info().query("file").parse().unwrap();
-    let file_path = Path::new(&path);
+pub async fn mcap_downloader(Path(path): Path<String>) -> impl IntoResponse {
+    // axum 0.8 wildcard captures include leading slash; strip it
+    let path = path.strip_prefix('/').unwrap_or(&path).to_string();
+    let file_path = StdPath::new(&path);
 
     if !file_path
         .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("MCAP"))
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("mcap"))
     {
-        return Err(actix_web::error::ErrorForbidden(
+        return (
+            StatusCode::FORBIDDEN,
             "Invalid file extension. Only .mcap files are allowed.",
-        ));
+        )
+            .into_response();
     }
+
+    // Path traversal protection: canonicalize and verify within storage directory
+    let canonical = match file_path.canonicalize() {
+        Ok(p) => p,
+        Err(_) => {
+            return (StatusCode::NOT_FOUND, format!("File {:?} not found", path)).into_response();
+        }
+    };
+    let allowed_base = match read_storage_directory() {
+        Ok(dir) => match StdPath::new(&dir).canonicalize() {
+            Ok(p) => p,
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Storage directory not accessible",
+                )
+                    .into_response();
+            }
+        },
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Storage directory not configured",
+            )
+                .into_response();
+        }
+    };
+    if !canonical.starts_with(&allowed_base) {
+        return (StatusCode::FORBIDDEN, "Access denied").into_response();
+    }
+    let file_path = canonical.as_path();
 
     if !file_path.exists() || !file_path.is_file() {
-        return Err(actix_web::error::ErrorNotFound(format!(
-            "File {:?} not found",
-            path
-        )));
+        return (StatusCode::NOT_FOUND, format!("File {:?} not found", path)).into_response();
     }
 
-    let mut file = tokio::fs::File::open(file_path).await?;
-    let file_size = file.metadata().await?.len() as usize;
-
-    let mcap_stream = stream! {
-        let mut buffer = [0; 64 * 1024];
-        loop {
-            let bytes_read = file.read(&mut buffer).await?;
-            if bytes_read == 0 {
-                break;
-            }
-
-            yield Result::<Bytes, std::io::Error>::Ok(Bytes::copy_from_slice(&buffer[..bytes_read]));
+    let file = match tokio::fs::File::open(file_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to open file: {}", e),
+            )
+                .into_response();
         }
     };
 
-    let mime_type = Mime::from_str("application/octet-stream").unwrap();
+    let file_size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+    let stream = ReaderStream::new(file);
+    let body = Body::from_stream(stream);
 
-    Ok(HttpResponse::Ok()
-        .content_type(mime_type)
-        .insert_header(ContentLength(file_size))
-        .streaming(mcap_stream))
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/octet-stream")
+        .header(header::CONTENT_LENGTH, file_size)
+        .body(body)
+        .unwrap()
+        .into_response()
 }
 
 #[cfg(test)]

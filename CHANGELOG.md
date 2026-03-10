@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.0.0] - 2026-03-10
+
+### Changed
+
+- **BREAKING**: Migrate web framework from actix-web to axum 0.8
+- **BREAKING**: Replace OpenSSL with rustls for TLS — removes system OpenSSL dependency
+- **BREAKING**: Replace actix-web-actors WebSocket with yawc — adds RFC 7692 permessage-deflate compression
+- **BREAKING**: All API endpoints moved under `/api/` prefix with RESTful naming conventions
+  - `/start` → `POST /api/recorder/start`
+  - `/stop` → `POST /api/recorder/stop`
+  - `/recorder-status` → `GET /api/recorder/status`
+  - `/current-recording` → `GET /api/recorder/current`
+  - `/replay` → `POST /api/replay/start`
+  - `/replay-end` → `POST /api/replay/stop`
+  - `/replay-status` → `GET /api/replay/status`
+  - `/delete` → `DELETE /api/recordings`
+  - `/download/{file}` → `GET /api/recordings/download/{file}`
+  - `/check-storage` → `GET /api/storage`
+  - `/config/service/status` → `POST /api/services/status`
+  - `/config/services/update` → `POST /api/services/update`
+  - `/config/{service}/details` → `GET /api/config/{service}`
+  - `/config/{service}` (POST) → `POST /api/config/{service}`
+  - `/rt/{topic}` → `/api/rt/{topic}`
+  - `/ws/dropped` → `/api/ws/dropped`
+  - `/mcap/` (WebSocket) → `GET /api/recordings` (HTTP JSON)
+- Replace MCAP listing WebSocket with HTTP GET endpoint returning JSON
+- WebSocket broadcast uses tokio::sync::broadcast channels instead of actix actor mailboxes
+- Static files served exclusively from `/*` (no API route conflicts)
+- Automatic `.html` extension resolution for clean URLs (e.g., `/config/camera` serves `config/camera.html`)
+
+### Added
+
+- systemd socket activation support via `listenfd` for non-root operation
+- WebSocket permessage-deflate compression with `?compress=false` opt-out
+- Per-client WebSocket ping/pong keepalive (30s interval) and send timeouts (5s)
+- Path traversal protection for MCAP downloads and config file writes
+- Input validation for service names in configuration endpoints
+- rustls PEM parsing validation in SSL integration tests
+- WebSocket compression benchmark test
+
+### Fixed
+
+- WebSocket upgrade errors now return HTTP 500 instead of panicking
+- TLS private key parsing returns descriptive error instead of panicking
+- Recording start failure now returns HTTP 500 instead of misleading 200
+- MCAP file listing moved to `spawn_blocking` to avoid blocking Tokio workers
+
+### Removed
+
+- actix-web, actix-web-actors, actix-web-lab, actix-files dependencies
+- OpenSSL dependency (replaced by rustls)
+- Embedded `server.pem` fallback certificate (runtime generation via rcgen)
+- CDR serialization for dropped-frame error notifications
+
 ## [3.8.5] - 2026-03-02
 
 ### Fixed

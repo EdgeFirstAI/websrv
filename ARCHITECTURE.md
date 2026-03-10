@@ -27,7 +27,7 @@ graph TB
     subgraph "WebSrv Server"
         HTTPS[HTTPS Server<br/>Port 443]
         HTTP[HTTP Redirect<br/>Port 80]
-        Router[Actix Router]
+        Router[axum Router]
 
         subgraph "Core Components"
             StaticFiles[Static File Server]
@@ -86,7 +86,7 @@ graph TB
 #### ServerContext
 **Location**: `main.rs` - struct ServerContext
 
-Central application context shared across all request handlers via Actix-web's `Data<T>` mechanism.
+Central application context shared across all request handlers via axum's `State<Arc<T>>` mechanism.
 
 **Fields**:
 - `args: Args` - Command-line configuration (docroot, storage path, Zenoh topics, mode)
@@ -187,33 +187,29 @@ graph LR
 ```mermaid
 sequenceDiagram
     participant Browser
-    participant ActixWS as Actix WebSocket Handler
-    participant Stream as MessageStream
-    participant Zenoh as Zenoh Listener Thread
+    participant AxumWS as axum WebSocket Handler
+    participant Stream as MessageStream (broadcast)
+    participant Zenoh as Zenoh Listener Task
     participant ZenohBus as Zenoh Bus
 
-    Browser->>+ActixWS: WebSocket Connect /rt/camera/h264
-    ActixWS->>Stream: Create MessageStream
-    ActixWS->>Stream: Add WebSocket as client
-    ActixWS->>Zenoh: Spawn thread with topic
+    Browser->>+AxumWS: WebSocket Connect /api/rt/camera/h264
+    AxumWS->>Stream: Create MessageStream
+    AxumWS->>Stream: Subscribe to broadcast channel
+    AxumWS->>Zenoh: Spawn tokio task with topic
 
     activate Zenoh
     Zenoh->>ZenohBus: declare_subscriber("rt/camera/h264")
 
     loop Real-time streaming
         ZenohBus-->>Zenoh: Sample data
-        Zenoh->>Zenoh: Drain all pending messages
-        Zenoh->>Zenoh: Take only latest (temporal filtering)
-        Zenoh->>Stream: broadcast(BroadcastMessage(data))
-        Stream->>ActixWS: Forward to WebSocket
-        ActixWS-->>Browser: Binary WebSocket frame
+        Zenoh->>Stream: broadcast(Binary(data))
+        Stream->>AxumWS: recv() from broadcast channel
+        AxumWS-->>Browser: Binary WebSocket frame
     end
 
-    Browser->>ActixWS: WebSocket Disconnect
-    ActixWS->>Stream: on_exit.send(STOP)
-    Stream->>Zenoh: Receive STOP signal
+    Browser->>AxumWS: WebSocket Close frame
+    AxumWS->>Zenoh: shutdown_tx.send(())
     Zenoh->>ZenohBus: undeclare()
-    Zenoh->>ZenohBus: close()
     deactivate Zenoh
 ```
 
@@ -740,7 +736,7 @@ stateDiagram-v2
 - **MessageStream**: Reuses existing WebSocket broadcast infrastructure
 - **ServerContext**: Upload manager added as `Arc<UploadManager>` field
 - **Storage Path**: Uses same `args.storage_path` as MCAP recording
-- **Actix-web**: All endpoints follow existing handler patterns
+- **axum**: All endpoints follow existing handler patterns
 - **Error Handling**: Consistent with existing `anyhow::Result<>` patterns
 
 ## Configuration Management
@@ -890,9 +886,9 @@ graph LR
 ```
 
 **TLS Implementation**:
-- **Cipher Suites**: Mozilla Intermediate profile (OpenSSL)
-- **Protocol**: TLS 1.2+ via `SslMethod::tls()`
-- **HTTP**: Always redirects to HTTPS via `RedirectHttps` middleware
+- **Cipher Suites**: rustls defaults (modern TLS 1.2+ and TLS 1.3)
+- **Protocol**: TLS 1.2+ via rustls `ServerConfig`
+- **HTTP**: Always redirects to HTTPS via axum redirect handler
 
 ### Path Validation
 
@@ -1077,21 +1073,20 @@ sequenceDiagram
 ### Optimization Strategies
 
 **Static File Serving**:
-- Actix-files middleware with efficient sendfile support
-- Embedded certificate/key to avoid filesystem overhead
+- tower-http `ServeDir` with automatic `.html` extension resolution
 - Browser caching via HTTP cache headers
 
 **WebSocket Efficiency**:
-- Binary serialization (CDR format) for minimal overhead
-- Mailbox capacity tuning (1 vs 16) based on priority
-- Temporal filtering (latest-only) for high-frequency streams
-- Backpressure handling via `try_send()` vs `do_send()`
+- Binary frames via yawc with permessage-deflate compression
+- tokio::sync::broadcast channels for fan-out to subscribers
+- Per-client send timeouts and ping/pong keepalive
+- Backpressure handling via `RecvError::Lagged` on receiver side
 
 **Concurrency**:
 - 8-worker Tokio runtime (`worker_threads = 8`)
-- Multi-threaded HTTP server (Actix-web default)
-- Arc/Mutex/RwLock for minimal lock contention
-- Separate threads for Zenoh listeners (blocking I/O isolation)
+- Multi-threaded HTTP server (axum with hyper)
+- Arc-based shared state with broadcast channels
+- Async tokio tasks for Zenoh listeners
 
 **MCAP Handling**:
 - Memory-mapped file access for zero-copy reads
@@ -1396,20 +1391,25 @@ For a system integrator deploying websrv on a new platform:
 
 | Crate | Version | Purpose |
 |-------|---------|---------|
-| `actix-web` | 4.12.1 | HTTP server framework |
-| `actix-web-actors` | 4.3.0 | WebSocket actor support |
+| `axum` | 0.8 | HTTP server framework |
+| `axum-server` | 0.7 | TLS server with rustls |
+| `yawc` | 0.3 | WebSocket with permessage-deflate |
+| `rustls` | 0.23 | TLS implementation |
+| `tower-http` | 0.6 | Static file serving middleware |
 | `zenoh` | 1.6.2 | Real-time data bus |
 | `mcap` | 0.23.4 | MCAP file format parsing |
 | `edgefirst-client` | 2.6.4 | EdgeFirst Studio API client |
 | `tokio` | 1.48.0 | Async runtime |
-| `openssl` | 0.10.75 | TLS/SSL support |
-| `serde_json` | 1.0.140 | JSON serialization |
-| `uuid` | 1.18.1 | Unique identifiers |
-| `chrono` | 0.4.42 | Date/time handling |
+| `listenfd` | 1 | systemd socket activation |
+| `serde_json` | 1.0 | JSON serialization |
+| `uuid` | 1.18 | Unique identifiers |
+| `chrono` | 0.4 | Date/time handling |
 
 ### Related Documentation
 
-- **Actix-web**: https://actix.rs/docs/
+- **axum**: https://docs.rs/axum/latest/axum/
+- **yawc**: https://docs.rs/yawc/latest/yawc/
+- **rustls**: https://docs.rs/rustls/latest/rustls/
 - **Zenoh**: https://zenoh.io/docs/
 - **MCAP Format**: https://mcap.dev/
 - **EdgeFirst Studio API**: Internal documentation
@@ -1417,6 +1417,6 @@ For a system integrator deploying websrv on a new platform:
 
 ---
 
-**Document Version**: 1.1
-**Last Updated**: 2026-03-09
+**Document Version**: 2.0
+**Last Updated**: 2026-03-10
 **Author**: Sébastien Taylor <sebastien@au-zone.com>

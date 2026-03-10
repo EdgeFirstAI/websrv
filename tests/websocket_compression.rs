@@ -172,10 +172,8 @@ async fn test_websocket_compression_ratio() {
     };
 
     // --- Compressed client ---
-    let compressed_handle = {
-        let addr = addr;
-        tokio::spawn(async move { receive_messages(addr, "test/sensor_c", true, msg_count).await })
-    };
+    let compressed_handle =
+        tokio::spawn(async move { receive_messages(addr, "test/sensor_c", true, msg_count).await });
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
@@ -194,10 +192,10 @@ async fn test_websocket_compression_ratio() {
             .expect("Join error");
 
     // --- Uncompressed client ---
-    let uncompressed_handle = {
-        let addr = addr;
-        tokio::spawn(async move { receive_messages(addr, "test/sensor_u", false, msg_count).await })
-    };
+    let uncompressed_handle =
+        tokio::spawn(
+            async move { receive_messages(addr, "test/sensor_u", false, msg_count).await },
+        );
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 

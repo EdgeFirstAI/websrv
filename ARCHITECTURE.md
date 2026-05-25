@@ -796,8 +796,6 @@ graph TB
 | `--connect` | Vec<String> | [] | Zenoh endpoints to connect to |
 | `--listen` | Vec<String> | [] | Zenoh endpoints to listen on |
 | `--no-multicast-scouting` | bool | false | Disable Zenoh multicast |
-| `--mask` | String | `/rt/model/mask_compressed` | Segmentation mask topic |
-| `--detect` | String | `/rt/model/boxes2d` | Detection boxes topic |
 | `--h264` | String | `/rt/camera/h264` | Video stream topic |
 | `--draw-box` | bool | true | Enable bounding box overlay |
 | `--draw-labels` | bool | true | Enable label overlay |

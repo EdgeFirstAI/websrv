@@ -60,24 +60,6 @@ pub struct Args {
     #[arg(long, env = "NO_MULTICAST_SCOUTING")]
     no_multicast_scouting: bool,
 
-    /// Zenoh topic for segmentation mask overlay
-    #[arg(
-        long,
-        env = "MASK",
-        default_value = "/rt/model/mask_compressed",
-        conflicts_with = "system"
-    )]
-    mask: String,
-
-    /// Zenoh topic for 2D object detection bounding boxes
-    #[arg(
-        long,
-        env = "DETECT",
-        default_value = "/rt/model/boxes2d",
-        conflicts_with = "system"
-    )]
-    detect: String,
-
     /// Zenoh topic for H.264 video stream
     #[arg(
         long,
@@ -131,8 +113,6 @@ pub struct Args {
 #[derive(Serialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub struct WebUISettings {
-    mask_topic: String,
-    detect_topic: String,
     h264_topic: String,
     draw_box: bool,
     draw_box_text: bool,
@@ -142,8 +122,6 @@ pub struct WebUISettings {
 impl From<Args> for WebUISettings {
     fn from(value: Args) -> Self {
         Self {
-            mask_topic: value.mask,
-            detect_topic: value.detect,
             h264_topic: value.h264,
             draw_box: value.draw_box,
             draw_box_text: value.draw_labels,

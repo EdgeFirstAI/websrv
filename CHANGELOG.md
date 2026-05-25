@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.0.1] - 2026-05-25
+
+### Removed
+
+- Dead `--mask` / `--detect` CLI flags (and matching `MASK` / `DETECT` environment variables) — these defaulted to the legacy `/rt/model/mask_compressed` and `/rt/model/boxes2d` topics that the EdgeFirst `model` service no longer publishes
+- `mask_topic` and `detect_topic` fields from the `WebUISettings` JSON returned by `GET /api/config/{service}` — the webui never read these and they would now point at non-existent topics
+
+### Changed
+
+- Documentation: removed `--mask` and `--detect` rows from the CLI argument table in `ARCHITECTURE.md`
+
 ## [4.0.0] - 2026-03-10
 
 ### Changed

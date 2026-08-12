@@ -56,3 +56,15 @@ LISTEN=""
 # operating in networks where multicast is unavailable or undesired, and use
 # CONNECT/LISTEN for explicit endpoint configuration instead.
 NO_MULTICAST_SCOUTING="false"
+
+# ---------------------------------------------------------------------------
+# Blockly Programs
+# ---------------------------------------------------------------------------
+# Filesystem path for storing deployed Blockly programs. Each program is
+# stored in a subdirectory containing its .efapp bundle files and metadata.
+# When running as root (system mode), use /var/lib/edgefirst/programs.
+# When running as a user, the default ~/.local/share/edgefirst/programs is used.
+PROGRAMS_PATH="/var/lib/edgefirst/programs"
+
+# Python interpreter path for Blockly programs
+PYTHON_PATH="/usr/bin/python3"

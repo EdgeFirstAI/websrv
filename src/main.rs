@@ -8,10 +8,12 @@
 //! - MCAP recording and replay management
 //! - EdgeFirst Studio integration for uploads
 //! - System service management
+//! - Blockly program deployment and lifecycle management
 
 mod ssl;
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
+use axum::handler::Handler;
 use axum::http::{HeaderMap, Uri};
 use axum::response::{IntoResponse, Redirect};
 use axum::routing::{get, post};
@@ -29,6 +31,13 @@ use edgefirst_websrv::{
     auth::{auth_login, auth_logout, auth_status, AuthContext},
     config::{get_config, read_storage_directory, set_config},
     mcap::{list_mcap_files, mcap_downloader, McapContext},
+    programs::{
+        handlers::{
+            create_program, delete_program, download_program, list_programs, program_icon,
+            program_logs, program_status, start_program, stop_program, update_program,
+        },
+        resolve_programs_path, ProgramManager, ProgramsContext,
+    },
     recording::{
         check_recorder_status, check_replay_status, delete as recording_delete,
         get_current_recording, isolate_system, start, start_replay, stop, stop_replay,
@@ -61,6 +70,7 @@ pub struct ServerContext {
     pub zenoh_session: zenoh::Session,
     pub shutdown_coordinator: ShutdownCoordinator,
     pub process: Mutex<Option<std::process::Child>>,
+    pub program_manager: Arc<ProgramManager>,
 }
 
 impl AuthContext for ServerContext {
@@ -122,6 +132,12 @@ impl WebSocketContext for ServerContext {
 
     fn shutdown_token(&self) -> Option<tokio_util::sync::CancellationToken> {
         Some(self.shutdown_coordinator.token())
+    }
+}
+
+impl ProgramsContext for ServerContext {
+    fn program_manager(&self) -> &Arc<ProgramManager> {
+        &self.program_manager
     }
 }
 
@@ -272,6 +288,39 @@ fn common_routes(ctx: Arc<ServerContext>) -> Router {
         .route("/api/ws/uploads", get(websocket_handler_uploads))
         // WebSocket: Zenoh real-time topic bridge
         .route("/api/rt/{*topic}", get(websocket_handler::<ServerContext>))
+        // Programs (Blockly) — upload routes have a 10MB body limit
+        .route(
+            "/api/programs",
+            get(list_programs::<ServerContext>).post(
+                create_program::<ServerContext>.layer(DefaultBodyLimit::max(10 * 1024 * 1024)),
+            ),
+        )
+        .route(
+            "/api/programs/{id}",
+            get(download_program::<ServerContext>)
+                .put(update_program::<ServerContext>.layer(DefaultBodyLimit::max(10 * 1024 * 1024)))
+                .delete(delete_program::<ServerContext>),
+        )
+        .route(
+            "/api/programs/{id}/start",
+            post(start_program::<ServerContext>),
+        )
+        .route(
+            "/api/programs/{id}/stop",
+            post(stop_program::<ServerContext>),
+        )
+        .route(
+            "/api/programs/{id}/status",
+            get(program_status::<ServerContext>),
+        )
+        .route(
+            "/api/programs/{id}/logs",
+            get(program_logs::<ServerContext>),
+        )
+        .route(
+            "/api/programs/{id}/icon",
+            get(program_icon::<ServerContext>),
+        )
         .with_state(ctx)
 }
 
@@ -381,6 +430,24 @@ async fn main() -> anyhow::Result<()> {
         error!("Failed to initialize upload manager: {}", e);
     }
 
+    // Initialize program manager for Blockly apps
+    // Follows the same --system flag as the rest of websrv
+    let programs_path = resolve_programs_path(&args.programs_path);
+    let program_manager = Arc::new(ProgramManager::new(
+        programs_path,
+        args.python_path.clone(),
+        args.system,
+    ));
+    info!(
+        "Program manager: {} mode, path: {}",
+        if args.system { "system" } else { "user" },
+        args.programs_path,
+    );
+
+    if let Err(e) = program_manager.initialize().await {
+        error!("Failed to initialize program manager: {}", e);
+    }
+
     // Initialize shared Zenoh session
     let zenoh_session = zenoh::open(args.clone())
         .await
@@ -399,6 +466,7 @@ async fn main() -> anyhow::Result<()> {
         zenoh_session: zenoh_session.clone(),
         shutdown_coordinator: shutdown_coordinator.clone(),
         process: Mutex::new(None),
+        program_manager: program_manager.clone(),
     });
 
     // Build TLS config from PEM bytes.
@@ -489,6 +557,9 @@ async fn main() -> anyhow::Result<()> {
     if cancelled > 0 {
         info!("Cancelled {} active upload(s)", cancelled);
     }
+
+    info!("Stopping program log followers...");
+    program_manager.shutdown().await;
 
     info!("Closing Zenoh session...");
     if let Err(e) = zenoh_session.close().await {

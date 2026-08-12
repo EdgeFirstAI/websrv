@@ -121,3 +121,39 @@ The server runs as a systemd service on Maivin devices. Configuration is loaded 
 
 - **System mode** (`--system`): Controls services via systemd, reads config from `/etc/default/`
 - **User mode** (default): Spawns processes directly, useful for development
+
+### On-Target Testing
+
+To deploy and test on a Maivin device, cross-compile and use `scp` to transfer the binary.
+The systemd service name is `websrv`. Replace `<user>@<device>` with the appropriate
+credentials (e.g., `torizon@10.10.x.x`).
+
+**Devices with ostree (read-only rootfs):** Use a systemd service file override that points
+`ExecStart` to the binary in `$HOME` instead of `/usr/bin`. `sudo` is required since login
+is as a regular user.
+
+```sh
+# 1. Cross-compile
+cargo zigbuild --release --target aarch64-unknown-linux-gnu
+
+# 2. Stop the service
+ssh <user>@<device> sudo systemctl stop websrv
+
+# 3. Deploy the binary
+scp target/aarch64-unknown-linux-gnu/release/edgefirst-websrv <user>@<device>:
+
+# 4. Start the service
+ssh <user>@<device> sudo systemctl start websrv
+
+# 5. Check logs
+ssh <user>@<device> journalctl -fu websrv
+```
+
+**Devices with writable rootfs and root SSH:** Copy directly to `/usr/bin` instead, and
+`sudo` is not needed if logged in as root.
+
+Useful `journalctl` flags for debugging:
+- `-f` — follow (live tail)
+- `-u websrv` — filter by unit
+- `--since "5 min ago"` — recent logs only
+- `-n 100` — last N lines

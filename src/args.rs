@@ -103,6 +103,18 @@ pub struct Args {
     #[arg(long, default_value = ".", conflicts_with = "system")]
     pub storage_path: String,
 
+    /// Path for Blockly program storage
+    #[arg(
+        long,
+        env = "PROGRAMS_PATH",
+        default_value = "~/.local/share/edgefirst/programs"
+    )]
+    pub programs_path: String,
+
+    /// Python interpreter path for Blockly programs
+    #[arg(long, env = "PYTHON_PATH", default_value = "/usr/bin/python3")]
+    pub python_path: String,
+
     /// HTTP port (default: 80, use 8080 for non-root)
     #[arg(long, env = "HTTP_PORT", default_value = "80")]
     pub http_port: u16,

@@ -12,7 +12,7 @@
 # - ubuntu-22.04: Standard GitHub-hosted runner (x86_64, 2 vCPU, 7 GB RAM)
 # - ubuntu-22.04-xlarge: Extra-large runner (x86_64, 32 vCPU, 128 GB RAM, 1200 GB SSD)
 # - ubuntu-22.04-arm-xlarge: Extra-large ARM runner (aarch64, 32 vCPU, 128 GB RAM, 1200 GB SSD)
-# - raivin: Self-hosted hardware runner with Zenoh network and Studio access
+# - raivin: Self-hosted hardware runner with Zenoh network and Studio access (currently disabled)
 #
 # Note: Coverage-instrumented builds require larger runners due to high memory
 # usage during LLVM instrumentation. See: github.com/actions/runner-images/issues/6680
@@ -192,8 +192,8 @@ jobs:
     name: Hardware Integration Tests
     needs: test
     runs-on: raivin
-    # Only run on main branch or when explicitly requested via label
-    if: github.ref == 'refs/heads/main' || contains(github.event.pull_request.labels.*.name, 'test-hardware')
+    # Disabled: raivin self-hosted runner is unavailable.
+    if: false
 
     steps:
       - name: Clean workspace (self-hosted runner)

@@ -174,8 +174,7 @@ graph LR
 | Endpoint | Priority | Capacity | Purpose | Handler Function |
 |----------|----------|----------|---------|------------------|
 | `/ws/dropped` | Normal | 1 | Error/dropped frame notifications | `websocket_handler_errors` |
-| `/api/rt/model/output` | High | 16 | Segmentation mask stream | `websocket_handler_high_priority` |
-| `/api/rt/{*topic}` | Low | 1 | General Zenoh topics | `websocket_handler_low_priority` |
+| `/api/rt/{*topic}` | High / Low | 16 / 1 | Zenoh topics (H.264, model, sensors) | `websocket_handler` |
 | `/mcap/` | Normal | Default | MCAP file list updates | `mcap_websocket_handler` |
 
 **Priority Modes**:

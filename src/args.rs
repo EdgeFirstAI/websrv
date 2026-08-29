@@ -64,7 +64,7 @@ pub struct Args {
     #[arg(
         long,
         env = "H264",
-        default_value = "/rt/camera/h264",
+        default_value = "camera/h264",
         conflicts_with = "system"
     )]
     h264: String,
@@ -130,9 +130,34 @@ impl From<Args> for WebUISettings {
     }
 }
 
+/// System hostname used as the Zenoh session namespace.
+///
+/// Empty or `/`-containing hostnames would create unintended sub-keys, so we
+/// fall back to `"localhost"` and warn. Two devices both falling back would
+/// silently share a namespace; that is a deployment defect.
+fn zenoh_namespace() -> String {
+    let raw = hostname::get()
+        .map(|h| h.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if raw.is_empty() || raw.contains('/') {
+        log::warn!(
+            "system hostname `{raw}` is empty or contains '/' — falling back to \"localhost\""
+        );
+        "localhost".into()
+    } else {
+        raw
+    }
+}
+
 impl From<Args> for Config {
     fn from(args: Args) -> Self {
         let mut config = Config::default();
+
+        // Session namespace = hostname: application keys are bare
+        // (`camera/h264`) and the wire form is `{hostname}/camera/h264`.
+        config
+            .insert_json5("namespace", &json!(zenoh_namespace()).to_string())
+            .unwrap();
 
         config
             .insert_json5("mode", &json!(args.mode).to_string())
@@ -163,5 +188,33 @@ impl From<Args> for Config {
             .unwrap();
 
         config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn zenoh_config_sets_namespace() {
+        let args = Args::parse_from(["edgefirst-websrv"]);
+        let cfg = Config::from(args);
+        let ns: String = serde_json::from_str(&cfg.to_string())
+            .ok()
+            .and_then(|v: serde_json::Value| {
+                v.pointer("/namespace")
+                    .and_then(|n| n.as_str().map(String::from))
+            })
+            .expect("namespace should be set in config");
+        assert!(!ns.is_empty(), "namespace should be non-empty");
+        assert!(!ns.contains('/'), "namespace must not contain '/'");
+    }
+
+    #[test]
+    fn default_h264_topic_has_no_rt_prefix() {
+        let args = Args::parse_from(["edgefirst-websrv"]);
+        assert_eq!(args.h264, "camera/h264");
+        assert!(!args.h264.starts_with("rt/"));
     }
 }

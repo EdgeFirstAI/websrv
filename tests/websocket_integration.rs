@@ -79,7 +79,7 @@ async fn test_websocket_receives_zenoh_message() {
     // Publish a message on the same topic via Zenoh
     let payload = b"hello from zenoh";
     zenoh_session
-        .put("rt/test/topic", payload.as_slice())
+        .put("test/topic", payload.as_slice())
         .await
         .expect("Failed to publish Zenoh message");
 

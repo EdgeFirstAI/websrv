@@ -205,11 +205,20 @@ fn is_precompressed_topic(topic: &str) -> bool {
     topic.contains("h264") || topic.contains("jpeg")
 }
 
+/// Maps `/api/rt/{*topic}` path remainder to a Zenoh application key.
+fn zenoh_key_from_ws_path(topic: &str) -> String {
+    topic
+        .strip_prefix('/')
+        .unwrap_or(topic)
+        .trim_end_matches('/')
+        .to_string()
+}
+
 // ============================================================================
 // WebSocket Handlers
 // ============================================================================
 
-/// WebSocket handler for `/rt/*topic` routes.
+/// WebSocket handler for `/api/rt/{*topic}` routes.
 ///
 /// Creates a per-connection MessageStream, spawns a zenoh_listener, and
 /// manages the WebSocket connection loop forwarding broadcast messages to
@@ -223,15 +232,10 @@ pub async fn websocket_handler<T: WebSocketContext>(
     axum::extract::Path(topic): axum::extract::Path<String>,
     axum::extract::Query(params): axum::extract::Query<WsParams>,
 ) -> impl IntoResponse {
-    // axum 0.8 wildcard captures include leading slash; strip it and prepend
-    // "rt/" since the route prefix /rt/ is the Zenoh key expression namespace
-    let topic = format!(
-        "rt/{}",
-        topic
-            .strip_prefix('/')
-            .unwrap_or(&topic)
-            .trim_end_matches('/')
-    );
+    // `/api/rt/` is the HTTP path, not a Zenoh prefix. Path remainder
+    // `camera/h264` is the application key; the session namespace adds
+    // `{hostname}/` on the wire.
+    let topic = zenoh_key_from_ws_path(&topic);
     let use_compression = params.compress && !is_precompressed_topic(&topic);
     let options = if use_compression {
         Options::default().with_compression_level(yawc::CompressionLevel::fast())
@@ -429,10 +433,18 @@ mod tests {
 
     #[test]
     fn test_websocket_message_deserialization() {
-        let json = r#"{"action":"subscribe","topic":"rt/camera"}"#;
+        let json = r#"{"action":"subscribe","topic":"camera"}"#;
         let msg: WebSocketMessage = serde_json::from_str(json).expect("Failed to deserialize");
         assert_eq!(msg.action, "subscribe");
-        assert_eq!(msg.topic, "rt/camera");
+        assert_eq!(msg.topic, "camera");
+    }
+
+    #[test]
+    fn zenoh_key_from_ws_path_strips_slashes_not_rt() {
+        assert_eq!(zenoh_key_from_ws_path("/camera/h264/"), "camera/h264");
+        assert_eq!(zenoh_key_from_ws_path("camera/h264"), "camera/h264");
+        assert_eq!(zenoh_key_from_ws_path("/tf_static"), "tf_static");
+        assert!(!zenoh_key_from_ws_path("/camera/h264").starts_with("rt/"));
     }
 
     #[test]

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Set the Zenoh session namespace to the system hostname and map
+  `/api/rt/{topic}` to the bare application key `{topic}` (no extra `rt/`
+  segment). Wire keys are `{hostname}/camera/h264` and so on (EDGEAI-1396).
+
 ## [4.0.1] - 2026-05-25
 
 ### Removed

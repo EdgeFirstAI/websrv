@@ -179,7 +179,7 @@ async fn test_websocket_compression_ratio() {
 
     for _ in 0..msg_count {
         zenoh_session
-            .put("rt/test/sensor_c", compressible_payload.as_slice())
+            .put("test/sensor_c", compressible_payload.as_slice())
             .await
             .expect("Zenoh put failed");
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -201,7 +201,7 @@ async fn test_websocket_compression_ratio() {
 
     for _ in 0..msg_count {
         zenoh_session
-            .put("rt/test/sensor_u", compressible_payload.as_slice())
+            .put("test/sensor_u", compressible_payload.as_slice())
             .await
             .expect("Zenoh put failed");
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -346,7 +346,7 @@ async fn test_compress_false_disables_compression() {
 
     for _ in 0..msg_count {
         zenoh_session
-            .put("rt/test/nocomp", payload.as_slice())
+            .put("test/nocomp", payload.as_slice())
             .await
             .expect("Zenoh put failed");
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;

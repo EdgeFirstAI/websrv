@@ -133,8 +133,8 @@ graph LR
 
     subgraph "WebSrv - WebSocket Handlers"
         WSError[/ws/dropped<br/>Error Stream]
-        WSMask[/rt/detect/mask<br/>High Priority]
-        WSGeneral[/rt/...*<br/>Low Priority]
+        WSMask[/api/rt/model/output<br/>High Priority]
+        WSGeneral[/api/rt/...*<br/>Low Priority]
         WSMCAP[/mcap/<br/>File Browser]
     end
 
@@ -174,8 +174,7 @@ graph LR
 | Endpoint | Priority | Capacity | Purpose | Handler Function |
 |----------|----------|----------|---------|------------------|
 | `/ws/dropped` | Normal | 1 | Error/dropped frame notifications | `websocket_handler_errors` |
-| `/rt/detect/mask` | High | 16 | Segmentation mask stream | `websocket_handler_high_priority` |
-| `/rt/{tail:.*}` | Low | 1 | General Zenoh topics | `websocket_handler_low_priority` |
+| `/api/rt/{*topic}` | High / Low | 16 / 1 | Zenoh topics (H.264, model, sensors) | `websocket_handler` |
 | `/mcap/` | Normal | Default | MCAP file list updates | `mcap_websocket_handler` |
 
 **Priority Modes**:
@@ -198,7 +197,7 @@ sequenceDiagram
     AxumWS->>Zenoh: Spawn tokio task with topic
 
     activate Zenoh
-    Zenoh->>ZenohBus: declare_subscriber("rt/camera/h264")
+    Zenoh->>ZenohBus: declare_subscriber("camera/h264")
 
     loop Real-time streaming
         ZenohBus-->>Zenoh: Sample data
@@ -401,7 +400,7 @@ graph TB
 
 **Configuration Format** (`/etc/default/{service}`):
 ```bash
-CAMERA_TOPIC=/rt/camera/h264
+CAMERA_TOPIC=camera/h264
 STORAGE_DIR=/var/lib/maivin/mcap
 TAG=production
 ENABLE_COMPRESSION=true
@@ -796,7 +795,7 @@ graph TB
 | `--connect` | Vec<String> | [] | Zenoh endpoints to connect to |
 | `--listen` | Vec<String> | [] | Zenoh endpoints to listen on |
 | `--no-multicast-scouting` | bool | false | Disable Zenoh multicast |
-| `--h264` | String | `/rt/camera/h264` | Video stream topic |
+| `--h264` | String | `camera/h264` | Video stream topic |
 | `--draw-box` | bool | true | Enable bounding box overlay |
 | `--draw-labels` | bool | true | Enable label overlay |
 | `--mirror` | bool | true | Mirror video horizontally |
@@ -984,14 +983,14 @@ sequenceDiagram
 
     Camera->>Maivin: Raw camera frames
     Maivin->>Maivin: H.264 encoding
-    Maivin->>Zenoh: Publish /rt/camera/h264
+    Maivin->>Zenoh: Publish camera/h264
 
     Note over Browser,WS: User opens video page
-    Browser->>WS: WebSocket connect /rt/camera/h264
+    Browser->>WS: WebSocket connect /api/rt/camera/h264
     WS->>Stream: Add client
     WS->>WebSrv: Spawn zenoh_listener thread
 
-    WebSrv->>Zenoh: declare_subscriber("/rt/camera/h264")
+    WebSrv->>Zenoh: declare_subscriber("camera/h264")
 
     loop Real-time streaming
         Zenoh-->>WebSrv: H.264 frame data

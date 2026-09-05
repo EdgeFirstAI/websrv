@@ -931,6 +931,7 @@ Example not-found body (404):
 | `--draw-labels` | bool | true | Enable label overlay |
 | `--mirror` | bool | true | Mirror video horizontally |
 | `--storage-path` | String | `.` | MCAP storage directory |
+| `--config-dir` | PathBuf | `/etc/default` | Service configuration directory |
 
 ## Security Architecture
 

@@ -56,6 +56,7 @@ pub(crate) struct Entry {
 ///
 /// systemd unescapes `\"` to `"` and `\\` to `\` inside double quotes, and
 /// needs no other escaping, so those two characters are the complete set.
+// Scaffolding: unused until Task 2 adds plan_edit. Remove this attribute then.
 #[allow(dead_code)]
 pub(crate) fn escape_value(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -69,7 +70,6 @@ pub(crate) fn escape_value(s: &str) -> String {
 }
 
 /// True when `key` is a valid environment variable name.
-#[allow(dead_code)]
 fn valid_key(key: &str) -> bool {
     let mut chars = key.chars();
     match chars.next() {
@@ -80,7 +80,6 @@ fn valid_key(key: &str) -> bool {
 }
 
 /// Render a JSON scalar as a string, or `None` if it is not a scalar.
-#[allow(dead_code)]
 fn scalar_to_string(value: &Value) -> Option<String> {
     match value {
         Value::String(s) => Some(s.clone()),
@@ -91,7 +90,6 @@ fn scalar_to_string(value: &Value) -> Option<String> {
 }
 
 /// Name a JSON type for use in rejection messages.
-#[allow(dead_code)]
 fn type_name(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",
@@ -105,7 +103,6 @@ fn type_name(value: &Value) -> &'static str {
 
 /// Convert one JSON value into the string that will be written, or `None`
 /// to unset the key.
-#[allow(dead_code)]
 fn coerce(value: &Value) -> Result<Option<String>, Reject> {
     match value {
         Value::Null => Ok(None),
@@ -141,7 +138,6 @@ fn coerce(value: &Value) -> Result<Option<String>, Reject> {
 ///
 /// A newline is the dangerous case: it would inject additional `KEY=VALUE`
 /// lines into a file systemd feeds to services running as root.
-#[allow(dead_code)]
 fn check_writable(value: &str) -> Result<(), Reject> {
     if let Some(c) = value.chars().find(|c| c.is_control()) {
         return Err(Reject::InvalidValue(format!(
@@ -157,6 +153,7 @@ fn check_writable(value: &str) -> Result<(), Reject> {
 /// Returns `Err` with a rejection for every offending key if any key is
 /// invalid, so the caller can report all problems in a single response and
 /// leave the file untouched.
+// Scaffolding: unused until Task 2 adds plan_edit. Remove this attribute then.
 #[allow(dead_code)]
 pub(crate) fn validate(
     updates: &Map<String, Value>,

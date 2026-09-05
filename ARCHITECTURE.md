@@ -835,8 +835,8 @@ plain successful save stays compact:
 | `path` | string | file resolved | Absolute path of the file that was read or written. |
 | `applied` | bool | always | `true` only when the file was actually rewritten. |
 | `restarted` | bool | always | `true` when the service was active and restarted successfully. |
-| `dispositions` | object | plan ok | Per-key outcome: updated/inserted/appended/unset/unchanged. |
-| `unmatched` | string array | plan ok | Keys appended because absent everywhere in the file. |
+| `dispositions` | object | 200 only | Per-key outcome: updated/inserted/appended/unset/unchanged. |
+| `unmatched` | string array | 200 only | Keys appended because absent everywhere in the file. |
 | `reserved` | string array | reserved key sent | Stripped keys naming the file, not a setting. |
 | `rejected` | object | 400, invalid key | Reason: invalid_key/invalid_value/unsupported_type. |
 | `tried` | string array | 404 | Every candidate path examined. |
@@ -865,8 +865,9 @@ Status codes:
 - **400** — the body was not a JSON object, `fileName` was missing, not a
   string, or failed the path-safety whitelist, or one or more submitted keys
   were rejected (`rejected` is populated).
-- **404** — neither candidate configuration file exists (`tried` is
-  populated).
+- **404** — neither candidate path is a regular file: the service has no
+  configuration file, or the name resolves to a directory or other
+  non-regular file (`tried` is populated).
 - **500** — the resolved configuration file could not be read, or the
   rewritten content could not be written back.
 

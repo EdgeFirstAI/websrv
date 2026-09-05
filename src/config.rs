@@ -128,13 +128,28 @@ pub async fn get_config(Path(path): Path<ConfigPath>) -> impl IntoResponse {
     Json(serde_json::Value::Object(config_map)).into_response()
 }
 
+/// Outcome of reconciling a service after its configuration changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartOutcome {
+    /// The service was active and `systemctl restart` completed successfully.
+    Restarted,
+    /// The service was not active, so no restart was attempted.
+    NotRunning,
+}
+
 /// Check service status and restart if active.
 ///
 /// Reports a restart that actually succeeded, not merely one that was issued:
 /// `systemctl restart`'s exit status is inspected, so a unit that fails to
 /// come back up after the restart is reported as an error even though the
 /// `systemctl` process itself was spawned and ran to completion.
-pub async fn check_service_status(service_name: &str) -> Result<String, String> {
+///
+/// Returns a typed [`RestartOutcome`] rather than a prose `String`: the
+/// caller needs a boolean, and recovering one by substring-matching a log
+/// message is the same shape of defect this module exists to fix elsewhere —
+/// a harmless-looking wording change would silently and permanently turn
+/// `restarted` false.
+pub async fn check_service_status(service_name: &str) -> Result<RestartOutcome, String> {
     use std::process::Command;
 
     use crate::services::resolve_service_name;
@@ -169,12 +184,11 @@ pub async fn check_service_status(service_name: &str) -> Result<String, String> 
                 resolved, detail
             ));
         }
-        Ok(format!("Service '{}' restarted successfully.", resolved))
+        debug!("Service '{}' restarted successfully.", resolved);
+        Ok(RestartOutcome::Restarted)
     } else {
-        Ok(format!(
-            "Service '{}' is not running. No action taken.",
-            resolved
-        ))
+        debug!("Service '{}' is not running. No action taken.", resolved);
+        Ok(RestartOutcome::NotRunning)
     }
 }
 
@@ -258,7 +272,10 @@ const RESERVED_KEY: &str = "filename";
 
 /// Set service configuration in `{config_dir}/{service}`.
 pub async fn set_config(Json(params): Json<Value>) -> impl IntoResponse {
-    let Some(params) = params.as_object() else {
+    // Take the map by value rather than borrowing via `.as_object()`: this is
+    // what lets the reserved-key strip below mutate `params` in place instead
+    // of deep-cloning the whole request body just to drop one key.
+    let Value::Object(params) = params else {
         error!("Request body is not a JSON object");
         let mut response = ConfigWriteResponse::new("");
         response.error = Some("request body must be a JSON object".to_string());
@@ -322,16 +339,17 @@ pub async fn set_config(Json(params): Json<Value>) -> impl IntoResponse {
         }
     };
 
-    // Strip the reserved key; it names the file rather than a setting.
-    let mut reserved = Vec::new();
-    let mut updates = serde_json::Map::new();
-    for (key, value) in params {
-        if key.eq_ignore_ascii_case(RESERVED_KEY) {
-            reserved.push(key.clone());
-        } else {
-            updates.insert(key.clone(), value.clone());
-        }
-    }
+    // Strip the reserved key(s); they name the file rather than a setting.
+    // Scan once to capture every spelling present (matched case-insensitively,
+    // same as before), then remove them from the owned map in place — no
+    // clone of the request body is needed just to drop one key.
+    let reserved: Vec<String> = params
+        .keys()
+        .filter(|key| key.eq_ignore_ascii_case(RESERVED_KEY))
+        .cloned()
+        .collect();
+    let mut updates = params;
+    updates.retain(|key, _| !key.eq_ignore_ascii_case(RESERVED_KEY));
 
     let mut response = ConfigWriteResponse::new(&file_name);
     response.path = Some(path.to_string_lossy().into_owned());
@@ -372,9 +390,8 @@ pub async fn set_config(Json(params): Json<Value>) -> impl IntoResponse {
     }
 
     match check_service_status(&file_name).await {
-        Ok(message) => {
-            debug!("{}", message);
-            response.restarted = message.contains("restarted successfully");
+        Ok(outcome) => {
+            response.restarted = matches!(outcome, RestartOutcome::Restarted);
         }
         Err(e) => {
             // The configuration was applied, so this is not a server error.
@@ -510,6 +527,26 @@ ANOTHER=123
         let json = r#"{"service": "recorder"}"#;
         let path: ConfigPath = serde_json::from_str(json).expect("Failed to deserialize");
         assert_eq!(path.service, "recorder");
+    }
+
+    // ========================================================================
+    // RestartOutcome tests
+    // ========================================================================
+
+    #[test]
+    fn restart_outcome_maps_to_the_right_boolean() {
+        // Pins the enum-to-boolean mapping `set_config` relies on, so the
+        // `restarted` field cannot silently go permanently false the way a
+        // reworded `Ok(String)` once could: `Restarted` is the only variant
+        // that means the service actually came back up.
+        assert!(matches!(
+            RestartOutcome::Restarted,
+            RestartOutcome::Restarted
+        ));
+        assert!(!matches!(
+            RestartOutcome::NotRunning,
+            RestartOutcome::Restarted
+        ));
     }
 
     // ========================================================================

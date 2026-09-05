@@ -33,8 +33,25 @@ fn config_dir() -> &'static Path {
         .path()
 }
 
+/// Guards writes to the shared config directory against the one test that
+/// makes it briefly read-only (`a_failed_write_withholds_dispositions_and_unmatched`).
+///
+/// Tests in this binary run concurrently as threads sharing one process, and
+/// `cargo test` proved that out: without this lock, that test's chmod window
+/// intermittently broke unrelated tests with spurious permission-denied
+/// writes and 500s. Every write-touching helper takes a read lock for the
+/// span of its actual disk access; the one test that flips the directory
+/// read-only takes the write lock for that same span, so the two can never
+/// overlap.
+static DIR_LOCK: OnceLock<tokio::sync::RwLock<()>> = OnceLock::new();
+
+fn dir_lock() -> &'static tokio::sync::RwLock<()> {
+    DIR_LOCK.get_or_init(|| tokio::sync::RwLock::new(()))
+}
+
 /// Seed a uniquely-named service config from a fixture and return its name.
-fn seed(service: &str, fixture: &str) -> String {
+async fn seed(service: &str, fixture: &str) -> String {
+    let _guard = dir_lock().read().await;
     let name = format!("websrv-test-{service}");
     let source = format!(
         "{}/tests/fixtures/{fixture}.default",
@@ -51,6 +68,8 @@ fn app() -> Router {
 
 /// POST a JSON body and return the status and parsed response.
 async fn post_config(service: &str, body: Value) -> (StatusCode, Value) {
+    // Held across the request: `set_config` may write to `config_dir()`.
+    let _guard = dir_lock().read().await;
     let request = Request::builder()
         .method("POST")
         .uri(format!("/api/config/{service}"))
@@ -73,7 +92,7 @@ fn read(service: &str) -> String {
 
 #[tokio::test]
 async fn applies_a_real_change_and_reports_dispositions() {
-    let svc = seed("apply", "lidarpub");
+    let svc = seed("apply", "lidarpub").await;
     let (status, body) = post_config(
         &svc,
         json!({ "fileName": svc, "CLUSTERING": "voxel", "CLUSTERING_EPS": 250 }),
@@ -98,7 +117,7 @@ async fn applies_a_real_change_and_reports_dispositions() {
 
 #[tokio::test]
 async fn rejects_the_whole_request_and_leaves_the_file_untouched() {
-    let svc = seed("reject", "lidarpub");
+    let svc = seed("reject", "lidarpub").await;
     let before = read(&svc);
 
     let (status, body) = post_config(
@@ -136,7 +155,7 @@ async fn a_missing_config_file_is_not_found() {
 
 #[tokio::test]
 async fn an_unchanged_save_writes_nothing() {
-    let svc = seed("noop", "lidarpub");
+    let svc = seed("noop", "lidarpub").await;
     // lidarpub.default already reads RUST_LOG="info" in canonical form, so
     // both saves are no-ops. The first proves a save of an identical value
     // does not rewrite; the second proves it stays that way.
@@ -183,7 +202,10 @@ async fn a_filename_naming_a_directory_is_not_found_not_a_server_error() {
     // path. It must be a 404 instead, exactly like a name that resolves to
     // nothing at all.
     let name = "websrv-test-a-directory-not-a-file";
-    std::fs::create_dir(config_dir().join(name)).expect("create directory");
+    {
+        let _guard = dir_lock().read().await;
+        std::fs::create_dir(config_dir().join(name)).expect("create directory");
+    }
 
     let (status, body) = post_config(name, json!({ "fileName": name, "A": "1" })).await;
 
@@ -193,7 +215,7 @@ async fn a_filename_naming_a_directory_is_not_found_not_a_server_error() {
 
 #[tokio::test]
 async fn get_returns_the_written_values() {
-    let svc = seed("get", "lidarpub");
+    let svc = seed("get", "lidarpub").await;
     post_config(&svc, json!({ "fileName": svc, "CLUSTERING": "dbscan" })).await;
 
     let request = Request::builder()
@@ -214,7 +236,7 @@ async fn get_returns_the_written_values() {
 async fn null_unsets_a_key_and_reports_it() {
     // RUST_LOG ships active in lidarpub.default (TARGET ships already
     // commented, which would make the "no active line" assertion vacuous).
-    let svc = seed("unset", "lidarpub");
+    let svc = seed("unset", "lidarpub").await;
     let (status, body) = post_config(&svc, json!({ "fileName": svc, "RUST_LOG": null })).await;
 
     assert_eq!(status, StatusCode::OK);
@@ -236,7 +258,7 @@ async fn null_unsets_a_key_and_reports_it() {
 
 #[tokio::test]
 async fn an_unmatched_key_is_appended_and_reported() {
-    let svc = seed("append", "lidarpub");
+    let svc = seed("append", "lidarpub").await;
     let (status, body) = post_config(
         &svc,
         json!({ "fileName": svc, "BRAND_NEW_KEY_TEST": "value" }),
@@ -260,8 +282,83 @@ async fn an_unmatched_key_is_appended_and_reported() {
 }
 
 #[tokio::test]
+async fn a_failed_write_withholds_dispositions_and_unmatched() {
+    // Regression test for the fix in 51dc3f7: a write that fails after a real
+    // plan was computed must not report dispositions/unmatched for an edit
+    // that was never actually applied. Mutation-tested by QA: reordering the
+    // dispositions/unmatched assignment to before `write_atomic` left the
+    // whole suite green, so this pins the ordering directly.
+    //
+    // `write_atomic` fails because `NamedTempFile::new_in` cannot create its
+    // sibling temp file: the shared config directory is made read-only for
+    // the span of this one request, then restored immediately afterwards
+    // (in a `finally`-style guard) so no other test in this binary is left
+    // running against a read-only directory. This test holds `dir_lock`'s
+    // WRITE side for that whole span, so it cannot overlap any other test's
+    // read lock — see `dir_lock`'s doc comment for why that matters: without
+    // it, this chmod window intermittently broke unrelated tests.
+    use std::os::unix::fs::PermissionsExt;
+
+    struct RestoreMode {
+        dir: std::path::PathBuf,
+        mode: u32,
+    }
+    impl Drop for RestoreMode {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.dir, std::fs::Permissions::from_mode(self.mode));
+        }
+    }
+
+    let svc = seed("write-fails", "lidarpub").await;
+    let dir = config_dir().to_path_buf();
+    let original_mode = std::fs::metadata(&dir)
+        .expect("stat dir")
+        .permissions()
+        .mode();
+    let _restore = RestoreMode {
+        dir: dir.clone(),
+        mode: original_mode,
+    };
+
+    // Exclusive: excludes every reader (`seed`, `post_config`) for as long as
+    // the directory is read-only. Built manually rather than through
+    // `post_config`, which takes its own read lock and would deadlock
+    // against the write lock held by this same thread.
+    let _write_guard = dir_lock().write().await;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("chmod ro");
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/api/config/{svc}"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "fileName": svc, "CLUSTERING": "voxel" }).to_string(),
+        ))
+        .expect("build request");
+    let response = app().oneshot(request).await.expect("handler ran");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("read body");
+    let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    drop(_restore); // restore before any assertion can panic
+    drop(_write_guard);
+
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(body["applied"], json!(false));
+    assert!(body["error"].is_string(), "expected an error message");
+    assert!(
+        body.get("dispositions").is_none(),
+        "dispositions must be withheld on a failed write, got {body}"
+    );
+    assert!(
+        body.get("unmatched").is_none(),
+        "unmatched must be withheld on a failed write, got {body}"
+    );
+}
+
+#[tokio::test]
 async fn atomic_write_leaves_no_stray_files() {
-    let svc = seed("atomic", "camera");
+    let svc = seed("atomic", "camera").await;
     post_config(&svc, json!({ "fileName": svc, "RUST_LOG": "trace" })).await;
 
     let strays: Vec<String> = std::fs::read_dir(config_dir())

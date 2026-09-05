@@ -820,6 +820,28 @@ mod tests {
     }
 
     #[test]
+    fn an_unchanged_line_is_promoted_when_a_later_duplicate_really_changes() {
+        // Pins the `and_modify` promotion in `plan_edit`: with several active
+        // lines for one key, an earlier line that already matched must not
+        // leave the key dispositioned `Unchanged` once a later line proves a
+        // real change happened somewhere. The first line here already reads
+        // the submitted value; the second does not.
+        let p = plan("KEY=\"1\"\nx\nKEY=\"2\"\n", json!({ "KEY": "1" }));
+        assert_eq!(p.content, "KEY=\"1\"\nx\nKEY=\"1\"\n");
+        assert_eq!(p.dispositions["KEY"], Disposition::Updated);
+    }
+
+    #[test]
+    fn a_later_unchanged_line_does_not_undo_an_earlier_promotion() {
+        // The reverse order: the first line is the one that changes, the
+        // second already matches. The key must still end up `Updated`, not
+        // demoted back to `Unchanged` by processing the matching line last.
+        let p = plan("KEY=\"2\"\nx\nKEY=\"1\"\n", json!({ "KEY": "1" }));
+        assert_eq!(p.content, "KEY=\"1\"\nx\nKEY=\"1\"\n");
+        assert_eq!(p.dispositions["KEY"], Disposition::Updated);
+    }
+
+    #[test]
     fn documentation_prose_containing_equals_is_never_matched() {
         let original =
             "# Examples: \"info\", \"debug\", \"warn\", \"edgefirst_lidarpub=debug,info\"\n\

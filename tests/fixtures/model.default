@@ -1,0 +1,170 @@
+# EdgeFirst Model Configuration
+#
+# This file is loaded by the systemd service as an EnvironmentFile. Every
+# variable here maps to a command-line flag of the same name (lower-case,
+# with dashes replaced by underscores). Command-line flags take precedence
+# over environment variables.
+#
+# Syntax rules (systemd EnvironmentFile):
+#   - Lines beginning with # or ; are comments.
+#   - KEY=VALUE pairs, one per line.
+#   - Quoting is optional; quotes are stripped by systemd.
+#   - No spaces around the '=' sign.
+
+# ---------------------------------------------------------------------------
+# Model Path
+# ---------------------------------------------------------------------------
+# Path to the inference model file (e.g., a .tflite model). This is required
+# and the service will not start without it. Place model files in a known
+# location such as /usr/share/edgefirst/models/.
+MODEL=""
+
+# ---------------------------------------------------------------------------
+# EdgeFirst Config Override
+# ---------------------------------------------------------------------------
+# Optional path to an EdgeFirst config file (YAML or JSON) that overrides the
+# config embedded in the model, or supplies one when the model does not
+# include a config. Leave empty to use the model's built-in config.
+EDGEFIRST_CONFIG=""
+
+# ---------------------------------------------------------------------------
+# TFLite Delegate
+# ---------------------------------------------------------------------------
+# Path to TFLite delegate shared library. Leave empty for CPU-only inference.
+# Examples:
+#   i.MX 8M Plus NPU: DELEGATE="/usr/lib/libvx_delegate.so"
+#   i.MX 95 Neutron:   DELEGATE="/usr/lib/libneutron_delegate.so"
+DELEGATE=""
+
+# ---------------------------------------------------------------------------
+# Detection Parameters
+# ---------------------------------------------------------------------------
+# Minimum confidence score for a detection to be accepted. When TRACK is
+# enabled, this also serves as the threshold for creating new ByteTrack
+# tracklets (the decoder uses TRACK_SCORE instead). Range: 0.0 to 1.0.
+THRESHOLD="0.45"
+
+# IOU (Intersection over Union) threshold for non-maximum suppression.
+# Overlapping boxes with IOU above this value are merged. Range: 0.0 to 1.0.
+IOU="0.45"
+
+# Maximum number of detection bounding boxes to output per frame.
+MAX_BOXES="100"
+
+# Label index offset applied to detection class indices. Useful when the
+# model's class indices do not start at 0.
+LABEL_OFFSET="0"
+
+# ---------------------------------------------------------------------------
+# Label Annotation
+# ---------------------------------------------------------------------------
+# Controls what text is drawn next to each detected bounding box.
+# Accepted values: index, label, score, label-score, track
+#   index       - Show class index only
+#   label       - Show class label name
+#   score       - Show confidence score only
+#   label-score - Show label and score together
+#   track       - Show tracking ID (requires TRACK=true)
+LABELS="label"
+
+# ---------------------------------------------------------------------------
+# SSD Model Mode
+# ---------------------------------------------------------------------------
+# Enable SSD model mode when a different model config is not found. Set to
+# true only when using an SSD-style detection model without an embedded
+# EdgeFirst config.
+SSD_MODEL="false"
+
+# ---------------------------------------------------------------------------
+# Object Tracking (ByteTrack)
+# ---------------------------------------------------------------------------
+# Enable multi-object tracking. Must be true for the other TRACK_* parameters
+# to have any effect.
+TRACK="false"
+
+# Number of seconds a tracked object can be missing (not matched to a
+# detection) before the track is removed.
+TRACK_EXTRA_LIFESPAN="0.5"
+
+# Score threshold for the decoder when tracking is enabled. A lower value
+# than THRESHOLD lets the tracker see more candidate detections for
+# tracker-assisted recovery. Only effective when TRACK=true.
+TRACK_SCORE="0.1"
+
+# IOU threshold for associating detection boxes with existing tracks.
+# Higher values require tighter overlap for a match. Range: 0.0 to 1.0.
+TRACK_IOU="0.25"
+
+# Kalman filter update factor for tracked boxes. Higher values mean less
+# smoothing but faster response to position changes. Range: 0.0 to 1.0.
+TRACK_UPDATE="0.25"
+
+# ---------------------------------------------------------------------------
+# Visualization
+# ---------------------------------------------------------------------------
+# Enable publishing a Foxglove-compatible visualization message with
+# annotated bounding boxes overlaid on the camera image.
+VISUALIZATION="false"
+
+# ---------------------------------------------------------------------------
+# Topics
+# ---------------------------------------------------------------------------
+# Zenoh key expressions for subscribing and publishing messages. All topics
+# can be overridden via CLI flags or environment variables.
+
+# Camera frame subscription topic (CameraFrame schema).
+CAMERA_TOPIC="camera/frame"
+
+# Camera info subscription topic (needed when VISUALIZATION is enabled).
+CAMERA_INFO_TOPIC="camera/info"
+
+# Unified model output topic (boxes, masks, timing in a single message).
+OUTPUT_TOPIC="model/output"
+
+# Model metadata topic (model name, labels, input/output shapes).
+INFO_TOPIC="model/info"
+
+# Foxglove visualization topic (when VISUALIZATION is enabled).
+VISUAL_TOPIC="model/visualization"
+
+# Legacy detection topic. Empty string disables publishing. Set to
+# "model/boxes2d" to re-enable for backwards compatibility.
+DETECT_TOPIC=""
+
+# Legacy mask topic. Empty string disables publishing. Set to
+# "model/mask" to re-enable for backwards compatibility.
+MASK_TOPIC=""
+
+# Space-separated class label names to include in output (empty = all classes).
+# Only boxes matching these labels (and their associated instance masks) are
+# published. Example: CLASSES="person car truck"
+CLASSES=""
+
+# ---------------------------------------------------------------------------
+# Zenoh Networking
+# ---------------------------------------------------------------------------
+# Zenoh participant mode. In "peer" mode nodes discover each other via
+# multicast. Use "client" to connect to a Zenoh router, or "router" to act
+# as one.
+# Accepted values: peer, client, router
+MODE="peer"
+
+# Zenoh endpoint(s) to connect to. Required when MODE is "client".
+# Example: CONNECT="tcp/192.168.1.1:7447"
+CONNECT=""
+
+# Zenoh endpoint(s) to listen on. Useful when running as a router or when
+# peers need to reach this node on a specific address/port.
+LISTEN=""
+
+# Disable Zenoh multicast scouting (peer auto-discovery). Set to true when
+# operating in networks where multicast is unavailable or undesired, and use
+# CONNECT/LISTEN for explicit endpoint configuration instead.
+NO_MULTICAST_SCOUTING="false"
+
+# ---------------------------------------------------------------------------
+# Debugging / Profiling
+# ---------------------------------------------------------------------------
+# Enable the Tracy profiler for real-time performance analysis. Requires the
+# binary to be built with Tracy support.
+TRACY="false"

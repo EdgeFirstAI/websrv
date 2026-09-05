@@ -12,6 +12,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::io;
 
+use crate::envfile::{parse_config_content, plan_edit};
+
 const EDGEFIRST_PREFIX: &str = "edgefirst-";
 
 /// Resolve a config file path under `/etc/default/`, supporting both
@@ -130,87 +132,6 @@ pub fn parse_storage_directory(content: &str) -> io::Result<String> {
     ))
 }
 
-/// Parse config file content into a JSON map
-pub fn parse_config_content(content: &str) -> serde_json::Map<String, serde_json::Value> {
-    let mut config_map = serde_json::Map::new();
-
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((key, value)) = line.split_once('=') {
-            let clean_key = key.trim();
-            let raw_value = value.trim();
-
-            // If the value is quoted, treat it as a single string value
-            if raw_value.starts_with('"') && raw_value.ends_with('"') && raw_value.len() >= 2 {
-                let unquoted = &raw_value[1..raw_value.len() - 1];
-                config_map.insert(
-                    clean_key.to_string(),
-                    serde_json::Value::String(unquoted.to_string()),
-                );
-            } else {
-                // Unquoted: split on whitespace for multiple values
-                let clean_value = raw_value.replace("\"", "");
-                let parts: Vec<&str> = clean_value.split_whitespace().collect();
-
-                if parts.len() > 1 {
-                    config_map.insert(
-                        clean_key.to_string(),
-                        serde_json::Value::Array(
-                            parts
-                                .iter()
-                                .map(|s| serde_json::Value::String(s.to_string()))
-                                .collect(),
-                        ),
-                    );
-                } else {
-                    config_map.insert(
-                        clean_key.to_string(),
-                        serde_json::Value::String(clean_value.to_string()),
-                    );
-                }
-            }
-        }
-    }
-
-    config_map
-}
-
-/// Update config content with new values
-pub fn update_config_content(
-    original_content: &str,
-    updates: &serde_json::Map<String, serde_json::Value>,
-) -> String {
-    let mut updated_config = String::new();
-
-    for line in original_content.lines() {
-        let mut found = false;
-
-        for (key, value) in updates {
-            let escaped_key = regex::escape(key);
-            let pattern = format!(r"(?i)^\s*{}\s*=\s*.*", escaped_key);
-            let re = Regex::new(&pattern).unwrap();
-
-            if re.is_match(line) {
-                updated_config.push_str(&format!(
-                    "{} = \"{}\"\n",
-                    key.to_uppercase(),
-                    value.as_str().unwrap_or("")
-                ));
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            updated_config.push_str(&format!("{}\n", line));
-        }
-    }
-
-    updated_config
-}
-
 /// Set service configuration in /etc/default/{service}
 pub async fn set_config(Json(params): Json<Value>) -> impl IntoResponse {
     let file_name = if let Some(file_name_value) = params.get("fileName") {
@@ -262,9 +183,19 @@ pub async fn set_config(Json(params): Json<Value>) -> impl IntoResponse {
         serde_json::Map::new()
     };
 
-    let updated_config = update_config_content(&config_content, &config_map);
+    // TODO(EDGEAI-1402 Task 6): this whole handler body is replaced wholesale
+    // by Task 6, which reports per-key dispositions instead of writing plain
+    // text. This is a minimal stopgap so the crate keeps compiling now that
+    // `update_config_content` is gone.
+    let plan = match plan_edit(&config_content, &config_map) {
+        Ok(plan) => plan,
+        Err(rejected) => {
+            error!("Rejected configuration keys: {:?}", rejected);
+            return (StatusCode::BAD_REQUEST, "Invalid configuration values").into_response();
+        }
+    };
 
-    match std::fs::write(config_file_path.clone(), updated_config) {
+    match std::fs::write(config_file_path.clone(), plan.content) {
         Ok(_) => match check_service_status(&service_name).await {
             Ok(_) => (
                 StatusCode::OK,
@@ -371,135 +302,6 @@ ANOTHER=123
             expand_env_vars("$THIS_VAR_SHOULD_NOT_EXIST_EVER/data"),
             "/data"
         );
-    }
-
-    // ========================================================================
-    // Config content parsing tests
-    // ========================================================================
-
-    #[test]
-    fn test_parse_config_content_simple() {
-        let content = r#"
-KEY1=value1
-KEY2=value2
-"#;
-        let result = parse_config_content(content);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result.get("KEY1").unwrap(), "value1");
-        assert_eq!(result.get("KEY2").unwrap(), "value2");
-    }
-
-    #[test]
-    fn test_parse_config_content_with_quotes() {
-        let content = r#"
-PATH="/usr/local/bin"
-NAME="My Service"
-"#;
-        let result = parse_config_content(content);
-        assert_eq!(result.get("PATH").unwrap(), "/usr/local/bin");
-        assert_eq!(result.get("NAME").unwrap(), "My Service");
-    }
-
-    #[test]
-    fn test_parse_config_content_with_comments() {
-        let content = r#"
-# This is a comment
-KEY1=value1
-# Another comment
-KEY2=value2
-"#;
-        let result = parse_config_content(content);
-        assert_eq!(result.len(), 2);
-        assert!(!result.contains_key("# This is a comment"));
-    }
-
-    #[test]
-    fn test_parse_config_content_empty_lines() {
-        let content = r#"
-KEY1=value1
-
-KEY2=value2
-
-"#;
-        let result = parse_config_content(content);
-        assert_eq!(result.len(), 2);
-    }
-
-    #[test]
-    fn test_parse_config_content_multiple_values() {
-        let content = r#"TOPICS=topic1 topic2 topic3"#;
-        let result = parse_config_content(content);
-        let topics = result.get("TOPICS").unwrap().as_array().unwrap();
-        assert_eq!(topics.len(), 3);
-        assert_eq!(topics[0], "topic1");
-        assert_eq!(topics[1], "topic2");
-        assert_eq!(topics[2], "topic3");
-    }
-
-    #[test]
-    fn test_parse_config_content_empty() {
-        let content = "";
-        let result = parse_config_content(content);
-        assert!(result.is_empty());
-    }
-
-    // ========================================================================
-    // Config update tests
-    // ========================================================================
-
-    #[test]
-    fn test_update_config_content_simple() {
-        let original = "KEY1=old_value\nKEY2=keep_this\n";
-        let mut updates = serde_json::Map::new();
-        updates.insert(
-            "KEY1".to_string(),
-            serde_json::Value::String("new_value".to_string()),
-        );
-
-        let result = update_config_content(original, &updates);
-        assert!(result.contains("KEY1 = \"new_value\""));
-        assert!(result.contains("KEY2=keep_this"));
-    }
-
-    #[test]
-    fn test_update_config_content_case_insensitive() {
-        let original = "key1=old_value\n";
-        let mut updates = serde_json::Map::new();
-        updates.insert(
-            "KEY1".to_string(),
-            serde_json::Value::String("new_value".to_string()),
-        );
-
-        let result = update_config_content(original, &updates);
-        assert!(result.contains("KEY1 = \"new_value\""));
-    }
-
-    #[test]
-    fn test_update_config_content_preserves_comments() {
-        let original = "# Comment line\nKEY1=value\n";
-        let updates = serde_json::Map::new();
-
-        let result = update_config_content(original, &updates);
-        assert!(result.contains("# Comment line"));
-    }
-
-    #[test]
-    fn test_update_config_content_multiple_updates() {
-        let original = "KEY1=old1\nKEY2=old2\nKEY3=old3\n";
-        let mut updates = serde_json::Map::new();
-        updates.insert(
-            "KEY1".to_string(),
-            serde_json::Value::String("new1".to_string()),
-        );
-        updates.insert(
-            "KEY3".to_string(),
-            serde_json::Value::String("new3".to_string()),
-        );
-
-        let result = update_config_content(original, &updates);
-        assert!(result.contains("KEY1 = \"new1\""));
-        assert!(result.contains("KEY2=old2"));
-        assert!(result.contains("KEY3 = \"new3\""));
     }
 
     // ========================================================================

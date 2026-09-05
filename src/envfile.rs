@@ -211,6 +211,50 @@ pub(crate) fn validate(
     }
 }
 
+/// Parse config file content into a JSON map.
+///
+/// Values that are whitespace-separated and unquoted become JSON arrays;
+/// [`plan_edit`] joins arrays back with single spaces, so the two are
+/// inverses.
+pub fn parse_config_content(content: &str) -> Map<String, Value> {
+    let mut config_map = Map::new();
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            let clean_key = key.trim();
+            let raw_value = value.trim();
+
+            // If the value is quoted, treat it as a single string value
+            if raw_value.starts_with('"') && raw_value.ends_with('"') && raw_value.len() >= 2 {
+                let unquoted = &raw_value[1..raw_value.len() - 1];
+                config_map.insert(clean_key.to_string(), Value::String(unquoted.to_string()));
+            } else {
+                // Unquoted: split on whitespace for multiple values
+                let clean_value = raw_value.replace("\"", "");
+                let parts: Vec<&str> = clean_value.split_whitespace().collect();
+
+                if parts.len() > 1 {
+                    config_map.insert(
+                        clean_key.to_string(),
+                        Value::Array(parts.iter().map(|s| Value::String(s.to_string())).collect()),
+                    );
+                } else {
+                    config_map.insert(
+                        clean_key.to_string(),
+                        Value::String(clean_value.to_string()),
+                    );
+                }
+            }
+        }
+    }
+
+    config_map
+}
+
 /// Comment introducing keys appended because they appeared nowhere in the file.
 pub const APPEND_MARKER: &str = "# --- Added by edgefirst-websrv ---";
 
@@ -775,5 +819,215 @@ mod tests {
         let e = plan_edit("A=\"1\"\n", &map(json!({ "A": "ok\nEVIL=1" })))
             .expect_err("expected rejection");
         assert!(matches!(e["A"], Reject::InvalidValue(_)));
+    }
+
+    // ========================================================================
+    // Config content parsing tests
+    // ========================================================================
+
+    #[test]
+    fn test_parse_config_content_simple() {
+        let content = r#"
+KEY1=value1
+KEY2=value2
+"#;
+        let result = parse_config_content(content);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result.get("KEY1").unwrap(), "value1");
+        assert_eq!(result.get("KEY2").unwrap(), "value2");
+    }
+
+    #[test]
+    fn test_parse_config_content_with_quotes() {
+        let content = r#"
+PATH="/usr/local/bin"
+NAME="My Service"
+"#;
+        let result = parse_config_content(content);
+        assert_eq!(result.get("PATH").unwrap(), "/usr/local/bin");
+        assert_eq!(result.get("NAME").unwrap(), "My Service");
+    }
+
+    #[test]
+    fn test_parse_config_content_with_comments() {
+        let content = r#"
+# This is a comment
+KEY1=value1
+# Another comment
+KEY2=value2
+"#;
+        let result = parse_config_content(content);
+        assert_eq!(result.len(), 2);
+        assert!(!result.contains_key("# This is a comment"));
+    }
+
+    #[test]
+    fn test_parse_config_content_empty_lines() {
+        let content = r#"
+KEY1=value1
+
+KEY2=value2
+
+"#;
+        let result = parse_config_content(content);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_config_content_multiple_values() {
+        let content = r#"TOPICS=topic1 topic2 topic3"#;
+        let result = parse_config_content(content);
+        let topics = result.get("TOPICS").unwrap().as_array().unwrap();
+        assert_eq!(topics.len(), 3);
+        assert_eq!(topics[0], "topic1");
+        assert_eq!(topics[1], "topic2");
+        assert_eq!(topics[2], "topic3");
+    }
+
+    #[test]
+    fn test_parse_config_content_empty() {
+        let content = "";
+        let result = parse_config_content(content);
+        assert!(result.is_empty());
+    }
+
+    // ========================================================================
+    // Golden fixture tests: six real shipped service config files
+    // ========================================================================
+
+    const FIXTURES: [&str; 6] = [
+        "lidarpub", "recorder", "radarpub", "camera", "fusion", "model",
+    ];
+
+    fn fixture(name: &str) -> String {
+        let path = format!(
+            "{}/tests/fixtures/{name}.default",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {path}: {e}"))
+    }
+
+    #[test]
+    fn every_fixture_survives_an_empty_update_unchanged() {
+        for name in FIXTURES {
+            let original = fixture(name);
+            let p = plan(&original, json!({}));
+            assert_eq!(p.content, original, "{name}.default was modified");
+            assert!(!p.changed, "{name}.default reported changed");
+        }
+    }
+
+    #[test]
+    fn round_tripping_parsed_values_preserves_meaning() {
+        for name in FIXTURES {
+            let original = fixture(name);
+            let parsed = parse_config_content(&original);
+            let p = plan(&original, Value::Object(parsed.clone()));
+            assert_eq!(
+                parse_config_content(&p.content),
+                parsed,
+                "{name}.default lost or changed a value on round trip"
+            );
+        }
+    }
+
+    #[test]
+    fn round_trip_is_byte_identical_for_canonically_formatted_fixtures() {
+        // fusion.default is written entirely as `KEY = "v"` and is expected to
+        // renormalize; every other fixture must not move a single byte.
+        for name in ["lidarpub", "recorder", "radarpub", "camera", "model"] {
+            let original = fixture(name);
+            let p = plan(&original, Value::Object(parse_config_content(&original)));
+            assert_eq!(p.content, original, "{name}.default was reformatted");
+        }
+    }
+
+    #[test]
+    fn fusion_renormalizes_only_the_spaces_around_equals() {
+        let original = fixture("fusion");
+        let p = plan(&original, Value::Object(parse_config_content(&original)));
+        assert!(p.changed);
+        assert_eq!(
+            p.content.replace(" = \"", "=\""),
+            original.replace(" = \"", "=\""),
+            "fusion.default changed by more than the spacing around '='"
+        );
+    }
+
+    #[test]
+    fn lidarpub_commented_keys_all_become_active_in_their_own_sections() {
+        let original = fixture("lidarpub");
+        let before = parse_config_content(&original);
+
+        // Every key that ships commented out, per the ticket.
+        let commented: Vec<String> = original
+            .lines()
+            .filter_map(|line| {
+                let rest = line.trim_start().strip_prefix('#')?;
+                let (key, _) = rest.split_once('=')?;
+                let key = key.trim();
+                (!key.is_empty()
+                    && key.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                    && key
+                        .chars()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                    && !before.contains_key(key))
+                .then(|| key.to_string())
+            })
+            .collect();
+        assert!(
+            commented.len() >= 15,
+            "expected lidarpub.default to ship many commented keys, found {}",
+            commented.len()
+        );
+
+        let updates: Map<String, Value> = commented
+            .iter()
+            .map(|k| (k.clone(), json!("test-value")))
+            .collect();
+        let p = plan_edit(&original, &updates).expect("planning should succeed");
+
+        let after = parse_config_content(&p.content);
+        for key in &commented {
+            assert_eq!(
+                after.get(key.as_str()),
+                Some(&json!("test-value")),
+                "{key} did not become active"
+            );
+            assert_eq!(p.dispositions[key], Disposition::Inserted, "{key}");
+        }
+        assert!(
+            p.unmatched.is_empty(),
+            "no lidarpub key should be unmatched: {:?}",
+            p.unmatched
+        );
+        assert!(
+            !p.content.contains(APPEND_MARKER),
+            "every key had a commented home; nothing should be appended"
+        );
+    }
+
+    #[test]
+    fn fusion_page_payload_reports_its_three_stray_keys() {
+        // Characterization test for EDGEAI-732: webui/src/config/fusion.html
+        // posts three keys that match neither a fusion arg nor fusion.default.
+        // Expected to change when EDGEAI-732 fixes the page.
+        let original = fixture("fusion");
+        let p = plan(
+            &original,
+            json!({
+                "rust_log": "info",
+                "radar_input_topic": "radar/pcd",
+                "occ_angle_limit": "-55 55",
+                "occ_range_limit": "0 16",
+                "threshold": "0.5",
+            }),
+        );
+        assert_eq!(
+            p.unmatched.iter().cloned().collect::<Vec<_>>(),
+            vec!["OCC_ANGLE_LIMIT", "OCC_RANGE_LIMIT", "RADAR_INPUT_TOPIC"]
+        );
+        assert_eq!(p.dispositions["RUST_LOG"], Disposition::Updated);
+        assert_eq!(p.dispositions["THRESHOLD"], Disposition::Updated);
     }
 }

@@ -1,0 +1,216 @@
+# EdgeFirst Camera Configuration
+#
+# This file is loaded by the systemd service as an EnvironmentFile. Every
+# variable here maps to a command-line flag of the same name (lower-case,
+# with dashes replaced by underscores). Command-line flags take precedence
+# over environment variables.
+#
+# Syntax rules (systemd EnvironmentFile):
+#   - Lines beginning with # or ; are comments.
+#   - KEY=VALUE pairs, one per line.
+#   - Quoting is optional; quotes are stripped by systemd.
+#   - No spaces around the '=' sign.
+
+# ---------------------------------------------------------------------------
+# Camera Device
+# ---------------------------------------------------------------------------
+# V4L2 device path for the camera. Use `v4l2-ctl --list-devices` to find
+# available cameras. On Maivin boards video3 is typically the ISP output.
+CAMERA="/dev/video3"
+
+# ---------------------------------------------------------------------------
+# Camera Capture Resolution
+# ---------------------------------------------------------------------------
+# Native capture resolution requested from the camera driver (width height).
+# This is independent of STREAM_SIZE — the camera captures at this resolution
+# and frames are scaled to STREAM_SIZE for encoding. Set this to match a
+# resolution the camera sensor actually supports.
+CAMERA_SIZE="1920 1080"
+
+# ---------------------------------------------------------------------------
+# Streaming Resolution
+# ---------------------------------------------------------------------------
+# Resolution used for H.264 and JPEG encoding output (width height). The
+# hardware H.264 encoder supports up to 1920x1080. If CAMERA_SIZE is larger
+# (e.g. 4K), frames are downscaled to STREAM_SIZE before encoding unless
+# H264_TILES is enabled.
+STREAM_SIZE="1920 1080"
+
+# ---------------------------------------------------------------------------
+# Mirror Setting
+# ---------------------------------------------------------------------------
+# Flip the camera image to correct for physical camera orientation.
+# Maivin and Raivin mount the sensor upside down, so both axes (vflip+hflip,
+# a 180-degree rotation) must be enabled by default.
+# Accepted values: none, horizontal, vertical, both
+MIRROR="both"
+
+# ---------------------------------------------------------------------------
+# H.264 Streaming
+# ---------------------------------------------------------------------------
+# Enable H.264 video output on the Zenoh topic camera/h264.
+# The stream uses hardware encoding when available. This is also the
+# built-in default, so a manually launched camera publishes video too.
+H264="true"
+
+# H.264 encoding bitrate preset. Higher bitrates improve quality but
+# increase bandwidth and storage requirements.
+# Accepted values: auto, mbps5, mbps25, mbps50, mbps100
+# "auto" selects a bitrate based on the stream resolution.
+H264_BITRATE="auto"
+
+# ---------------------------------------------------------------------------
+# H.264 4K Tiling
+# ---------------------------------------------------------------------------
+# When the camera captures at 4K, the hardware encoder is limited to 1080p.
+# Enabling tiles splits each 4K frame into 4 non-overlapping 1080p quadrants
+# and encodes each independently. The four tile streams are published on
+# separate Zenoh topics (camera/h264/tl, camera/h264/tr, camera/h264/bl,
+# camera/h264/br).
+# Only useful when CAMERA_SIZE is 3840x2160 or larger.
+H264_TILES="false"
+
+# FPS limit applied to tile streams. A lower value than the camera FPS
+# reduces compression artifacts and total bandwidth when tiling is active.
+# 0 means no limit: every captured frame is offered to each tile encoder.
+H264_TILES_FPS="15"
+
+# ---------------------------------------------------------------------------
+# JPEG Streaming
+# ---------------------------------------------------------------------------
+# Enable JPEG snapshot output on the Zenoh topic camera/jpeg.
+# Useful for low-bandwidth preview or single-frame consumers.
+JPEG="false"
+
+# JPEG encoding quality, 1-100. 85 is visually equivalent to 100 for
+# slightly less work.
+#
+# Note that quality is a weak lever on cost. Measured at 1080p30 on a
+# Verdin iMX8MP, enabling JPEG takes the camera process from 27% to 104%
+# CPU, and dropping quality from 100 to 85 recovers only about 3 of those
+# 77 points -- the cost is dominated by the per-frame conversion and DCT,
+# not the entropy coding. If JPEG streaming is too expensive, reduce
+# STREAM_SIZE or turn JPEG off; there is no hardware JPEG encoder on this
+# platform to fall back on.
+JPEG_QUALITY="85"
+
+# ---------------------------------------------------------------------------
+# Recording and Replay
+# ---------------------------------------------------------------------------
+# Record the live H.264 stream to a file, as raw Annex-B. Requires H264,
+# and cannot be combined with REPLAY. A matching <path>.json sidecar is
+# written alongside at startup carrying colorimetry, camera/info and
+# tf_static -- the producer state that is not recoverable from the
+# bitstream.
+#
+# WARNING: this writes continuously for as long as the service runs, with
+# no size cap and no rotation. Left set in this file it will fill the
+# filesystem. Set it for a capture session and clear it afterwards; it is
+# not intended as a persistent setting.
+RECORD=""
+
+# Replay a previously recorded .h264 file instead of opening the camera.
+# Requires the matching <path>.json sidecar. Cannot be combined with
+# RECORD, JPEG, or H264_TILES -- a recording carries only the main H.264
+# stream.
+REPLAY=""
+
+# Loop the replay back to the start on EOF instead of exiting. The frame
+# sequence counter keeps incrementing across the loop boundary so
+# consumers see one continuous stream, as they would from a live camera.
+REPLAY_LOOP="false"
+
+# Override the replay frame rate. Empty uses the rate recorded in the
+# sidecar.
+REPLAY_FPS=""
+
+# ---------------------------------------------------------------------------
+# Camera Calibration
+# ---------------------------------------------------------------------------
+# Path to a camera calibration JSON file (isp-imx format). When provided,
+# the node publishes sensor_msgs/CameraInfo on camera/info using that
+# file's geometry. Leave empty if no calibration file is available.
+#
+# camera/info is published either way. If this path is set but cannot be
+# loaded, the node logs a warning and falls back to built-in defaults
+# rather than failing to start -- those defaults are nominal for a 1080p
+# sensor and describe no particular lens, so they are not valid for
+# projection or sensor fusion. Check the log if calibration matters.
+CAM_INFO_PATH=""
+
+# ---------------------------------------------------------------------------
+# Camera Transform (TF)
+# ---------------------------------------------------------------------------
+# Static transform from the robot base_link frame to the camera optical
+# frame, published as a TF message. These values define the physical
+# mounting position and orientation of the camera on the robot.
+
+# Translation vector (x y z) in meters from base_link to camera_optical.
+CAM_TF_VEC="0 0 0"
+
+# Rotation quaternion (x y z w) from base_link to camera_optical.
+# The default represents a typical forward-facing camera rotation.
+CAM_TF_QUAT="-1 1 -1 1"
+
+# TF frame IDs for the two ends of the transform above. The camera frame
+# ID is also stamped into the header of every published frame.
+BASE_FRAME_ID="base_link"
+CAMERA_FRAME_ID="camera_optical"
+
+# ---------------------------------------------------------------------------
+# Zenoh Topics
+# ---------------------------------------------------------------------------
+# Key expressions the node publishes on. All keys are relative to the
+# session namespace, which is the system hostname, so the wire form of
+# camera/frame is {hostname}/camera/frame. Change these only when
+# integrating with a consumer that expects different names.
+
+# Multi-plane camera frame (edgefirst_msgs/CameraFrame).
+FRAME_TOPIC="camera/frame"
+
+# Camera calibration (sensor_msgs/CameraInfo). See CAM_INFO_PATH above.
+INFO_TOPIC="camera/info"
+
+# JPEG compressed images (sensor_msgs/CompressedImage). Requires JPEG.
+JPEG_TOPIC="camera/jpeg"
+
+# H.264 video stream (foxglove_msgs/CompressedVideo). Requires H264.
+H264_TOPIC="camera/h264"
+
+# The four 4K tile streams, in order: top-left, top-right, bottom-left,
+# bottom-right. Space separated, exactly four entries. Requires
+# H264_TILES.
+H264_TILES_TOPICS="camera/h264/tl camera/h264/tr camera/h264/bl camera/h264/br"
+
+# ---------------------------------------------------------------------------
+# Zenoh Networking
+# ---------------------------------------------------------------------------
+# Zenoh participant mode. In "peer" mode nodes discover each other via
+# multicast. Use "client" to connect to a Zenoh router, or "router" to act
+# as one.
+# Accepted values: peer, client, router
+MODE="peer"
+
+# Zenoh endpoint(s) to connect to. Required when MODE is "client".
+# Example: CONNECT="tcp/192.168.1.1:7447"
+CONNECT=""
+
+# Zenoh endpoint(s) to listen on. Useful when running as a router or when
+# peers need to reach this node on a specific address/port.
+LISTEN=""
+
+# Disable Zenoh multicast scouting (peer auto-discovery). Set to true when
+# operating in networks where multicast is unavailable or undesired, and use
+# CONNECT/LISTEN for explicit endpoint configuration instead.
+NO_MULTICAST_SCOUTING="false"
+
+# ---------------------------------------------------------------------------
+# Debugging / Profiling
+# ---------------------------------------------------------------------------
+# Enable the Tokio async runtime console (tokio-console). Requires the
+# binary to be built with the tokio_unstable cfg flag.
+TOKIO_CONSOLE="false"
+
+# Enable the Tracy profiler for real-time performance analysis. Requires the
+# binary to be built with Tracy support.
+TRACY="false"

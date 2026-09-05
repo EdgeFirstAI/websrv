@@ -1,0 +1,83 @@
+# EdgeFirst Recorder Configuration
+#
+# This file is loaded by the systemd service as an EnvironmentFile. Every
+# variable here maps to a command-line flag of the same name (lower-case,
+# with dashes replaced by underscores). Command-line flags take precedence
+# over environment variables.
+#
+# Syntax rules (systemd EnvironmentFile):
+#   - Lines beginning with # or ; are comments.
+#   - KEY=VALUE pairs, one per line.
+#   - Quoting is optional; quotes are stripped by systemd.
+#   - No spaces around the '=' sign.
+
+# ---------------------------------------------------------------------------
+# Storage Location
+# ---------------------------------------------------------------------------
+# Directory where MCAP recording files are saved. The directory is created
+# automatically if it does not exist. When empty, files are written to the
+# current working directory.
+# Examples:
+#   STORAGE="$HOME/recordings"   - User's home (default for interactive use)
+#   STORAGE="/media/DATA"        - SD card or USB drive labelled DATA
+STORAGE="$HOME/recordings"
+
+# ---------------------------------------------------------------------------
+# Recording Duration
+# ---------------------------------------------------------------------------
+# Maximum recording duration in seconds. When set, the recorder stops
+# automatically after this many seconds. Leave empty for unlimited recording
+# (stop manually with Ctrl-C or SIGTERM).
+DURATION=""
+
+# ---------------------------------------------------------------------------
+# MCAP Compression
+# ---------------------------------------------------------------------------
+# Compression algorithm used inside the MCAP file. Compression reduces file
+# size at the cost of additional CPU usage during recording.
+# Accepted values: none, lz4, zstd
+#   none  - No compression (fastest recording, largest files)
+#   lz4   - LZ4 compression (fast, moderate compression ratio)
+#   zstd  - Zstandard compression (slower, best compression ratio)
+COMPRESSION="lz4"
+
+# ---------------------------------------------------------------------------
+# Topics
+# ---------------------------------------------------------------------------
+# Space-delimited list of Zenoh topics to record. When set, only these
+# specific topics are recorded. When empty, all active topics are discovered
+# and recorded automatically.
+# Example: TOPICS="camera/h264 radar/cube"
+TOPICS=""
+
+# ---------------------------------------------------------------------------
+# Radar Cube FPS Limit
+# ---------------------------------------------------------------------------
+# Limit the frame rate of the radar cube topic to reduce file size. Set to a
+# positive integer for the desired FPS to throttle the cube to that rate.
+# Leave empty to record the radar cube at its native publish rate (no rate
+# limiting). "MAX" is a CLI-only synonym for the native rate and cannot be
+# expressed via this environment variable.
+CUBE_FPS=""
+
+# ---------------------------------------------------------------------------
+# Zenoh Networking
+# ---------------------------------------------------------------------------
+# Zenoh participant mode. In "peer" mode nodes discover each other via
+# multicast. Use "client" to connect to a Zenoh router, or "router" to act
+# as one.
+# Accepted values: peer, client, router
+MODE="peer"
+
+# Zenoh endpoint(s) to connect to. Required when MODE is "client".
+# Example: CONNECT="tcp/192.168.1.1:7447"
+CONNECT=""
+
+# Zenoh endpoint(s) to listen on. Useful when running as a router or when
+# peers need to reach this node on a specific address/port.
+LISTEN=""
+
+# Disable Zenoh multicast scouting (peer auto-discovery). Set to true when
+# operating in networks where multicast is unavailable or undesired, and use
+# CONNECT/LISTEN for explicit endpoint configuration instead.
+NO_MULTICAST_SCOUTING="false"

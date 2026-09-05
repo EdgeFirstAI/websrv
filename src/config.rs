@@ -276,6 +276,11 @@ pub async fn set_config(Json(params): Json<Value>) -> impl IntoResponse {
     };
 
     // Validate fileName to prevent path traversal.
+    //
+    // The alphanumeric/`-`/`_` whitelist already rejects every character in
+    // "..", so the `/` and ".." checks are redundant today. They stay as
+    // defence-in-depth: they become load-bearing the moment the whitelist is
+    // widened (e.g. to allow `.` so names like `foo.conf` work).
     let safe = !file_name.contains('/')
         && !file_name.contains("..")
         && file_name

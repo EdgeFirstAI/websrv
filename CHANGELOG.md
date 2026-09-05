@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `POST /api/config/{service}` can now add keys that are missing from a service
+  configuration file and activate keys that ship commented out, instead of
+  silently returning 200 OK having written nothing. This unblocked the LiDAR
+  settings page, since `lidarpub.default` ships 19 of its 26 keys commented
+  (EDGEAI-1402).
+- Numbers, booleans and arrays submitted to the config API are now written
+  correctly instead of being replaced with an empty value. Space-separated
+  values such as `TF_VEC` and `AZIMUTH` round-trip losslessly through
+  `GET` followed by `POST` (EDGEAI-1402).
+- The `fileName` field the web UI posts alongside config values is no longer
+  treated as a setting (EDGEAI-1402).
+- Configuration files are written atomically, so an interrupted save can no
+  longer leave a truncated file that prevents the service from starting
+  (EDGEAI-1402).
+- `check_service_status` now checks the exit status of `systemctl restart`
+  instead of only whether the process could be spawned. A unit that fails to
+  come back up after a config change now returns an error naming the unit and
+  its stderr, instead of a `restarted: true` response for a restart that
+  never actually succeeded (EDGEAI-1402).
+
+### Added
+
+- `POST /api/config/{service}` returns a JSON report naming the disposition of
+  every submitted key — `updated`, `inserted`, `appended`, `unset` or
+  `unchanged` — plus any keys that matched nothing in the file (EDGEAI-1402).
+- `--config-dir` / `CONFIG_DIR` selects the directory holding service
+  configuration files, defaulting to `/etc/default` (EDGEAI-1402).
+
+### Changed
+
+- `POST /api/config/{service}` now rejects the entire request with 400 if any
+  key or value is invalid, leaving the file untouched, and returns 404 rather
+  than 500 when the service has no configuration file. Values containing
+  newlines or control characters are refused, since they would inject
+  additional lines into a file systemd feeds to services running as root
+  (EDGEAI-1402).
+- The service is no longer restarted when a save changes nothing (EDGEAI-1402).
+- Configuration lines are written as `KEY="value"` without spaces around `=`,
+  matching the convention documented in the shipped `.default` files
+  (EDGEAI-1402).
+
 ## [4.1.0] - 2026-08-31
 
 ### Changed

@@ -783,6 +783,38 @@ graph TB
     CmdLine --> Topics
 ```
 
+#### Configuration Writes
+
+`POST /api/config/{service}` edits `{CONFIG_DIR}/{service}` through
+`envfile::plan_edit`, a pure function that validates every submitted key and
+returns the complete prospective file content. Because planning touches no
+files, a rejected key leaves the file untouched by construction.
+
+Each key resolves in this order:
+
+1. An active `KEY=` line is rewritten in place. Every duplicate active line
+   is rewritten too, because systemd takes the *last* definition and a stale
+   duplicate would otherwise silently win.
+2. Otherwise a new active line is inserted directly below the **last**
+   `#KEY=` line, so the key lands in its documented section and the comment
+   stays as a record of the shipped default.
+3. Otherwise the key is appended under `# --- Added by edgefirst-websrv ---`
+   and reported in `unmatched`. `unmatched` names only keys that landed here —
+   a key set to `null` that is simply absent from the file is not in it.
+
+A JSON `null` unsets a key by commenting it out. An empty string, in
+contrast, is written literally: for some services empty is a meaningful value
+that differs from absent. `fusion`'s `LIDAR_OUTPUT_TOPIC=""` disables that
+output, while an absent key falls back to the non-empty default
+`"fusion/lidar"` — treating the two the same would silently re-enable a
+disabled output.
+
+Values are escaped for `\` and `"`; newlines and other control characters
+are rejected outright, since a newline would inject arbitrary lines into a
+file systemd feeds to services running as root. The file is replaced
+atomically, and the service is restarted only when the content actually
+changed.
+
 ### Args Structure
 
 **Location**: `args.rs` - struct Args

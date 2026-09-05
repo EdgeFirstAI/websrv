@@ -11,36 +11,92 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::Value;
 use std::io;
+use std::path::{Path as FsPath, PathBuf};
+use std::sync::OnceLock;
 
 use crate::envfile::{parse_config_content, plan_edit};
 
 const EDGEFIRST_PREFIX: &str = "edgefirst-";
 
-/// Resolve a config file path under `/etc/default/`, supporting both
-/// `edgefirst-{service}` and `{service}` naming conventions.
+/// Directory holding service configuration files.
 ///
-/// Tries the given name first; if the file doesn't exist, tries the
-/// alternate name with or without the `edgefirst-` prefix.
-/// Returns the path that exists, or the original path if neither does.
-fn resolve_config_file(service: &str) -> String {
-    let primary = format!("/etc/default/{}", service);
-    if std::path::Path::new(&primary).exists() {
-        return primary;
-    }
+/// Set once at startup from `Args::config_dir`. A `OnceLock` rather than a
+/// threaded parameter because [`read_storage_directory`] is a free function
+/// called from four places that have no server state in scope, and the value
+/// is an immutable startup constant.
+static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-    let alt_name = if let Some(short) = service.strip_prefix(EDGEFIRST_PREFIX) {
-        short.to_string()
-    } else {
-        format!("{}{}", EDGEFIRST_PREFIX, service)
+/// Set the configuration directory. Only the first call has any effect.
+pub fn init_config_dir(dir: PathBuf) {
+    if CONFIG_DIR.set(dir).is_err() {
+        debug!("Configuration directory already initialised; ignoring");
+    }
+}
+
+/// The configuration directory, defaulting to `/etc/default`.
+fn config_dir() -> &'static FsPath {
+    CONFIG_DIR
+        .get()
+        .map(PathBuf::as_path)
+        .unwrap_or_else(|| FsPath::new("/etc/default"))
+}
+
+/// The outcome of resolving a service name to a configuration file.
+pub(crate) struct Resolved {
+    /// The path to use: the one that exists, or the primary candidate.
+    pub path: PathBuf,
+    /// Whether any candidate actually exists.
+    // Scaffolding: unused until Task 6 reports it. Remove this attribute then.
+    #[allow(dead_code)]
+    pub exists: bool,
+    /// Every candidate examined, in order, for error reporting.
+    // Scaffolding: unused until Task 6 reports it. Remove this attribute then.
+    #[allow(dead_code)]
+    pub tried: Vec<String>,
+}
+
+/// Resolve a service name to a config file, supporting both
+/// `edgefirst-{service}` and `{service}` naming conventions.
+pub(crate) fn resolve_config(service: &str) -> Resolved {
+    let alt_name = match service.strip_prefix(EDGEFIRST_PREFIX) {
+        Some(short) => short.to_string(),
+        None => format!("{EDGEFIRST_PREFIX}{service}"),
     };
-    let alternate = format!("/etc/default/{}", alt_name);
-    if std::path::Path::new(&alternate).exists() {
-        debug!("Config '{}' not found, using '{}'", primary, alternate);
-        return alternate;
+
+    let primary = config_dir().join(service);
+    let alternate = config_dir().join(&alt_name);
+    let tried = vec![
+        primary.to_string_lossy().into_owned(),
+        alternate.to_string_lossy().into_owned(),
+    ];
+
+    if primary.exists() {
+        return Resolved {
+            path: primary,
+            exists: true,
+            tried,
+        };
+    }
+    if alternate.exists() {
+        debug!("Config {:?} not found, using {:?}", primary, alternate);
+        return Resolved {
+            path: alternate,
+            exists: true,
+            tried,
+        };
     }
 
-    // Neither found — return original so callers get the expected error
-    primary
+    // Neither found — return the primary so callers get the expected error.
+    Resolved {
+        path: primary,
+        exists: false,
+        tried,
+    }
+}
+
+/// Resolve a service name to a config file path.
+fn resolve_config_file(service: &str) -> String {
+    resolve_config(service).path.to_string_lossy().into_owned()
 }
 
 /// Read storage directory from /etc/default/recorder (or edgefirst-recorder)
@@ -327,33 +383,26 @@ ANOTHER=123
     // ========================================================================
 
     #[test]
-    fn test_resolve_config_file_neither_exists() {
-        // When neither file exists, returns the primary path
-        let result = resolve_config_file("nonexistent-test-service-xyz");
-        assert_eq!(result, "/etc/default/nonexistent-test-service-xyz");
+    fn resolve_config_reports_both_candidate_paths() {
+        let r = resolve_config("nonexistent-test-service-xyz");
+        assert!(!r.exists);
+        assert_eq!(r.tried.len(), 2);
+        assert!(r.tried[0].ends_with("/nonexistent-test-service-xyz"));
+        assert!(r.tried[1].ends_with("/edgefirst-nonexistent-test-service-xyz"));
     }
 
     #[test]
-    fn test_resolve_config_file_adds_prefix() {
-        // When given "recorder", alternate is "edgefirst-recorder"
-        let service = "recorder";
-        let alt = if let Some(short) = service.strip_prefix(EDGEFIRST_PREFIX) {
-            short.to_string()
-        } else {
-            format!("{}{}", EDGEFIRST_PREFIX, service)
-        };
-        assert_eq!(alt, "edgefirst-recorder");
+    fn resolve_config_strips_the_edgefirst_prefix_for_the_alternate() {
+        let r = resolve_config("edgefirst-nonexistent-test-xyz");
+        assert_eq!(r.tried.len(), 2);
+        assert!(r.tried[0].ends_with("/edgefirst-nonexistent-test-xyz"));
+        assert!(r.tried[1].ends_with("/nonexistent-test-xyz"));
     }
 
     #[test]
-    fn test_resolve_config_file_strips_prefix() {
-        // When given "edgefirst-recorder", alternate is "recorder"
-        let service = "edgefirst-recorder";
-        let alt = if let Some(short) = service.strip_prefix(EDGEFIRST_PREFIX) {
-            short.to_string()
-        } else {
-            format!("{}{}", EDGEFIRST_PREFIX, service)
-        };
-        assert_eq!(alt, "recorder");
+    fn config_dir_defaults_to_etc_default_when_uninitialised() {
+        // Only meaningful when nothing has called init_config_dir in this
+        // binary; the lib test binary does not.
+        assert!(resolve_config("anything").tried[0].starts_with("/etc/default/"));
     }
 }

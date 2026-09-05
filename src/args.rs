@@ -108,6 +108,10 @@ pub struct Args {
     /// Force regeneration of self-signed certificate
     #[arg(long)]
     pub generate_cert: bool,
+
+    /// Directory containing service configuration files
+    #[arg(long, env = "CONFIG_DIR", default_value = "/etc/default")]
+    pub config_dir: PathBuf,
 }
 
 #[derive(Serialize)]

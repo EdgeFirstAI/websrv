@@ -27,7 +27,7 @@ use tower_http::services::ServeDir;
 use edgefirst_websrv::{
     args::{Args, WebUISettings},
     auth::{auth_login, auth_logout, auth_status, AuthContext},
-    config::{get_config, read_storage_directory, set_config},
+    config::{get_config, init_config_dir, read_storage_directory, set_config},
     mcap::{list_mcap_files, mcap_downloader, McapContext},
     recording::{
         check_recorder_status, check_replay_status, delete as recording_delete,
@@ -351,6 +351,8 @@ async fn main() -> anyhow::Result<()> {
         .expect("Failed to install default CryptoProvider");
 
     let args = Args::parse();
+    // Must precede any read of a service config, including read_storage_directory below.
+    init_config_dir(args.config_dir.clone());
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     // Load or generate TLS certificate

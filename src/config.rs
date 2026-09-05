@@ -6,15 +6,16 @@
 use axum::extract::{Json, Path};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use log::{debug, error};
+use log::{debug, error, warn};
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::OnceLock;
 
-use crate::envfile::{parse_config_content, plan_edit};
+use crate::envfile::{parse_config_content, plan_edit, Disposition, Reject};
 
 const EDGEFIRST_PREFIX: &str = "edgefirst-";
 
@@ -46,12 +47,8 @@ pub(crate) struct Resolved {
     /// The path to use: the one that exists, or the primary candidate.
     pub path: PathBuf,
     /// Whether any candidate actually exists.
-    // Scaffolding: unused until Task 6 reports it. Remove this attribute then.
-    #[allow(dead_code)]
     pub exists: bool,
     /// Every candidate examined, in order, for error reporting.
-    // Scaffolding: unused until Task 6 reports it. Remove this attribute then.
-    #[allow(dead_code)]
     pub tried: Vec<String>,
 }
 
@@ -188,101 +185,174 @@ pub fn parse_storage_directory(content: &str) -> io::Result<String> {
     ))
 }
 
-/// Set service configuration in /etc/default/{service}
-pub async fn set_config(Json(params): Json<Value>) -> impl IntoResponse {
-    let file_name = if let Some(file_name_value) = params.get("fileName") {
-        if let Some(file_name) = file_name_value.as_str() {
-            file_name.to_string()
-        } else {
-            error!("fileName is not a string");
-            return (StatusCode::BAD_REQUEST, "Invalid fileName").into_response();
+/// JSON body returned by [`set_config`] for every outcome.
+///
+/// Optional members are omitted when empty so a plain successful save stays
+/// compact, and the shape is additive for clients that only check the status.
+#[derive(Serialize, Default)]
+struct ConfigWriteResponse {
+    service: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    applied: bool,
+    restarted: bool,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    dispositions: BTreeMap<String, Disposition>,
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    unmatched: BTreeSet<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    reserved: Vec<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    rejected: BTreeMap<String, Reject>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tried: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restart_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl ConfigWriteResponse {
+    fn new(service: &str) -> Self {
+        Self {
+            service: service.to_string(),
+            ..Default::default()
         }
-    } else {
-        error!("fileName not found in JSON");
-        return (StatusCode::BAD_REQUEST, "Missing fileName").into_response();
+    }
+
+    fn into_response_with(self, status: StatusCode) -> axum::response::Response {
+        (status, Json(self)).into_response()
+    }
+}
+
+/// Key the webui sends alongside the config values to name the target file.
+/// It is stripped rather than rejected: every settings page posts it, so
+/// rejecting it would fail every save.
+const RESERVED_KEY: &str = "filename";
+
+/// Set service configuration in `{config_dir}/{service}`.
+pub async fn set_config(Json(params): Json<Value>) -> impl IntoResponse {
+    let Some(params) = params.as_object() else {
+        error!("Request body is not a JSON object");
+        let mut response = ConfigWriteResponse::new("");
+        response.error = Some("request body must be a JSON object".to_string());
+        return response.into_response_with(StatusCode::BAD_REQUEST);
     };
 
-    // Validate fileName to prevent path traversal
-    if file_name.contains('/') || file_name.contains("..") {
-        error!("Invalid fileName: path traversal attempt detected");
-        return (StatusCode::BAD_REQUEST, "Invalid fileName").into_response();
+    let file_name = match params.get("fileName").map(|v| v.as_str()) {
+        Some(Some(name)) => name.to_string(),
+        Some(None) => {
+            error!("fileName is not a string");
+            let mut response = ConfigWriteResponse::new("");
+            response.error = Some("fileName must be a string".to_string());
+            return response.into_response_with(StatusCode::BAD_REQUEST);
+        }
+        None => {
+            error!("fileName not found in JSON");
+            let mut response = ConfigWriteResponse::new("");
+            response.error = Some("missing fileName".to_string());
+            return response.into_response_with(StatusCode::BAD_REQUEST);
+        }
+    };
+
+    // Validate fileName to prevent path traversal.
+    let safe = !file_name.contains('/')
+        && !file_name.contains("..")
+        && file_name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_');
+    if !safe {
+        error!("Invalid fileName: {:?}", file_name);
+        let mut response = ConfigWriteResponse::new(&file_name);
+        response.error = Some("invalid fileName".to_string());
+        return response.into_response_with(StatusCode::BAD_REQUEST);
     }
-    if !file_name
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-    {
-        error!("Invalid fileName: contains disallowed characters");
-        return (StatusCode::BAD_REQUEST, "Invalid fileName").into_response();
+
+    let resolved = resolve_config(&file_name);
+    if !resolved.exists {
+        error!("No configuration file for service {:?}", file_name);
+        let mut response = ConfigWriteResponse::new(&file_name);
+        response.error = Some("no config file".to_string());
+        response.tried = resolved.tried;
+        return response.into_response_with(StatusCode::NOT_FOUND);
     }
+    let path = resolved.path;
+    debug!("Configuration file path: {:?}", path);
 
-    let service_name = file_name.clone();
-
-    let config_file_path = resolve_config_file(&file_name);
-    debug!("Configuration file path: {}", config_file_path.clone());
-    debug!("{:?}", params);
-
-    let config_content = match std::fs::read_to_string(config_file_path.clone()) {
+    let original = match std::fs::read_to_string(&path) {
         Ok(content) => content,
         Err(e) => {
-            error!("Error reading configuration file: {:?}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Error reading configuration file",
-            )
-                .into_response();
+            error!("Error reading configuration file {:?}: {:?}", path, e);
+            let mut response = ConfigWriteResponse::new(&file_name);
+            response.path = Some(path.to_string_lossy().into_owned());
+            response.error = Some("error reading configuration file".to_string());
+            return response.into_response_with(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
 
-    // `fileName` names the target file, not a setting; strip it before
-    // planning the edit so it is never written into the config file.
-    let config_map: serde_json::Map<String, Value> = params
-        .as_object()
-        .map(|map| {
-            map.iter()
-                .filter(|(key, _)| !key.eq_ignore_ascii_case("filename"))
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect()
-        })
-        .unwrap_or_default();
+    // Strip the reserved key; it names the file rather than a setting.
+    let mut reserved = Vec::new();
+    let mut updates = serde_json::Map::new();
+    for (key, value) in params {
+        if key.to_lowercase() == RESERVED_KEY {
+            reserved.push(key.clone());
+        } else {
+            updates.insert(key.clone(), value.clone());
+        }
+    }
 
-    // TODO(EDGEAI-1402 Task 6): this whole handler body is replaced wholesale
-    // by Task 6, which reports per-key dispositions instead of writing plain
-    // text. This is a minimal stopgap so the crate keeps compiling now that
-    // `update_config_content` is gone. Task 6 replaces this silent filename
-    // filter with a reported `reserved` list instead of a silent drop.
-    let plan = match plan_edit(&config_content, &config_map) {
+    let mut response = ConfigWriteResponse::new(&file_name);
+    response.path = Some(path.to_string_lossy().into_owned());
+    response.reserved = reserved;
+
+    let plan = match plan_edit(&original, &updates) {
         Ok(plan) => plan,
         Err(rejected) => {
             error!("Rejected configuration keys: {:?}", rejected);
-            return (StatusCode::BAD_REQUEST, "Invalid configuration values").into_response();
+            response.rejected = rejected;
+            return response.into_response_with(StatusCode::BAD_REQUEST);
         }
     };
 
-    match std::fs::write(config_file_path.clone(), plan.content) {
-        Ok(_) => match check_service_status(&service_name).await {
-            Ok(_) => (
-                StatusCode::OK,
-                "Configuration saved successfully and service status checked.",
-            )
-                .into_response(),
-            Err(e) => {
-                error!("{}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Error handling service status",
-                )
-                    .into_response()
-            }
-        },
+    response.dispositions = plan.dispositions;
+    response.unmatched = plan.unmatched;
+
+    if !plan.changed {
+        debug!("No configuration change for {:?}", file_name);
+        response.reason = Some("no changes".to_string());
+        return response.into_response_with(StatusCode::OK);
+    }
+
+    if let Err(e) = write_atomic(&path, &plan.content) {
+        error!("Error saving configuration {:?}: {:?}", path, e);
+        response.error = Some("error saving configuration".to_string());
+        return response.into_response_with(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    response.applied = true;
+
+    for key in &response.unmatched {
+        warn!(
+            "Key {:?} was not present in {:?} and has been appended; \
+             it may not be a setting this service reads",
+            key, path
+        );
+    }
+
+    match check_service_status(&file_name).await {
+        Ok(message) => {
+            debug!("{}", message);
+            response.restarted = message.contains("restarted successfully");
+        }
         Err(e) => {
-            error!("Error saving configuration: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Error saving configuration",
-            )
-                .into_response()
+            // The configuration was applied, so this is not a server error.
+            error!("{}", e);
+            response.restart_error = Some(e);
         }
     }
+
+    response.into_response_with(StatusCode::OK)
 }
 
 /// Write `content` to `path` atomically.
@@ -296,9 +366,6 @@ pub async fn set_config(Json(params): Json<Value>) -> impl IntoResponse {
 /// Ownership is deliberately not copied: websrv must already run as root to
 /// write `/etc/default` and to restart units, so the renamed file lands
 /// root-owned exactly as the original was.
-// Scaffolding: unused outside tests until Task 6 wires it into `set_config`.
-// Remove this attribute then.
-#[allow(dead_code)]
 fn write_atomic(path: &FsPath, content: &str) -> io::Result<()> {
     use std::io::Write;
 

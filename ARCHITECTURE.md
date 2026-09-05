@@ -802,6 +802,10 @@ Each key resolves in this order:
    and reported in `unmatched`. `unmatched` names only keys that landed here —
    a key set to `null` that is simply absent from the file is not in it.
 
+When the resolved line already reads exactly what would be written, no line
+changes and the key is reported `unchanged`: the file already expresses that
+value.
+
 A JSON `null` unsets a key by commenting it out. An empty string, in
 contrast, is written literally: for some services empty is a meaningful value
 that differs from absent. `fusion`'s `LIDAR_OUTPUT_TOPIC=""` disables that

@@ -194,6 +194,55 @@ async fn get_returns_the_written_values() {
 }
 
 #[tokio::test]
+async fn null_unsets_a_key_and_reports_it() {
+    // RUST_LOG ships active in lidarpub.default (TARGET ships already
+    // commented, which would make the "no active line" assertion vacuous).
+    let svc = seed("unset", "lidarpub");
+    let (status, body) = post_config(&svc, json!({ "fileName": svc, "RUST_LOG": null })).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["dispositions"]["RUST_LOG"], json!("unset"));
+    assert_eq!(body["restarted"], json!(false));
+
+    let content = read(&svc);
+    assert!(
+        content.lines().any(|l| l.trim() == "#RUST_LOG="),
+        "expected a commented #RUST_LOG= line, got: {content}"
+    );
+    assert!(
+        !content
+            .lines()
+            .any(|l| l.trim_start().starts_with("RUST_LOG=")),
+        "an active RUST_LOG= line remained: {content}"
+    );
+}
+
+#[tokio::test]
+async fn an_unmatched_key_is_appended_and_reported() {
+    let svc = seed("append", "lidarpub");
+    let (status, body) = post_config(
+        &svc,
+        json!({ "fileName": svc, "BRAND_NEW_KEY_TEST": "value" }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["dispositions"]["BRAND_NEW_KEY_TEST"],
+        json!("appended")
+    );
+    assert_eq!(body["unmatched"], json!(["BRAND_NEW_KEY_TEST"]));
+    assert_eq!(body["restarted"], json!(false));
+
+    let content = read(&svc);
+    let appended = "# --- Added by edgefirst-websrv ---\nBRAND_NEW_KEY_TEST=\"value\"\n";
+    assert!(
+        content.contains(appended),
+        "missing append marker: {content}"
+    );
+}
+
+#[tokio::test]
 async fn atomic_write_leaves_no_stray_files() {
     let svc = seed("atomic", "camera");
     post_config(&svc, json!({ "fileName": svc, "RUST_LOG": "trace" })).await;

@@ -339,11 +339,10 @@ pub async fn set_config(Json(params): Json<Value>) -> impl IntoResponse {
         }
     };
 
-    response.dispositions = plan.dispositions;
-    response.unmatched = plan.unmatched;
-
     if !plan.changed {
         debug!("No configuration change for {:?}", file_name);
+        response.dispositions = plan.dispositions;
+        response.unmatched = plan.unmatched;
         response.reason = Some("no changes".to_string());
         return response.into_response_with(StatusCode::OK);
     }
@@ -354,6 +353,8 @@ pub async fn set_config(Json(params): Json<Value>) -> impl IntoResponse {
         return response.into_response_with(StatusCode::INTERNAL_SERVER_ERROR);
     }
     response.applied = true;
+    response.dispositions = plan.dispositions;
+    response.unmatched = plan.unmatched;
 
     for key in &response.unmatched {
         warn!(

@@ -49,6 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Configuration lines are written as `KEY="value"` without spaces around `=`,
   matching the convention documented in the shipped `.default` files
   (EDGEAI-1402).
+- `POST /api/config/{service}` now responds with `application/json` instead of
+  `text/plain` (EDGEAI-1402).
 
 ## [4.1.0] - 2026-08-31
 

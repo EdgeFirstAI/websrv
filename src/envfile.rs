@@ -211,6 +211,35 @@ pub(crate) fn validate(
     }
 }
 
+/// Undo [`escape_value`] on the inner text of a quoted value.
+///
+/// This is the exact inverse of `escape_value`, which prefixes a backslash to
+/// exactly two characters (`\` and `"`) and nothing else. Consuming `\\` and
+/// `\"` in a single left-to-right pass is what the round trip requires; two
+/// sequential `str::replace` calls would re-process their own output and get
+/// the wrong answer on inputs like `\\"`.
+///
+/// Any other `\X` sequence (e.g. `\n`, `\t`) is left untouched, as a literal
+/// backslash followed by that character. systemd itself may interpret other
+/// C-style escapes on read, but this parser has never modelled those, and
+/// widening it here would change how existing hand-written files are read —
+/// out of scope for this fix.
+fn unescape_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next @ ('\\' | '"')) = chars.clone().next() {
+                out.push(next);
+                chars.next();
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Parse config file content into a JSON map.
 ///
 /// Values that are whitespace-separated and unquoted become JSON arrays;
@@ -231,7 +260,10 @@ pub fn parse_config_content(content: &str) -> Map<String, Value> {
             // If the value is quoted, treat it as a single string value
             if raw_value.starts_with('"') && raw_value.ends_with('"') && raw_value.len() >= 2 {
                 let unquoted = &raw_value[1..raw_value.len() - 1];
-                config_map.insert(clean_key.to_string(), Value::String(unquoted.to_string()));
+                config_map.insert(
+                    clean_key.to_string(),
+                    Value::String(unescape_value(unquoted)),
+                );
             } else {
                 // Unquoted: split on whitespace for multiple values
                 let clean_value = raw_value.replace("\"", "");
@@ -846,6 +878,46 @@ NAME="My Service"
         let result = parse_config_content(content);
         assert_eq!(result.get("PATH").unwrap(), "/usr/local/bin");
         assert_eq!(result.get("NAME").unwrap(), "My Service");
+    }
+
+    #[test]
+    fn parse_unescapes_backslash_and_quote() {
+        let content = r#"K="a\"b\\c""#;
+        let result = parse_config_content(content);
+        assert_eq!(result.get("K").unwrap(), r#"a"b\c"#);
+    }
+
+    #[test]
+    fn parse_render_round_trip_is_lossless_for_escaped_values() {
+        let value = r#"a"b\c"#;
+        let entry = entry("K", Some(value));
+        let rendered = render(&entry);
+        let parsed = parse_config_content(&rendered);
+        assert_eq!(parsed.get("K").unwrap(), value);
+    }
+
+    #[test]
+    fn saving_an_escaped_value_twice_is_idempotent() {
+        let original = "K=\"1\"\n";
+        let value = json!(r#"a"b\c"#);
+
+        let first = plan(original, json!({ "K": value.clone() }));
+        assert!(first.changed);
+
+        let parsed = parse_config_content(&first.content);
+        let second = plan(&first.content, Value::Object(parsed));
+        assert_eq!(
+            second.content, first.content,
+            "saving twice must be a no-op"
+        );
+        assert!(!second.changed, "second save must report no change");
+    }
+
+    #[test]
+    fn parse_leaves_other_backslash_sequences_alone() {
+        let content = r#"K="a\nb""#;
+        let result = parse_config_content(content);
+        assert_eq!(result.get("K").unwrap(), "a\\nb");
     }
 
     #[test]

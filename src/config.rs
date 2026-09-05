@@ -122,7 +122,12 @@ pub async fn get_config(Path(path): Path<ConfigPath>) -> impl IntoResponse {
     Json(serde_json::Value::Object(config_map)).into_response()
 }
 
-/// Check service status and restart if active
+/// Check service status and restart if active.
+///
+/// Reports a restart that actually succeeded, not merely one that was issued:
+/// `systemctl restart`'s exit status is inspected, so a unit that fails to
+/// come back up after the restart is reported as an error even though the
+/// `systemctl` process itself was spawned and ran to completion.
 pub async fn check_service_status(service_name: &str) -> Result<String, String> {
     use std::process::Command;
 
@@ -140,11 +145,24 @@ pub async fn check_service_status(service_name: &str) -> Result<String, String> 
         .to_string();
     debug!("{:?} service is {:?}", resolved, status);
     if status == "active" {
-        Command::new("systemctl")
+        let restart = Command::new("systemctl")
             .arg("restart")
             .arg(&resolved)
             .output()
             .map_err(|e| format!("Error restarting service: {:?}", e))?;
+
+        if !restart.status.success() {
+            let stderr = String::from_utf8_lossy(&restart.stderr).trim().to_string();
+            let detail = if stderr.is_empty() {
+                restart.status.to_string()
+            } else {
+                stderr
+            };
+            return Err(format!(
+                "Service '{}' failed to restart: {}",
+                resolved, detail
+            ));
+        }
         Ok(format!("Service '{}' restarted successfully.", resolved))
     } else {
         Ok(format!(
@@ -296,7 +314,7 @@ pub async fn set_config(Json(params): Json<Value>) -> impl IntoResponse {
     let mut reserved = Vec::new();
     let mut updates = serde_json::Map::new();
     for (key, value) in params {
-        if key.to_lowercase() == RESERVED_KEY {
+        if key.eq_ignore_ascii_case(RESERVED_KEY) {
             reserved.push(key.clone());
         } else {
             updates.insert(key.clone(), value.clone());

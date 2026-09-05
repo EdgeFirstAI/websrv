@@ -785,10 +785,14 @@ graph TB
 
 #### Configuration Writes
 
-`POST /api/config/{service}` edits `{CONFIG_DIR}/{service}` through
-`envfile::plan_edit`, a pure function that validates every submitted key and
-returns the complete prospective file content. Because planning touches no
-files, a rejected key leaves the file untouched by construction.
+`POST /api/config/{service}` edits the file named by the request body's
+`fileName` field through `envfile::plan_edit`, a pure function that validates
+every submitted key and returns the complete prospective file content. The
+`{service}` URL segment is currently ignored by the handler; it is not what
+selects the file. Anything that keys authorization or audit logging on the
+URL path (neither exists today) must instead extract and cross-check
+`fileName` from the body. Because planning touches no files, a rejected key
+leaves the file untouched by construction.
 
 Each key resolves in this order:
 
@@ -818,6 +822,97 @@ are rejected outright, since a newline would inject arbitrary lines into a
 file systemd feeds to services running as root. The file is replaced
 atomically, and the service is restarted only when the content actually
 changed.
+
+##### Response
+
+`set_config` always returns a JSON object, whatever the outcome. Fields are
+omitted (rather than emitted `null` or empty) when they do not apply, so a
+plain successful save stays compact:
+
+| Field | Type | Present when | Meaning |
+|-------|------|--------------|---------|
+| `service` | string | always | The `fileName` from the request (empty if the body was malformed). |
+| `path` | string | file resolved | Absolute path of the file that was read or written. |
+| `applied` | bool | always | `true` only when the file was actually rewritten. |
+| `restarted` | bool | always | `true` when the service was active and restarted successfully. |
+| `dispositions` | object | plan ok | Per-key outcome: updated/inserted/appended/unset/unchanged. |
+| `unmatched` | string array | plan ok | Keys appended because absent everywhere in the file. |
+| `reserved` | string array | reserved key sent | Stripped keys naming the file, not a setting. |
+| `rejected` | object | 400, invalid key | Reason: invalid_key/invalid_value/unsupported_type. |
+| `tried` | string array | 404 | Every candidate path examined. |
+| `reason` | string | 200, nothing to write | `"no changes"`. |
+| `restart_error` | string | applied, but the restart failed | Detail from `check_service_status`. |
+| `error` | string | 400 / 404 / 500 | Human-readable description of the failure. |
+
+A few fields need more than the table row allows:
+
+- `dispositions` is authoritative only when `applied` is `true`. On a
+  `reason: "no changes"` response it still reflects the plan that was
+  computed, which happens to equal the outcome since nothing changed.
+- `unmatched` names only keys that landed in `dispositions` as `appended` —
+  keys absent everywhere in the file, active or commented. A key set to
+  JSON `null` that is already absent from the file is *not* in it: nothing
+  changed, so nothing was appended.
+- `reserved` matches key names case-insensitively; today the only reserved
+  key is `fileName`.
+- `restart_error` is not a server error: the configuration write already
+  succeeded before the restart was attempted.
+
+Status codes:
+
+- **200** — applied (a line changed and the file was rewritten), or a no-op
+  (`reason: "no changes"`, nothing to write).
+- **400** — the body was not a JSON object, `fileName` was missing, not a
+  string, or failed the path-safety whitelist, or one or more submitted keys
+  were rejected (`rejected` is populated).
+- **404** — neither candidate configuration file exists (`tried` is
+  populated).
+- **500** — the resolved configuration file could not be read, or the
+  rewritten content could not be written back.
+
+Example success body:
+
+```json
+{
+  "service": "camera",
+  "path": "/etc/default/camera",
+  "applied": true,
+  "restarted": true,
+  "dispositions": { "RUST_LOG": "updated", "BRAND_NEW_KEY": "appended" },
+  "unmatched": ["BRAND_NEW_KEY"],
+  "reserved": ["fileName"]
+}
+```
+
+Example rejection body (400):
+
+```json
+{
+  "service": "camera",
+  "path": "/etc/default/camera",
+  "applied": false,
+  "restarted": false,
+  "reserved": ["fileName"],
+  "rejected": {
+    "TARGET": { "invalid_value": "value contains control character U+000A" }
+  }
+}
+```
+
+Example not-found body (404):
+
+```json
+{
+  "service": "websrv-test-absent",
+  "applied": false,
+  "restarted": false,
+  "error": "no config file",
+  "tried": [
+    "/etc/default/websrv-test-absent",
+    "/etc/default/edgefirst-websrv-test-absent"
+  ]
+}
+```
 
 ### Args Structure
 

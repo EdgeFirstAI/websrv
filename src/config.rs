@@ -21,10 +21,16 @@ const EDGEFIRST_PREFIX: &str = "edgefirst-";
 
 /// Directory holding service configuration files.
 ///
-/// Set once at startup from `Args::config_dir`. A `OnceLock` rather than a
-/// threaded parameter because [`read_storage_directory`] is a free function
-/// called from four places that have no server state in scope, and the value
-/// is an immutable startup constant.
+/// Set once at startup from `Args::config_dir`. This is a deliberate scope
+/// call, not a necessity: two of `read_storage_directory`'s four call sites
+/// (`storage::check_storage_availability`, `mcap::list_mcap_files`) already
+/// hold `State<Arc<T>>`, and a third (`mcap::mcap_downloader`) sits on a
+/// `.with_state(ctx)` router and could declare one. Threading the value
+/// instead of using a `OnceLock` would mean adding a `config_dir()` method to
+/// both `StorageContext` and `McapContext`, which is out of scope here. The
+/// price of keeping the global: a whole test binary shares one directory, so
+/// any lib test that calls `init_config_dir` would break
+/// `config_dir_defaults_to_etc_default_when_uninitialised`.
 static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// Set the configuration directory. Only the first call has any effect.

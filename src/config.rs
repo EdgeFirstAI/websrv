@@ -177,16 +177,23 @@ pub async fn set_config(Json(params): Json<Value>) -> impl IntoResponse {
         }
     };
 
-    let config_map = if let Some(map) = params.as_object() {
-        map.clone()
-    } else {
-        serde_json::Map::new()
-    };
+    // `fileName` names the target file, not a setting; strip it before
+    // planning the edit so it is never written into the config file.
+    let config_map: serde_json::Map<String, Value> = params
+        .as_object()
+        .map(|map| {
+            map.iter()
+                .filter(|(key, _)| !key.eq_ignore_ascii_case("filename"))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
 
     // TODO(EDGEAI-1402 Task 6): this whole handler body is replaced wholesale
     // by Task 6, which reports per-key dispositions instead of writing plain
     // text. This is a minimal stopgap so the crate keeps compiling now that
-    // `update_config_content` is gone.
+    // `update_config_content` is gone. Task 6 replaces this silent filename
+    // filter with a reported `reserved` list instead of a silent drop.
     let plan = match plan_edit(&config_content, &config_map) {
         Ok(plan) => plan,
         Err(rejected) => {

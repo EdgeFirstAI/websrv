@@ -289,7 +289,16 @@ pub fn plan_edit(
     let entries = validate(updates)?;
 
     let lines: Vec<&str> = original.lines().collect();
-    // `lines()` discards the terminator, so record it and restore it at the end.
+    // `lines()` discards the terminator (both `\n` and a leading `\r`), so record
+    // it and restore it at the end. A file containing any `\r\n` is emitted
+    // entirely CRLF; mixed-ending files are pathological and normalizing them to
+    // one kind is acceptable, but a uniform file of either kind must round-trip
+    // byte-identically under an empty update.
+    let terminator = if original.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    };
     let ended_with_newline = original.is_empty() || original.ends_with('\n');
 
     let located = locate(&lines, &entries);
@@ -329,7 +338,7 @@ pub fn plan_edit(
                     Disposition::Unset
                 };
                 content.push_str(&rendered);
-                content.push('\n');
+                content.push_str(terminator);
                 // With several active lines, any real change outranks Unchanged.
                 dispositions
                     .entry(entry.key.clone())
@@ -342,13 +351,13 @@ pub fn plan_edit(
             }
             None => {
                 content.push_str(line);
-                content.push('\n');
+                content.push_str(terminator);
             }
         }
 
         if let Some(entry) = insert_after.get(&index) {
             content.push_str(&render(entry));
-            content.push('\n');
+            content.push_str(terminator);
             dispositions.insert(entry.key.clone(), Disposition::Inserted);
         }
     }
@@ -362,16 +371,19 @@ pub fn plan_edit(
         .collect();
 
     if !to_append.is_empty() {
-        if !original.contains(APPEND_MARKER) {
+        // A line-wise check, not a substring search: the marker text could appear
+        // inside a quoted value (e.g. a NOTE key) without the file actually having
+        // a marker line.
+        if !original.lines().any(|line| line.trim() == APPEND_MARKER) {
             if !content.is_empty() {
-                content.push('\n');
+                content.push_str(terminator);
             }
             content.push_str(APPEND_MARKER);
-            content.push('\n');
+            content.push_str(terminator);
         }
         for entry in to_append {
             content.push_str(&render(entry));
-            content.push('\n');
+            content.push_str(terminator);
             dispositions.insert(entry.key.clone(), Disposition::Appended);
             unmatched.insert(entry.key.clone());
         }
@@ -385,8 +397,8 @@ pub fn plan_edit(
             .or_insert(Disposition::Unchanged);
     }
 
-    if !ended_with_newline && content.ends_with('\n') {
-        content.pop();
+    if !ended_with_newline && content.ends_with(terminator) {
+        content.truncate(content.len() - terminator.len());
     }
 
     let changed = content != original;
@@ -627,6 +639,18 @@ mod tests {
     }
 
     #[test]
+    fn marker_text_inside_a_value_does_not_suppress_a_real_marker_line() {
+        // The gate must be line-wise, not a substring search over the whole file:
+        // the marker text appearing inside a quoted value is not a marker line.
+        let original = format!("NOTE=\"{APPEND_MARKER}\"\n");
+        let p = plan(&original, json!({ "NEW_KEY": "x" }));
+        assert_eq!(p.content.matches(APPEND_MARKER).count(), 2);
+        assert!(p
+            .content
+            .contains(&format!("\n{APPEND_MARKER}\nNEW_KEY=\"x\"\n")));
+    }
+
+    #[test]
     fn null_comments_out_every_active_line() {
         let p = plan(
             "DURATION=\"300\"\nx\nDURATION=\"600\"\n",
@@ -695,11 +719,11 @@ mod tests {
 
     #[test]
     fn a_key_that_is_a_prefix_of_another_is_not_confused() {
-        let p = plan(
-            "MODE=\"peer\"\nLIDAR_MODE=\"1024x10\"\n",
-            json!({ "MODE": "client" }),
-        );
-        assert_eq!(p.content, "MODE=\"client\"\nLIDAR_MODE=\"1024x10\"\n");
+        // TF is a prefix of TF_VEC; the anchored `=` must not let TF match the
+        // TF_VEC line, so TF is appended and TF_VEC is left untouched.
+        let p = plan("TF_VEC=\"a\"\n", json!({ "TF": "b" }));
+        assert_eq!(p.dispositions["TF"], Disposition::Appended);
+        assert!(p.content.contains("TF_VEC=\"a\"\n"));
     }
 
     #[test]
@@ -713,6 +737,27 @@ mod tests {
         let original = "A=\"1\"";
         assert_eq!(plan(original, json!({})).content, original);
         assert_eq!(plan(original, json!({ "A": "2" })).content, "A=\"2\"");
+    }
+
+    #[test]
+    fn crlf_file_survives_an_empty_update_unchanged() {
+        let original = "A=\"1\"\r\nB=\"2\"\r\n";
+        let p = plan(original, json!({}));
+        assert_eq!(p.content, original);
+        assert!(!p.changed);
+    }
+
+    #[test]
+    fn crlf_file_keeps_crlf_when_edited() {
+        let original = "A=\"1\"\r\nB=\"2\"\r\n";
+        let p = plan(original, json!({ "A": "3" }));
+        assert_eq!(p.content, "A=\"3\"\r\nB=\"2\"\r\n");
+    }
+
+    #[test]
+    fn crlf_file_without_trailing_newline_keeps_not_having_one() {
+        let original = "A=\"1\"\r\nB=\"2\"";
+        assert_eq!(plan(original, json!({})).content, original);
     }
 
     #[test]

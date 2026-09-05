@@ -1,7 +1,7 @@
 {
   "bomFormat": "CycloneDX",
   "specVersion": "1.6",
-  "serialNumber": "urn:uuid:962a3c73-cea9-4913-94cd-388169d2bb01",
+  "serialNumber": "urn:uuid:2c9b3a35-d6de-4dba-83f8-62ba2ad0fb6d",
   "version": 1,
   "metadata": {
     "tools": [
@@ -16320,6 +16320,7 @@
         "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.228",
         "registry+https://github.com/rust-lang/crates.io-index#serde_json@1.0.149",
         "registry+https://github.com/rust-lang/crates.io-index#sysinfo@0.37.2",
+        "registry+https://github.com/rust-lang/crates.io-index#tempfile@3.24.0",
         "registry+https://github.com/rust-lang/crates.io-index#tokio@1.49.0",
         "registry+https://github.com/rust-lang/crates.io-index#tokio-util@0.7.18",
         "registry+https://github.com/rust-lang/crates.io-index#tower-http@0.6.8",

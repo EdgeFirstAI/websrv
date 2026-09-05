@@ -285,6 +285,42 @@ pub async fn set_config(Json(params): Json<Value>) -> impl IntoResponse {
     }
 }
 
+/// Write `content` to `path` atomically.
+///
+/// Writes a sibling temp file, syncs it, copies the original file's mode onto
+/// it, then renames over the target. Same-directory rename is atomic on Linux,
+/// so a reader never sees a partial file and a crash leaves the original
+/// intact — which matters because a truncated `/etc/default` file stops the
+/// service from starting at all.
+///
+/// Ownership is deliberately not copied: websrv must already run as root to
+/// write `/etc/default` and to restart units, so the renamed file lands
+/// root-owned exactly as the original was.
+// Scaffolding: unused outside tests until Task 6 wires it into `set_config`.
+// Remove this attribute then.
+#[allow(dead_code)]
+fn write_atomic(path: &FsPath, content: &str) -> io::Result<()> {
+    use std::io::Write;
+
+    let dir = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "configuration path has no parent directory",
+        )
+    })?;
+    // Fails if the target does not exist, which is what we want: this function
+    // replaces a config file, it does not create one.
+    let permissions = std::fs::metadata(path)?.permissions();
+
+    let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+    temp.write_all(content.as_bytes())?;
+    temp.as_file().sync_all()?;
+    temp.as_file().set_permissions(permissions)?;
+    temp.persist(path).map_err(|e| e.error)?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -404,5 +440,43 @@ ANOTHER=123
         // Only meaningful when nothing has called init_config_dir in this
         // binary; the lib test binary does not.
         assert!(resolve_config("anything").tried[0].starts_with("/etc/default/"));
+    }
+
+    // ========================================================================
+    // Atomic write tests
+    // ========================================================================
+
+    #[test]
+    fn write_atomic_replaces_content_and_preserves_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("svc");
+        std::fs::write(&path, "old\n").expect("seed");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+
+        write_atomic(&path, "new\n").expect("write");
+
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "new\n");
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "mode was not preserved");
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("readdir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "svc")
+            .collect();
+        assert!(leftovers.is_empty(), "stray temp files: {leftovers:?}");
+    }
+
+    #[test]
+    fn write_atomic_fails_when_the_target_is_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let result = write_atomic(&dir.path().join("absent"), "x\n");
+        assert!(
+            result.is_err(),
+            "should not create a file that does not exist"
+        );
     }
 }

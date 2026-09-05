@@ -281,7 +281,8 @@ pub async fn set_config(Json(params): Json<Value>) -> impl IntoResponse {
     // "..", so the `/` and ".." checks are redundant today. They stay as
     // defence-in-depth: they become load-bearing the moment the whitelist is
     // widened (e.g. to allow `.` so names like `foo.conf` work).
-    let safe = !file_name.contains('/')
+    let safe = !file_name.is_empty()
+        && !file_name.contains('/')
         && !file_name.contains("..")
         && file_name
             .chars()
@@ -544,13 +545,16 @@ ANOTHER=123
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("svc");
         std::fs::write(&path, "old\n").expect("seed");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        // 0o644 is deliberately NOT `tempfile::NamedTempFile`'s default mode
+        // (0o600): using the default would leave this test passing even if
+        // `write_atomic` never copied the mode over.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
 
         write_atomic(&path, "new\n").expect("write");
 
         assert_eq!(std::fs::read_to_string(&path).expect("read"), "new\n");
         let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
-        assert_eq!(mode & 0o777, 0o600, "mode was not preserved");
+        assert_eq!(mode & 0o777, 0o644, "mode was not preserved");
 
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .expect("readdir")

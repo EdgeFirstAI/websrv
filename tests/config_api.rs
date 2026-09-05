@@ -168,7 +168,7 @@ async fn an_unchanged_save_writes_nothing() {
 
 #[tokio::test]
 async fn path_traversal_in_filename_is_rejected() {
-    for bad in ["../etc/passwd", "a/b", "..", "semi;colon"] {
+    for bad in ["../etc/passwd", "a/b", "..", "semi;colon", ""] {
         let (status, _) = post_config("websrv-test-x", json!({ "fileName": bad, "A": "1" })).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "accepted fileName {bad:?}");
     }

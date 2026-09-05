@@ -78,6 +78,16 @@ fn valid_key(key: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
+/// Upper bound on a submitted key's length.
+///
+/// `locate` compiles a `Regex` from every key via `regex::escape`, which only
+/// guarantees the pattern parses, not that it compiles: `Regex::new` returns
+/// `Err(CompiledTooBig)` once the resulting NFA exceeds regex's 10 MB default
+/// size limit, which a single ~200 000-character key is enough to trigger.
+/// This bound keeps the compiled matcher well clear of that ceiling; the
+/// longest key in any shipped `.default` is well under 40 characters.
+const MAX_KEY_LEN: usize = 128;
+
 /// Render a JSON scalar as a string, or `None` if it is not a scalar.
 fn scalar_to_string(value: &Value) -> Option<String> {
     match value {
@@ -162,6 +172,14 @@ pub(crate) fn validate(
     let mut seen: BTreeMap<String, String> = BTreeMap::new();
 
     for (key, value) in updates {
+        if key.len() > MAX_KEY_LEN {
+            rejects.insert(
+                key.clone(),
+                Reject::InvalidKey(format!("key exceeds the {MAX_KEY_LEN}-character limit")),
+            );
+            continue;
+        }
+
         if !valid_key(key) {
             rejects.insert(
                 key.clone(),
@@ -336,9 +354,9 @@ fn locate(lines: &[&str], entries: &[Entry]) -> BTreeMap<String, Location> {
     for entry in entries {
         let escaped = regex::escape(&entry.key);
         let active = Regex::new(&format!(r"(?i)^\s*{escaped}\s*="))
-            .expect("key is escaped, so the pattern is valid");
+            .expect("pattern is bounded: keys are escaped and length-capped by validate");
         let commented = Regex::new(&format!(r"(?i)^\s*#\s*{escaped}\s*="))
-            .expect("key is escaped, so the pattern is valid");
+            .expect("pattern is bounded: keys are escaped and length-capped by validate");
 
         let mut location = Location::default();
         for (index, line) in lines.iter().enumerate() {
@@ -613,6 +631,27 @@ mod tests {
                 "expected key {bad:?} to be rejected"
             );
         }
+    }
+
+    #[test]
+    fn keys_longer_than_the_limit_are_rejected() {
+        // Regression test for the panic in `locate`: a key long enough to
+        // blow past regex's default 10 MB compiled-size limit must be
+        // rejected by `validate`, not reach `Regex::new` at all. Exercise
+        // `plan_edit`, the path that used to panic, rather than `validate`
+        // alone.
+        let key = "A".repeat(200_000);
+        let e = plan_edit("A=\"1\"\n", &one(&key, json!("x"))).expect_err("expected rejection");
+        assert!(matches!(e[&key], Reject::InvalidKey(_)));
+    }
+
+    #[test]
+    fn keys_at_the_length_limit_are_accepted() {
+        let key = "A".repeat(MAX_KEY_LEN);
+        assert_eq!(
+            validate(&one(&key, json!("x"))).expect("expected validation to succeed"),
+            vec![entry(&key, Some("x"))]
+        );
     }
 
     #[test]

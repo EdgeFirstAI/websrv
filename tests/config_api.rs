@@ -175,6 +175,23 @@ async fn path_traversal_in_filename_is_rejected() {
 }
 
 #[tokio::test]
+async fn a_filename_naming_a_directory_is_not_found_not_a_server_error() {
+    // A fileName of plain alphanumerics passes the path-traversal whitelist,
+    // and `Path::exists()` is true for directories too — so before Resolved
+    // switched to `is_file()`, this resolved to the directory itself and
+    // `read_to_string` on it returned EISDIR, a 500 that leaked the resolved
+    // path. It must be a 404 instead, exactly like a name that resolves to
+    // nothing at all.
+    let name = "websrv-test-a-directory-not-a-file";
+    std::fs::create_dir(config_dir().join(name)).expect("create directory");
+
+    let (status, body) = post_config(name, json!({ "fileName": name, "A": "1" })).await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"], json!("no config file"));
+}
+
+#[tokio::test]
 async fn get_returns_the_written_values() {
     let svc = seed("get", "lidarpub");
     post_config(&svc, json!({ "fileName": svc, "CLUSTERING": "dbscan" })).await;

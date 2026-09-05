@@ -52,7 +52,11 @@ fn config_dir() -> &'static FsPath {
 pub(crate) struct Resolved {
     /// The path to use: the one that exists, or the primary candidate.
     pub path: PathBuf,
-    /// Whether any candidate actually exists.
+    /// Whether any candidate is a regular file, as opposed to merely
+    /// existing. `Path::exists` is true for directories too, and
+    /// `CONFIG_DIR` itself is one: a `fileName` of `""` or of an existing
+    /// subdirectory name would otherwise pass this check, skip the 404, and
+    /// turn a directory read into a 500 that leaks the resolved path.
     pub exists: bool,
     /// Every candidate examined, in order, for error reporting.
     pub tried: Vec<String>,
@@ -73,14 +77,14 @@ pub(crate) fn resolve_config(service: &str) -> Resolved {
         alternate.to_string_lossy().into_owned(),
     ];
 
-    if primary.exists() {
+    if primary.is_file() {
         return Resolved {
             path: primary,
             exists: true,
             tried,
         };
     }
-    if alternate.exists() {
+    if alternate.is_file() {
         debug!("Config {:?} not found, using {:?}", primary, alternate);
         return Resolved {
             path: alternate,

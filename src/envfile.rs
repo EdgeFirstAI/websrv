@@ -10,8 +10,9 @@
 //! what makes all-or-nothing writes possible: on rejection the caller simply
 //! never writes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
+use regex::Regex;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
@@ -56,8 +57,6 @@ pub(crate) struct Entry {
 ///
 /// systemd unescapes `\"` to `"` and `\\` to `\` inside double quotes, and
 /// needs no other escaping, so those two characters are the complete set.
-// Scaffolding: unused until Task 2 adds plan_edit. Remove this attribute then.
-#[allow(dead_code)]
 pub(crate) fn escape_value(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -153,8 +152,6 @@ fn check_writable(value: &str) -> Result<(), Reject> {
 /// Returns `Err` with a rejection for every offending key if any key is
 /// invalid, so the caller can report all problems in a single response and
 /// leave the file untouched.
-// Scaffolding: unused until Task 2 adds plan_edit. Remove this attribute then.
-#[allow(dead_code)]
 pub(crate) fn validate(
     updates: &Map<String, Value>,
 ) -> Result<Vec<Entry>, BTreeMap<String, Reject>> {
@@ -212,6 +209,194 @@ pub(crate) fn validate(
     } else {
         Err(rejects)
     }
+}
+
+/// Comment introducing keys appended because they appeared nowhere in the file.
+pub const APPEND_MARKER: &str = "# --- Added by edgefirst-websrv ---";
+
+/// A complete prospective edit of a configuration file.
+///
+/// Holding the whole new content rather than mutating a file is what makes
+/// all-or-nothing writes trivial: the caller writes `content` or does nothing.
+#[derive(Debug, Clone)]
+pub struct EditPlan {
+    /// What happened to each submitted key.
+    pub dispositions: BTreeMap<String, Disposition>,
+    /// Keys appended because they appeared nowhere in the original file,
+    /// active or commented. Exactly the keys dispositioned
+    /// [`Disposition::Appended`], surfaced as a set so callers can log and
+    /// warn without walking the disposition map.
+    pub unmatched: BTreeSet<String>,
+    /// The complete new file content.
+    pub content: String,
+    /// False when `content` is byte-identical to the original.
+    pub changed: bool,
+}
+
+/// Where one key was found in the original file.
+#[derive(Default)]
+struct Location {
+    /// Indices of every active `KEY=` line, in order.
+    active: Vec<usize>,
+    /// Index of the last `#KEY=` line, if any.
+    last_comment: Option<usize>,
+}
+
+/// Render one entry as the line that will be written.
+fn render(entry: &Entry) -> String {
+    match &entry.value {
+        Some(value) => format!("{}=\"{}\"", entry.key, escape_value(value)),
+        None => format!("#{}=", entry.key),
+    }
+}
+
+/// Locate every submitted key in the original lines.
+///
+/// Both patterns are anchored and match the key exactly, so documentation
+/// prose containing `=` is never mistaken for a definition.
+fn locate(lines: &[&str], entries: &[Entry]) -> BTreeMap<String, Location> {
+    let mut located = BTreeMap::new();
+
+    for entry in entries {
+        let escaped = regex::escape(&entry.key);
+        let active = Regex::new(&format!(r"(?i)^\s*{escaped}\s*="))
+            .expect("key is escaped, so the pattern is valid");
+        let commented = Regex::new(&format!(r"(?i)^\s*#\s*{escaped}\s*="))
+            .expect("key is escaped, so the pattern is valid");
+
+        let mut location = Location::default();
+        for (index, line) in lines.iter().enumerate() {
+            if active.is_match(line) {
+                location.active.push(index);
+            } else if commented.is_match(line) {
+                location.last_comment = Some(index);
+            }
+        }
+        located.insert(entry.key.clone(), location);
+    }
+
+    located
+}
+
+/// Validate `updates` and produce the complete prospective file content.
+///
+/// Returns `Err` with a rejection for every offending key if any key is
+/// invalid; in that case nothing should be written.
+pub fn plan_edit(
+    original: &str,
+    updates: &Map<String, Value>,
+) -> Result<EditPlan, BTreeMap<String, Reject>> {
+    let entries = validate(updates)?;
+
+    let lines: Vec<&str> = original.lines().collect();
+    // `lines()` discards the terminator, so record it and restore it at the end.
+    let ended_with_newline = original.is_empty() || original.ends_with('\n');
+
+    let located = locate(&lines, &entries);
+    let by_key: BTreeMap<&str, &Entry> = entries.iter().map(|e| (e.key.as_str(), e)).collect();
+
+    // Line index -> the entry that owns (and replaces) that line.
+    let mut owner: BTreeMap<usize, &Entry> = BTreeMap::new();
+    // Line index -> the entry whose new line follows that (commented) line.
+    let mut insert_after: BTreeMap<usize, &Entry> = BTreeMap::new();
+
+    for (key, location) in &located {
+        let entry = by_key[key.as_str()];
+        for index in &location.active {
+            owner.insert(*index, entry);
+        }
+        // A commented line only gains a sibling when no active line exists.
+        if location.active.is_empty() && entry.value.is_some() {
+            if let Some(index) = location.last_comment {
+                insert_after.insert(index, entry);
+            }
+        }
+    }
+
+    let mut content = String::with_capacity(original.len() + 256);
+    let mut dispositions: BTreeMap<String, Disposition> = BTreeMap::new();
+    let mut unmatched = BTreeSet::new();
+
+    for (index, line) in lines.iter().enumerate() {
+        match owner.get(&index) {
+            Some(entry) => {
+                let rendered = render(entry);
+                let disposition = if rendered == **line {
+                    Disposition::Unchanged
+                } else if entry.value.is_some() {
+                    Disposition::Updated
+                } else {
+                    Disposition::Unset
+                };
+                content.push_str(&rendered);
+                content.push('\n');
+                // With several active lines, any real change outranks Unchanged.
+                dispositions
+                    .entry(entry.key.clone())
+                    .and_modify(|current| {
+                        if *current == Disposition::Unchanged {
+                            *current = disposition;
+                        }
+                    })
+                    .or_insert(disposition);
+            }
+            None => {
+                content.push_str(line);
+                content.push('\n');
+            }
+        }
+
+        if let Some(entry) = insert_after.get(&index) {
+            content.push_str(&render(entry));
+            content.push('\n');
+            dispositions.insert(entry.key.clone(), Disposition::Inserted);
+        }
+    }
+
+    let to_append: Vec<&Entry> = entries
+        .iter()
+        .filter(|entry| {
+            let location = &located[&entry.key];
+            entry.value.is_some() && location.active.is_empty() && location.last_comment.is_none()
+        })
+        .collect();
+
+    if !to_append.is_empty() {
+        if !original.contains(APPEND_MARKER) {
+            if !content.is_empty() {
+                content.push('\n');
+            }
+            content.push_str(APPEND_MARKER);
+            content.push('\n');
+        }
+        for entry in to_append {
+            content.push_str(&render(entry));
+            content.push('\n');
+            dispositions.insert(entry.key.clone(), Disposition::Appended);
+            unmatched.insert(entry.key.clone());
+        }
+    }
+
+    // Anything not otherwise dispositioned had nothing to do: an unset for a
+    // key with no active line.
+    for entry in &entries {
+        dispositions
+            .entry(entry.key.clone())
+            .or_insert(Disposition::Unchanged);
+    }
+
+    if !ended_with_newline && content.ends_with('\n') {
+        content.pop();
+    }
+
+    let changed = content != original;
+
+    Ok(EditPlan {
+        dispositions,
+        unmatched,
+        content,
+        changed,
+    })
 }
 
 #[cfg(test)]
@@ -361,5 +546,189 @@ mod tests {
         assert_eq!(escape_value(r#"say "hi""#), r#"say \"hi\""#);
         assert_eq!(escape_value(r"a\b"), r"a\\b");
         assert_eq!(escape_value("plain 0.1 0"), "plain 0.1 0");
+    }
+
+    fn plan(original: &str, updates: Value) -> EditPlan {
+        plan_edit(original, &map(updates)).expect("expected planning to succeed")
+    }
+
+    #[test]
+    fn empty_update_is_a_byte_identical_no_op() {
+        let original = "A=\"1\"\n# comment\nB=\"2\"\n";
+        let p = plan(original, json!({}));
+        assert_eq!(p.content, original);
+        assert!(!p.changed);
+        assert!(p.dispositions.is_empty());
+    }
+
+    #[test]
+    fn active_line_is_updated_in_place() {
+        let p = plan(
+            "# doc\nRUST_LOG=\"info\"\nOTHER=\"x\"\n",
+            json!({ "RUST_LOG": "debug" }),
+        );
+        assert_eq!(p.content, "# doc\nRUST_LOG=\"debug\"\nOTHER=\"x\"\n");
+        assert_eq!(p.dispositions["RUST_LOG"], Disposition::Updated);
+        assert!(p.unmatched.is_empty());
+    }
+
+    #[test]
+    fn lowercase_submitted_key_matches_uppercase_line() {
+        let p = plan("RUST_LOG=\"info\"\n", json!({ "rust_log": "debug" }));
+        assert_eq!(p.content, "RUST_LOG=\"debug\"\n");
+        assert_eq!(p.dispositions["RUST_LOG"], Disposition::Updated);
+    }
+
+    #[test]
+    fn new_line_is_inserted_below_the_last_commented_occurrence() {
+        let original = "#TARGET=\ntail\n";
+        let p = plan(original, json!({ "TARGET": "192.168.1.200" }));
+        assert_eq!(p.content, "#TARGET=\nTARGET=\"192.168.1.200\"\ntail\n");
+        assert_eq!(p.dispositions["TARGET"], Disposition::Inserted);
+    }
+
+    #[test]
+    fn last_commented_occurrence_wins_over_earlier_ones() {
+        let original = "#TF_VEC=\"first\"\nmiddle\n#TF_VEC=\"second\"\ntail\n";
+        let p = plan(original, json!({ "TF_VEC": "0 0 0" }));
+        assert_eq!(
+            p.content,
+            "#TF_VEC=\"first\"\nmiddle\n#TF_VEC=\"second\"\nTF_VEC=\"0 0 0\"\ntail\n"
+        );
+        assert_eq!(p.dispositions["TF_VEC"], Disposition::Inserted);
+    }
+
+    #[test]
+    fn active_line_wins_and_commented_alternative_is_untouched() {
+        // This is lidarpub.default's Robosense/Ouster pattern.
+        let original = "TF_VEC=\"0.1 0 -0.05\"\n#TF_VEC=\"0 0 -0.19\"\n";
+        let p = plan(original, json!({ "TF_VEC": "0.2 0 -0.05" }));
+        assert_eq!(p.content, "TF_VEC=\"0.2 0 -0.05\"\n#TF_VEC=\"0 0 -0.19\"\n");
+        assert_eq!(p.dispositions["TF_VEC"], Disposition::Updated);
+    }
+
+    #[test]
+    fn key_absent_everywhere_is_appended_under_a_marker() {
+        let p = plan("A=\"1\"\n", json!({ "NEW_KEY": "x" }));
+        assert_eq!(
+            p.content,
+            format!("A=\"1\"\n\n{APPEND_MARKER}\nNEW_KEY=\"x\"\n")
+        );
+        assert_eq!(p.dispositions["NEW_KEY"], Disposition::Appended);
+        assert!(p.unmatched.contains("NEW_KEY"));
+    }
+
+    #[test]
+    fn marker_is_never_emitted_twice() {
+        let first = plan("A=\"1\"\n", json!({ "B": "2" })).content;
+        let second = plan(&first, json!({ "C": "3" })).content;
+        assert_eq!(second.matches(APPEND_MARKER).count(), 1);
+        assert!(second.contains("C=\"3\"\n"));
+    }
+
+    #[test]
+    fn null_comments_out_every_active_line() {
+        let p = plan(
+            "DURATION=\"300\"\nx\nDURATION=\"600\"\n",
+            json!({ "DURATION": null }),
+        );
+        assert_eq!(p.content, "#DURATION=\nx\n#DURATION=\n");
+        assert_eq!(p.dispositions["DURATION"], Disposition::Unset);
+    }
+
+    #[test]
+    fn null_on_a_key_with_no_active_line_changes_nothing() {
+        let original = "#TARGET=\n";
+        let p = plan(original, json!({ "TARGET": null }));
+        assert_eq!(p.content, original);
+        assert!(!p.changed);
+        assert_eq!(p.dispositions["TARGET"], Disposition::Unchanged);
+    }
+
+    #[test]
+    fn null_on_a_key_absent_entirely_changes_nothing() {
+        let p = plan("A=\"1\"\n", json!({ "NOPE": null }));
+        assert_eq!(p.content, "A=\"1\"\n");
+        assert!(!p.changed);
+        assert_eq!(p.dispositions["NOPE"], Disposition::Unchanged);
+    }
+
+    #[test]
+    fn identical_value_reports_unchanged() {
+        let original = "RUST_LOG=\"info\"\n";
+        let p = plan(original, json!({ "RUST_LOG": "info" }));
+        assert_eq!(p.content, original);
+        assert!(!p.changed);
+        assert_eq!(p.dispositions["RUST_LOG"], Disposition::Unchanged);
+    }
+
+    #[test]
+    fn respacing_an_equals_sign_counts_as_a_change() {
+        // fusion.default ships entirely in this spaced form.
+        let p = plan("RUST_LOG = \"info\"\n", json!({ "RUST_LOG": "info" }));
+        assert_eq!(p.content, "RUST_LOG=\"info\"\n");
+        assert!(p.changed);
+        assert_eq!(p.dispositions["RUST_LOG"], Disposition::Updated);
+    }
+
+    #[test]
+    fn every_duplicate_active_line_is_rewritten() {
+        // systemd takes the last definition, so a stale duplicate would win.
+        let p = plan("MODE=\"a\"\nx\nMODE=\"b\"\n", json!({ "MODE": "peer" }));
+        assert_eq!(p.content, "MODE=\"peer\"\nx\nMODE=\"peer\"\n");
+        assert_eq!(p.dispositions["MODE"], Disposition::Updated);
+    }
+
+    #[test]
+    fn documentation_prose_containing_equals_is_never_matched() {
+        let original =
+            "# Examples: \"info\", \"debug\", \"warn\", \"edgefirst_lidarpub=debug,info\"\n\
+             RUST_LOG=\"info\"\n";
+        let p = plan(original, json!({ "RUST_LOG": "debug" }));
+        assert_eq!(
+            p.content,
+            "# Examples: \"info\", \"debug\", \"warn\", \"edgefirst_lidarpub=debug,info\"\n\
+             RUST_LOG=\"debug\"\n"
+        );
+        assert_eq!(p.content.matches("RUST_LOG=").count(), 1);
+    }
+
+    #[test]
+    fn a_key_that_is_a_prefix_of_another_is_not_confused() {
+        let p = plan(
+            "MODE=\"peer\"\nLIDAR_MODE=\"1024x10\"\n",
+            json!({ "MODE": "client" }),
+        );
+        assert_eq!(p.content, "MODE=\"client\"\nLIDAR_MODE=\"1024x10\"\n");
+    }
+
+    #[test]
+    fn values_are_escaped_on_write() {
+        let p = plan("A=\"x\"\n", json!({ "A": r#"say "hi" \ ok"# }));
+        assert_eq!(p.content, "A=\"say \\\"hi\\\" \\\\ ok\"\n");
+    }
+
+    #[test]
+    fn a_file_without_a_trailing_newline_keeps_not_having_one() {
+        let original = "A=\"1\"";
+        assert_eq!(plan(original, json!({})).content, original);
+        assert_eq!(plan(original, json!({ "A": "2" })).content, "A=\"2\"");
+    }
+
+    #[test]
+    fn planning_is_idempotent() {
+        let original = "#CLUSTERING=\"\"\nRUST_LOG=\"info\"\n";
+        let updates = json!({ "CLUSTERING": "voxel", "RUST_LOG": "debug", "NEW": "1" });
+        let once = plan(original, updates.clone()).content;
+        let twice = plan(&once, updates);
+        assert_eq!(twice.content, once);
+        assert!(!twice.changed);
+    }
+
+    #[test]
+    fn rejections_propagate_and_produce_no_plan() {
+        let e = plan_edit("A=\"1\"\n", &map(json!({ "A": "ok\nEVIL=1" })))
+            .expect_err("expected rejection");
+        assert!(matches!(e["A"], Reject::InvalidValue(_)));
     }
 }

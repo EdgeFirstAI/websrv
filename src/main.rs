@@ -197,7 +197,7 @@ async fn websocket_handler_uploads(
 // User Mode Config Handler
 // ============================================================================
 
-/// GET /config/:service/details (user mode) — returns WebUISettings as JSON.
+/// GET /api/config/{service} (user mode) — returns WebUISettings as JSON.
 async fn user_mode_get_config(State(ctx): State<Arc<ServerContext>>) -> impl IntoResponse {
     axum::Json(WebUISettings::from(ctx.args.clone()))
 }

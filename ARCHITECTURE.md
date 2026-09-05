@@ -361,10 +361,10 @@ sequenceDiagram
 ```mermaid
 graph TB
     subgraph "Service Control API"
-        GetStatus[POST /config/service/status<br/>get_all_services]
-        UpdateSvc[POST /config/services/update<br/>update_service]
-        GetConfig[GET /config/{service}/details<br/>get_config]
-        SetConfig[POST /config/{service}<br/>set_config]
+        GetStatus[POST /api/services/status<br/>get_all_services]
+        UpdateSvc[POST /api/services/update<br/>update_service]
+        GetConfig[GET /api/config/{service}<br/>get_config]
+        SetConfig[POST /api/config/{service}<br/>set_config]
     end
 
     subgraph "systemd Commands"
@@ -767,8 +767,8 @@ graph TB
         Topics[Zenoh topic mappings]
     end
 
-    GetConf[GET /config/{service}/details] --> DefaultFiles
-    SetConf[POST /config/{service}] --> DefaultFiles
+    GetConf[GET /api/config/{service}] --> DefaultFiles
+    SetConf[POST /api/config/{service}] --> DefaultFiles
 
     WebUIArgs --> CmdLine
 
@@ -1165,7 +1165,7 @@ Intended for production deployments where EdgeFirst services are managed by syst
   uploader, camera, model, etc.)
 - **Storage path**: Read from `/etc/default/recorder` (`STORAGE_DIR` variable),
   with fallback to `--storage-path`
-- **WebUI config endpoint**: `GET /config/{service}/details` returns the raw
+- **WebUI config endpoint**: `GET /api/config/{service}` returns the raw
   key-value content of `/etc/default/{service}`
 
 #### User Mode (default)
@@ -1176,7 +1176,7 @@ Intended for development, testing, or single-user installations.
   tracks it via `Mutex<Option<Child>>`
 - **Configuration**: All settings come from command-line arguments
 - **Storage path**: Uses `--storage-path` (defaults to `.`)
-- **WebUI config endpoint**: `GET /config/{service}/details` returns the CLI
+- **WebUI config endpoint**: `GET /api/config/{service}` returns the CLI
   arguments as JSON (`WebUISettings`)
 
 #### Handler Routing by Mode

@@ -35,6 +35,7 @@ pub enum Disposition {
 
 /// Why one submitted key was refused. Any rejection fails the whole request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Reject {
     /// The key is not a valid environment variable name.
     InvalidKey(String),

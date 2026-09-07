@@ -20,6 +20,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `GET` followed by `POST` (EDGEAI-1402).
 - The `fileName` field the web UI posts alongside config values is no longer
   treated as a setting (EDGEAI-1402).
+- Lines beginning with `;` are now recognised as comments, matching systemd's
+  own `EnvironmentFile` parser. `GET` no longer returns them as settings named
+  `;KEY`, which made posting back an unmodified `GET` response fail the whole
+  save, and activating a `;`-commented key now inserts the value below that
+  line instead of appending a duplicate (EDGEAI-1402).
 - Configuration files are written atomically, so an interrupted save can no
   longer leave a truncated file that prevents the service from starting
   (EDGEAI-1402).
@@ -50,7 +55,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matching the convention documented in the shipped `.default` files
   (EDGEAI-1402).
 - `POST /api/config/{service}` now responds with `application/json` instead of
-  `text/plain` (EDGEAI-1402).
+  `text/plain`, including for a malformed body or a missing `Content-Type`,
+  which previously bypassed the handler and answered in `text/plain`
+  (EDGEAI-1402).
+- `POST /api/config/{service}` now requires the body's `fileName` to match the
+  `{service}` URL segment and returns 400 when they disagree. The segment was
+  previously ignored, so a request could name one service in the URL and
+  rewrite and restart another. Every web UI settings page already posts the
+  two in agreement (EDGEAI-1402).
 
 ## [4.1.0] - 2026-08-31
 

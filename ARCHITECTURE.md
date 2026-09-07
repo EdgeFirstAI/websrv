@@ -787,12 +787,22 @@ graph TB
 
 `POST /api/config/{service}` edits the file named by the request body's
 `fileName` field through `envfile::plan_edit`, a pure function that validates
-every submitted key and returns the complete prospective file content. The
-`{service}` URL segment is currently ignored by the handler; it is not what
-selects the file. Anything that keys authorization or audit logging on the
-URL path (neither exists today) must instead extract and cross-check
-`fileName` from the body. Because planning touches no files, a rejected key
-leaves the file untouched by construction.
+every submitted key and returns the complete prospective file content.
+
+`fileName` and the `{service}` URL segment must name the same file; a request
+where they disagree is refused with 400 and nothing is written. The body
+remains what selects the file, but the URL is no longer inert, so
+authorization or audit logging keyed on the URL path (neither exists today)
+cannot be bypassed by pointing the body at a different service.
+
+Because planning touches no files, a rejected key leaves the file untouched by
+construction.
+
+Both `#` and `;` begin a comment, matching systemd's own `EnvironmentFile`
+parser (`man systemd.exec`). A commented line with either prefix is a home for
+the key it names: activating that setting inserts the new line directly below
+it rather than appending a duplicate. `GET` omits commented lines entirely, so
+posting back the map `GET` returned is always a valid request.
 
 Each key resolves in this order:
 
@@ -862,14 +872,19 @@ Status codes:
 
 - **200** — applied (a line changed and the file was rewritten), or a no-op
   (`reason: "no changes"`, nothing to write).
-- **400** — the body was not a JSON object, `fileName` was missing, not a
-  string, or failed the path-safety whitelist, or one or more submitted keys
+- **400** — the request body was not valid JSON, was not a JSON object,
+  `fileName` was missing, not a string, failed the path-safety whitelist, or
+  disagreed with the `{service}` URL segment, or one or more submitted keys
   were rejected (`rejected` is populated).
+- **415** — the request carried no `Content-Type: application/json`.
 - **404** — neither candidate path is a regular file: the service has no
   configuration file, or the name resolves to a directory or other
   non-regular file (`tried` is populated).
 - **500** — the resolved configuration file could not be read, or the
   rewritten content could not be written back.
+
+Every one of these answers in this response shape, including the 400 and 415
+raised by the JSON extractor before the handler body runs.
 
 Example success body:
 

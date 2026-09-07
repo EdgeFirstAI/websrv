@@ -232,6 +232,53 @@ async fn get_returns_the_written_values() {
     assert_eq!(body["CLUSTERING"], json!("dbscan"));
 }
 
+/// GET the service map, then POST it straight back. A round trip through the
+/// UI does exactly this, so anything GET emits must be something POST accepts.
+async fn get_map(service: &str) -> Value {
+    let request = Request::builder()
+        .uri(format!("/api/config/{service}"))
+        .body(Body::empty())
+        .expect("build request");
+    let response = app().oneshot(request).await.expect("handler ran");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("read body");
+    serde_json::from_slice(&bytes).expect("json")
+}
+
+#[tokio::test]
+async fn a_semicolon_commented_key_does_not_break_the_get_post_round_trip() {
+    // `;` is an EnvironmentFile comment prefix alongside `#`. When GET emitted
+    // ";OLD_KEY" as a setting, posting the map back rejected the entire save,
+    // because a save is all-or-nothing and ";OLD_KEY" is not a valid key.
+    let svc = seed("semicolon", "camera").await;
+    {
+        let _guard = dir_lock().read().await;
+        let path = config_dir().join(&svc);
+        let mut content = std::fs::read_to_string(&path).expect("read seed");
+        content.push_str(";OLD_KEY=\"retired\"\n");
+        std::fs::write(&path, content).expect("append comment");
+    }
+
+    let mut map = get_map(&svc).await;
+    assert!(
+        map.get("OLD_KEY").is_none() && map.get(";OLD_KEY").is_none(),
+        "a commented key must not surface as a setting, got {map}"
+    );
+
+    map.as_object_mut()
+        .expect("object")
+        .insert("fileName".to_string(), json!(svc));
+    let (status, body) = post_config(&svc, map).await;
+    assert_eq!(status, StatusCode::OK, "round trip rejected: {body}");
+
+    assert!(
+        read(&svc).contains(";OLD_KEY=\"retired\""),
+        "the comment line must survive untouched"
+    );
+}
+
 #[tokio::test]
 async fn null_unsets_a_key_and_reports_it() {
     // RUST_LOG ships active in lidarpub.default (TARGET ships already

@@ -269,7 +269,12 @@ pub fn parse_config_content(content: &str) -> Map<String, Value> {
 
     for line in content.lines() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+        // `man systemd.exec`: in an EnvironmentFile, "lines starting with
+        // \";\" or \"#\" will be ignored". Both must be skipped here, not
+        // just `#`: a `;`-commented line otherwise parses into a key like
+        // ";OLD_KEY", and posting the GET response back would fail the whole
+        // all-or-nothing save on a key `validate` rejects.
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
         }
         if let Some((key, value)) = line.split_once('=') {
@@ -356,7 +361,9 @@ fn locate(lines: &[&str], entries: &[Entry]) -> BTreeMap<String, Location> {
         let escaped = regex::escape(&entry.key);
         let active = Regex::new(&format!(r"(?i)^\s*{escaped}\s*="))
             .expect("pattern is bounded: keys are escaped and length-capped by validate");
-        let commented = Regex::new(&format!(r"(?i)^\s*#\s*{escaped}\s*="))
+        // `#` and `;` are both EnvironmentFile comment prefixes (see
+        // `parse_config_content`), so either marks a home for the new value.
+        let commented = Regex::new(&format!(r"(?i)^\s*[#;]\s*{escaped}\s*="))
             .expect("pattern is bounded: keys are escaped and length-capped by validate");
 
         let mut location = Location::default();
@@ -724,6 +731,42 @@ mod tests {
             "#TF_VEC=\"first\"\nmiddle\n#TF_VEC=\"second\"\nTF_VEC=\"0 0 0\"\ntail\n"
         );
         assert_eq!(p.dispositions["TF_VEC"], Disposition::Inserted);
+    }
+
+    #[test]
+    fn semicolon_commented_line_is_a_home_for_the_new_value() {
+        // `man systemd.exec`: in an EnvironmentFile, "lines starting with
+        // \";\" or \"#\" will be ignored". Both prefixes must count as a
+        // commented occurrence of the key.
+        let original = ";TARGET=\"old\"\ntail\n";
+        let p = plan(original, json!({ "TARGET": "192.168.1.200" }));
+        assert_eq!(
+            p.content,
+            ";TARGET=\"old\"\nTARGET=\"192.168.1.200\"\ntail\n"
+        );
+        assert_eq!(p.dispositions["TARGET"], Disposition::Inserted);
+        assert!(
+            p.unmatched.is_empty(),
+            "the key had a commented home; it must not be reported unmatched"
+        );
+    }
+
+    #[test]
+    fn semicolon_comment_is_not_mistaken_for_an_active_line() {
+        // The value must be inserted, never used to rewrite the comment
+        // itself: the original line stays byte-identical.
+        let p = plan(";A=\"1\"\n", json!({ "A": "2" }));
+        assert!(p.content.starts_with(";A=\"1\"\n"), "got {:?}", p.content);
+    }
+
+    #[test]
+    fn parse_skips_semicolon_comments() {
+        // A `;`-commented line parsed as a setting yields the key ";OLD_KEY",
+        // which `validate` rejects. Because a save is all-or-nothing, posting
+        // back what GET returned would then fail the entire request.
+        let parsed = parse_config_content("A=\"1\"\n;OLD_KEY=\"x\"\n; SPACED=\"y\"\n");
+        assert_eq!(parsed.len(), 1, "got {parsed:?}");
+        assert_eq!(parsed["A"], json!("1"));
     }
 
     #[test]

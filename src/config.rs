@@ -592,16 +592,17 @@ ANOTHER=123
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("svc");
         std::fs::write(&path, "old\n").expect("seed");
-        // 0o644 is deliberately NOT `tempfile::NamedTempFile`'s default mode
+        // 0o640 is deliberately NOT `tempfile::NamedTempFile`'s default mode
         // (0o600): using the default would leave this test passing even if
-        // `write_atomic` never copied the mode over.
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        // `write_atomic` never copied the mode over. It also grants nothing to
+        // "others", so the test creates no world-readable artifact.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).expect("chmod");
 
         write_atomic(&path, "new\n").expect("write");
 
         assert_eq!(std::fs::read_to_string(&path).expect("read"), "new\n");
         let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
-        assert_eq!(mode & 0o777, 0o644, "mode was not preserved");
+        assert_eq!(mode & 0o777, 0o640, "mode was not preserved");
 
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .expect("readdir")

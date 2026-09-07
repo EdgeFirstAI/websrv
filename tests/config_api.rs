@@ -325,7 +325,10 @@ async fn a_failed_write_withholds_dispositions_and_unmatched() {
     // `post_config`, which takes its own read lock and would deadlock
     // against the write lock held by this same thread.
     let _write_guard = dir_lock().write().await;
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).expect("chmod ro");
+    // 0o500 (owner r-x, nothing for group or others) is the least permissive
+    // mode that still lets this thread traverse the directory to read the
+    // seeded file while denying the write `set_config` is about to attempt.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).expect("chmod ro");
     let request = Request::builder()
         .method("POST")
         .uri(format!("/api/config/{svc}"))

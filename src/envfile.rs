@@ -380,10 +380,145 @@ fn locate(lines: &[&str], entries: &[Entry]) -> BTreeMap<String, Location> {
     located
 }
 
+/// Where each entry's new line goes, resolved against the original file.
+///
+/// Every entry lands in exactly one of the three: it rewrites the active
+/// line(s) it already has, it gains a new line below its last commented
+/// occurrence, or it has no home at all and must be appended.
+struct Placement<'a> {
+    /// Line index -> the entry that owns (and replaces) that line.
+    owner: BTreeMap<usize, &'a Entry>,
+    /// Line index -> the entry whose new line follows that (commented) line.
+    insert_after: BTreeMap<usize, &'a Entry>,
+    /// Entries present nowhere in the file, in `entries` order.
+    append: Vec<&'a Entry>,
+}
+
+/// Resolve every entry against what [`locate`] found for it.
+fn place<'a>(located: &BTreeMap<String, Location>, entries: &'a [Entry]) -> Placement<'a> {
+    let by_key: BTreeMap<&str, &Entry> = entries.iter().map(|e| (e.key.as_str(), e)).collect();
+
+    let mut owner: BTreeMap<usize, &Entry> = BTreeMap::new();
+    let mut insert_after: BTreeMap<usize, &Entry> = BTreeMap::new();
+
+    for (key, location) in located {
+        let entry = by_key[key.as_str()];
+        for index in &location.active {
+            owner.insert(*index, entry);
+        }
+        // A commented line only gains a sibling when no active line exists.
+        if location.active.is_empty() && entry.value.is_some() {
+            if let Some(index) = location.last_comment {
+                insert_after.insert(index, entry);
+            }
+        }
+    }
+
+    let append = entries
+        .iter()
+        .filter(|entry| {
+            let location = &located[&entry.key];
+            entry.value.is_some() && location.active.is_empty() && location.last_comment.is_none()
+        })
+        .collect();
+
+    Placement {
+        owner,
+        insert_after,
+        append,
+    }
+}
+
+/// What happened to an active line that its entry rewrote.
+fn disposition_for(entry: &Entry, rendered: &str, original_line: &str) -> Disposition {
+    if rendered == original_line {
+        Disposition::Unchanged
+    } else if entry.value.is_some() {
+        Disposition::Updated
+    } else {
+        Disposition::Unset
+    }
+}
+
+/// Rewrite the original body line by line, recording what became of each key.
+fn emit_body(
+    lines: &[&str],
+    terminator: &str,
+    placement: &Placement<'_>,
+    content: &mut String,
+    dispositions: &mut BTreeMap<String, Disposition>,
+) {
+    for (index, line) in lines.iter().enumerate() {
+        match placement.owner.get(&index) {
+            Some(entry) => {
+                let rendered = render(entry);
+                let disposition = disposition_for(entry, &rendered, line);
+                content.push_str(&rendered);
+                content.push_str(terminator);
+                // With several active lines, any real change outranks Unchanged.
+                dispositions
+                    .entry(entry.key.clone())
+                    .and_modify(|current| {
+                        if *current == Disposition::Unchanged {
+                            *current = disposition;
+                        }
+                    })
+                    .or_insert(disposition);
+            }
+            None => {
+                content.push_str(line);
+                content.push_str(terminator);
+            }
+        }
+
+        if let Some(entry) = placement.insert_after.get(&index) {
+            content.push_str(&render(entry));
+            content.push_str(terminator);
+            dispositions.insert(entry.key.clone(), Disposition::Inserted);
+        }
+    }
+}
+
+/// Append the entries that had no home in the file, under a single marker.
+fn append_missing(
+    original: &str,
+    placement: &Placement<'_>,
+    terminator: &str,
+    content: &mut String,
+    dispositions: &mut BTreeMap<String, Disposition>,
+    unmatched: &mut BTreeSet<String>,
+) {
+    if placement.append.is_empty() {
+        return;
+    }
+
+    // A line-wise check, not a substring search: the marker text could appear
+    // inside a quoted value (e.g. a NOTE key) without the file actually having
+    // a marker line.
+    if !original.lines().any(|line| line.trim() == APPEND_MARKER) {
+        if !content.is_empty() {
+            content.push_str(terminator);
+        }
+        content.push_str(APPEND_MARKER);
+        content.push_str(terminator);
+    }
+
+    for entry in &placement.append {
+        content.push_str(&render(entry));
+        content.push_str(terminator);
+        dispositions.insert(entry.key.clone(), Disposition::Appended);
+        unmatched.insert(entry.key.clone());
+    }
+}
+
 /// Validate `updates` and produce the complete prospective file content.
 ///
 /// Returns `Err` with a rejection for every offending key if any key is
 /// invalid; in that case nothing should be written.
+///
+/// Three phases, one helper each: [`locate`] and [`place`] decide where every
+/// value goes, [`emit_body`] rewrites the existing lines, and
+/// [`append_missing`] adds whatever had nowhere to go.
 pub fn plan_edit(
     original: &str,
     updates: &Map<String, Value>,
@@ -404,92 +539,27 @@ pub fn plan_edit(
     let ended_with_newline = original.is_empty() || original.ends_with('\n');
 
     let located = locate(&lines, &entries);
-    let by_key: BTreeMap<&str, &Entry> = entries.iter().map(|e| (e.key.as_str(), e)).collect();
-
-    // Line index -> the entry that owns (and replaces) that line.
-    let mut owner: BTreeMap<usize, &Entry> = BTreeMap::new();
-    // Line index -> the entry whose new line follows that (commented) line.
-    let mut insert_after: BTreeMap<usize, &Entry> = BTreeMap::new();
-
-    for (key, location) in &located {
-        let entry = by_key[key.as_str()];
-        for index in &location.active {
-            owner.insert(*index, entry);
-        }
-        // A commented line only gains a sibling when no active line exists.
-        if location.active.is_empty() && entry.value.is_some() {
-            if let Some(index) = location.last_comment {
-                insert_after.insert(index, entry);
-            }
-        }
-    }
+    let placement = place(&located, &entries);
 
     let mut content = String::with_capacity(original.len() + 256);
     let mut dispositions: BTreeMap<String, Disposition> = BTreeMap::new();
     let mut unmatched = BTreeSet::new();
 
-    for (index, line) in lines.iter().enumerate() {
-        match owner.get(&index) {
-            Some(entry) => {
-                let rendered = render(entry);
-                let disposition = if rendered == **line {
-                    Disposition::Unchanged
-                } else if entry.value.is_some() {
-                    Disposition::Updated
-                } else {
-                    Disposition::Unset
-                };
-                content.push_str(&rendered);
-                content.push_str(terminator);
-                // With several active lines, any real change outranks Unchanged.
-                dispositions
-                    .entry(entry.key.clone())
-                    .and_modify(|current| {
-                        if *current == Disposition::Unchanged {
-                            *current = disposition;
-                        }
-                    })
-                    .or_insert(disposition);
-            }
-            None => {
-                content.push_str(line);
-                content.push_str(terminator);
-            }
-        }
-
-        if let Some(entry) = insert_after.get(&index) {
-            content.push_str(&render(entry));
-            content.push_str(terminator);
-            dispositions.insert(entry.key.clone(), Disposition::Inserted);
-        }
-    }
-
-    let to_append: Vec<&Entry> = entries
-        .iter()
-        .filter(|entry| {
-            let location = &located[&entry.key];
-            entry.value.is_some() && location.active.is_empty() && location.last_comment.is_none()
-        })
-        .collect();
-
-    if !to_append.is_empty() {
-        // A line-wise check, not a substring search: the marker text could appear
-        // inside a quoted value (e.g. a NOTE key) without the file actually having
-        // a marker line.
-        if !original.lines().any(|line| line.trim() == APPEND_MARKER) {
-            if !content.is_empty() {
-                content.push_str(terminator);
-            }
-            content.push_str(APPEND_MARKER);
-            content.push_str(terminator);
-        }
-        for entry in to_append {
-            content.push_str(&render(entry));
-            content.push_str(terminator);
-            dispositions.insert(entry.key.clone(), Disposition::Appended);
-            unmatched.insert(entry.key.clone());
-        }
-    }
+    emit_body(
+        &lines,
+        terminator,
+        &placement,
+        &mut content,
+        &mut dispositions,
+    );
+    append_missing(
+        original,
+        &placement,
+        terminator,
+        &mut content,
+        &mut dispositions,
+        &mut unmatched,
+    );
 
     // Anything not otherwise dispositioned had nothing to do: an unset for a
     // key with no active line.

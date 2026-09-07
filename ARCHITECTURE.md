@@ -833,6 +833,18 @@ file systemd feeds to services running as root. The file is replaced
 atomically, and the service is restarted only when the content actually
 changed.
 
+Keys naming a loader or language-runtime variable are refused whatever their
+value: anything beginning `LD_`, plus `PATH`, `ENV`, `IFS`, `BASH_ENV`,
+`SHELLOPTS`, `GLIBC_TUNABLES`, `PYTHONPATH`, `PYTHONHOME`, `PYTHONSTARTUP`,
+`PERL5LIB` and `NODE_OPTIONS`. These are consumed before the service's own
+code runs, so writing one converts a configuration edit into control of the
+process. Most units run as root with no `User=` and a successful save
+restarts the unit, which would make an appended `LD_PRELOAD=` line code
+execution as root. The names appear in none of the shipped `.default` files,
+so nothing legitimate is refused. This is a backstop, not a boundary — the
+mutating routes are still unauthenticated, so a caller who can reach them can
+rewrite genuine settings and restart the unit regardless.
+
 ##### Response
 
 `set_config` always returns a JSON object, whatever the outcome. Fields are
@@ -848,7 +860,7 @@ plain successful save stays compact:
 | `dispositions` | object | 200 only | Per-key outcome: updated/inserted/appended/unset/unchanged. |
 | `unmatched` | string array | 200 only | Keys appended because absent everywhere in the file. |
 | `reserved` | string array | reserved key sent | Stripped keys naming the file, not a setting. |
-| `rejected` | object | 400, invalid key | Reason: invalid_key/invalid_value/unsupported_type. |
+| `rejected` | object | 400, invalid key | Reason: invalid_key/invalid_value/unsupported_type/forbidden_key. |
 | `tried` | string array | 404 | Every candidate path examined. |
 | `reason` | string | 200, nothing to write | `"no changes"`. |
 | `restart_error` | string | applied, but the restart failed | Detail from `check_service_status`. |

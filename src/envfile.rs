@@ -43,6 +43,52 @@ pub enum Reject {
     InvalidValue(String),
     /// The JSON type has no `EnvironmentFile` representation.
     UnsupportedType(String),
+    /// The key changes how the service's process is loaded rather than how it
+    /// is configured. See [`FORBIDDEN_KEYS`].
+    ForbiddenKey(String),
+}
+
+/// Variable names that are refused outright, whatever their value.
+///
+/// These are read by the dynamic loader, the C library or a language runtime
+/// before the service's own code runs, so writing one turns a configuration
+/// edit into control over the process itself. Most EdgeFirst units run as
+/// root with no `User=`, and a successful save restarts the unit, so an
+/// `LD_PRELOAD=` line here would execute attacker-supplied code as root.
+///
+/// Before this module could add keys, such a name was silently dropped: the
+/// old writer could only rewrite lines that already existed, and none of the
+/// 18 shipped `.default` files contain any of these. Being able to append
+/// keys is what makes the guard necessary, and that same fact is why it
+/// costs nothing -- no shipped configuration is refused by it.
+///
+/// This is a backstop, not the boundary. The route is unauthenticated, so a
+/// caller can still rewrite legitimate settings and restart the unit;
+/// authenticating the mutating routes is tracked separately.
+const FORBIDDEN_KEYS: &[&str] = &[
+    "BASH_ENV",
+    "ENV",
+    "GLIBC_TUNABLES",
+    "IFS",
+    "NODE_OPTIONS",
+    "PATH",
+    "PERL5LIB",
+    "PYTHONHOME",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+    "SHELLOPTS",
+];
+
+/// Prefix covering the whole dynamic-loader family (`LD_PRELOAD`, `LD_AUDIT`,
+/// `LD_LIBRARY_PATH` and the rest), which is easier to state as a prefix than
+/// to enumerate.
+const FORBIDDEN_PREFIX: &str = "LD_";
+
+/// Whether `key` names a loader or runtime variable rather than a setting.
+/// Matched case-insensitively, since keys are uppercased before being written.
+fn forbidden_key(key: &str) -> bool {
+    let upper = key.to_uppercase();
+    upper.starts_with(FORBIDDEN_PREFIX) || FORBIDDEN_KEYS.contains(&upper.as_str())
 }
 
 /// One validated entry, normalized to the form it will be written in.
@@ -185,6 +231,16 @@ pub(crate) fn validate(
             rejects.insert(
                 key.clone(),
                 Reject::InvalidKey("must match [A-Za-z_][A-Za-z0-9_]*".to_string()),
+            );
+            continue;
+        }
+
+        if forbidden_key(key) {
+            rejects.insert(
+                key.clone(),
+                Reject::ForbiddenKey(
+                    "names a loader or runtime variable, not a service setting".to_string(),
+                ),
             );
             continue;
         }
@@ -801,6 +857,50 @@ mod tests {
             "#TF_VEC=\"first\"\nmiddle\n#TF_VEC=\"second\"\nTF_VEC=\"0 0 0\"\ntail\n"
         );
         assert_eq!(p.dispositions["TF_VEC"], Disposition::Inserted);
+    }
+
+    #[test]
+    fn loader_and_interpreter_keys_are_refused() {
+        for key in [
+            "LD_PRELOAD",
+            "ld_preload",
+            "LD_LIBRARY_PATH",
+            "LD_AUDIT",
+            "GLIBC_TUNABLES",
+            "PATH",
+            "BASH_ENV",
+            "SHELLOPTS",
+            "PYTHONPATH",
+            "NODE_OPTIONS",
+            "PERL5LIB",
+        ] {
+            let rejected = err(json!({ key: "/tmp/evil.so" }));
+            assert!(
+                matches!(rejected.get(key), Some(Reject::ForbiddenKey(_))),
+                "{key} was not refused, got {rejected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_keys_that_merely_look_similar_are_still_accepted() {
+        // The guard is a fixed list plus the LD_ prefix, not a fuzzy match:
+        // real settings must not be caught by it.
+        let accepted = ok(json!({
+            "PATHFINDER": "1",
+            "STORAGE_PATH": "/var/lib",
+            "LDAP_URL": "x",
+            "OLD_TOPIC": "y",
+            "RUST_LOG": "info"
+        }));
+        assert_eq!(accepted.len(), 5);
+    }
+
+    #[test]
+    fn a_forbidden_key_fails_the_whole_request() {
+        // All-or-nothing: the valid sibling must not slip through.
+        let rejected = err(json!({ "RUST_LOG": "debug", "LD_PRELOAD": "/tmp/x.so" }));
+        assert!(rejected.contains_key("LD_PRELOAD"));
     }
 
     #[test]

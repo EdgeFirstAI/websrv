@@ -296,6 +296,34 @@ async fn a_filename_disagreeing_with_the_url_is_rejected() {
 }
 
 #[tokio::test]
+async fn a_loader_variable_cannot_be_injected_into_a_root_service() {
+    // Most EdgeFirst units run as root with no User=, and a successful save
+    // restarts the unit. Before this endpoint could add keys, LD_PRELOAD was
+    // silently dropped -- it appears in none of the shipped .default files, so
+    // there was no line to rewrite. Appending it would hand an unauthenticated
+    // caller code execution as root on the next restart.
+    let svc = seed("loader", "camera").await;
+    let before = read(&svc);
+
+    let (status, body) = post_config(
+        &svc,
+        json!({ "fileName": svc, "LD_PRELOAD": "/tmp/evil.so" }),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "got {body}");
+    assert!(
+        body["rejected"]["LD_PRELOAD"].is_object(),
+        "expected a rejection for LD_PRELOAD, got {body}"
+    );
+    assert_eq!(read(&svc), before, "the file was written anyway");
+    assert!(
+        !read(&svc).contains("LD_PRELOAD"),
+        "LD_PRELOAD reached the file"
+    );
+}
+
+#[tokio::test]
 async fn path_traversal_in_filename_is_rejected() {
     // The URL is percent-encoded so that the {service} segment decodes to the
     // same hostile string the body carries. Posting a mismatched pair instead

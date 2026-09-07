@@ -58,6 +58,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `text/plain`, including for a malformed body or a missing `Content-Type`,
   which previously bypassed the handler and answered in `text/plain`
   (EDGEAI-1402).
+- `POST /api/config/{service}` refuses keys that name a loader or
+  language-runtime variable — anything beginning `LD_`, plus `PATH`, `ENV`,
+  `IFS`, `BASH_ENV`, `SHELLOPTS`, `GLIBC_TUNABLES`, `PYTHONPATH`,
+  `PYTHONHOME`, `PYTHONSTARTUP`, `PERL5LIB` and `NODE_OPTIONS`. These are read
+  before a service's own code runs, and since most units run as root and a
+  successful save restarts the unit, an appended `LD_PRELOAD=` line would be
+  code execution as root. They appear in no shipped configuration file, so
+  nothing legitimate is refused (EDGEAI-1402).
 - `POST /api/config/{service}` now requires the body's `fileName` to match the
   `{service}` URL segment and returns 400 when they disagree. The segment was
   previously ignored, so a request could name one service in the URL and

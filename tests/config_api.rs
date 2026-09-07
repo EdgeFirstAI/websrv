@@ -364,6 +364,14 @@ async fn atomic_write_leaves_no_stray_files() {
     let svc = seed("atomic", "camera").await;
     post_config(&svc, json!({ "fileName": svc, "RUST_LOG": "trace" })).await;
 
+    // Exclusive for the scan only. Every other writer holds a read lock for
+    // the span of its disk access, so taking the write side here waits until
+    // no request is in flight. Without it this scan can catch a concurrent
+    // test's `NamedTempFile` mid-write and report a leak that never happened.
+    // Taken after the POST above, never across it: `post_config` acquires its
+    // own read lock and would deadlock against a write lock held here.
+    let _scan_guard = dir_lock().write().await;
+
     let strays: Vec<String> = std::fs::read_dir(config_dir())
         .expect("readdir")
         .filter_map(Result::ok)

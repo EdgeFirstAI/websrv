@@ -43,6 +43,7 @@ regex = "1.12.2"
 serde = "1.0.219"
 serde_json = "1.0.140"
 sysinfo = "0.37.2"
+tempfile = "3.15"
 tokio = { version = "1.48.0", features = ["rt-multi-thread", "time", "io-std", "signal"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tower-http = { version = "0.6", features = ["fs"] }
@@ -54,7 +55,7 @@ rustls-pemfile = "2.2.0"
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "cookies"], default-features = false }
-tempfile = "3.15"
 tokio = { version = "1.48", features = ["rt-multi-thread", "macros"] }
 tokio-tungstenite = "0.24"
+tower = { version = "0.5", features = ["util"] }
 url = "2"

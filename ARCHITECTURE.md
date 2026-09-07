@@ -361,10 +361,10 @@ sequenceDiagram
 ```mermaid
 graph TB
     subgraph "Service Control API"
-        GetStatus[POST /config/service/status<br/>get_all_services]
-        UpdateSvc[POST /config/services/update<br/>update_service]
-        GetConfig[GET /config/{service}/details<br/>get_config]
-        SetConfig[POST /config/{service}<br/>set_config]
+        GetStatus[POST /api/services/status<br/>get_all_services]
+        UpdateSvc[POST /api/services/update<br/>update_service]
+        GetConfig[GET /api/config/{service}<br/>get_config]
+        SetConfig[POST /api/config/{service}<br/>set_config]
     end
 
     subgraph "systemd Commands"
@@ -767,8 +767,8 @@ graph TB
         Topics[Zenoh topic mappings]
     end
 
-    GetConf[GET /config/{service}/details] --> DefaultFiles
-    SetConf[POST /config/{service}] --> DefaultFiles
+    GetConf[GET /api/config/{service}] --> DefaultFiles
+    SetConf[POST /api/config/{service}] --> DefaultFiles
 
     WebUIArgs --> CmdLine
 
@@ -781,6 +781,165 @@ graph TB
     CmdLine --> System
     CmdLine --> ZenohMode
     CmdLine --> Topics
+```
+
+#### Configuration Writes
+
+`POST /api/config/{service}` edits the file named by the request body's
+`fileName` field through `envfile::plan_edit`, a pure function that validates
+every submitted key and returns the complete prospective file content.
+
+`fileName` and the `{service}` URL segment must name the same file; a request
+where they disagree is refused with 400 and nothing is written. The body
+remains what selects the file, but the URL is no longer inert, so
+authorization or audit logging keyed on the URL path (neither exists today)
+cannot be bypassed by pointing the body at a different service.
+
+Because planning touches no files, a rejected key leaves the file untouched by
+construction.
+
+Both `#` and `;` begin a comment, matching systemd's own `EnvironmentFile`
+parser (`man systemd.exec`). A commented line with either prefix is a home for
+the key it names: activating that setting inserts the new line directly below
+it rather than appending a duplicate. `GET` omits commented lines entirely, so
+posting back the map `GET` returned is always a valid request.
+
+Each key resolves in this order:
+
+1. An active `KEY=` line is rewritten in place. Every duplicate active line
+   is rewritten too, because systemd takes the *last* definition and a stale
+   duplicate would otherwise silently win.
+2. Otherwise a new active line is inserted directly below the **last**
+   `#KEY=` line, so the key lands in its documented section and the comment
+   stays as a record of the shipped default.
+3. Otherwise the key is appended under `# --- Added by edgefirst-websrv ---`
+   and reported in `unmatched`. `unmatched` names only keys that landed here —
+   a key set to `null` that is simply absent from the file is not in it.
+
+When the resolved line already reads exactly what would be written, no line
+changes and the key is reported `unchanged`: the file already expresses that
+value.
+
+A JSON `null` unsets a key by commenting it out. An empty string, in
+contrast, is written literally: for some services empty is a meaningful value
+that differs from absent. `fusion`'s `LIDAR_OUTPUT_TOPIC=""` disables that
+output, while an absent key falls back to the non-empty default
+`"fusion/lidar"` — treating the two the same would silently re-enable a
+disabled output.
+
+Values are escaped for `\` and `"`; newlines and other control characters
+are rejected outright, since a newline would inject arbitrary lines into a
+file systemd feeds to services running as root. The file is replaced
+atomically, and the service is restarted only when the content actually
+changed.
+
+Keys naming a loader or language-runtime variable are refused whatever their
+value: anything beginning `LD_`, plus `PATH`, `ENV`, `IFS`, `BASH_ENV`,
+`SHELLOPTS`, `GLIBC_TUNABLES`, `PYTHONPATH`, `PYTHONHOME`, `PYTHONSTARTUP`,
+`PERL5LIB` and `NODE_OPTIONS`. These are consumed before the service's own
+code runs, so writing one converts a configuration edit into control of the
+process. Most units run as root with no `User=` and a successful save
+restarts the unit, which would make an appended `LD_PRELOAD=` line code
+execution as root. The names appear in none of the shipped `.default` files,
+so nothing legitimate is refused. This is a backstop, not a boundary — the
+mutating routes are still unauthenticated, so a caller who can reach them can
+rewrite genuine settings and restart the unit regardless.
+
+##### Response
+
+`set_config` always returns a JSON object, whatever the outcome. Fields are
+omitted (rather than emitted `null` or empty) when they do not apply, so a
+plain successful save stays compact:
+
+| Field | Type | Present when | Meaning |
+|-------|------|--------------|---------|
+| `service` | string | always | The `fileName` from the request (empty if the body was malformed). |
+| `path` | string | file resolved | Absolute path of the file that was read or written. |
+| `applied` | bool | always | `true` only when the file was actually rewritten. |
+| `restarted` | bool | always | `true` when the service was active and restarted successfully. |
+| `dispositions` | object | 200 only | Per-key outcome: updated/inserted/appended/unset/unchanged. |
+| `unmatched` | string array | 200 only | Keys appended because absent everywhere in the file. |
+| `reserved` | string array | reserved key sent | Stripped keys naming the file, not a setting. |
+| `rejected` | object | 400, invalid key | Reason: invalid_key/invalid_value/unsupported_type/forbidden_key. |
+| `tried` | string array | 404 | Every candidate path examined. |
+| `reason` | string | 200, nothing to write | `"no changes"`. |
+| `restart_error` | string | applied, but the restart failed | Detail from `check_service_status`. |
+| `error` | string | 400 / 404 / 500 | Human-readable description of the failure. |
+
+A few fields need more than the table row allows:
+
+- `dispositions` is authoritative only when `applied` is `true`. On a
+  `reason: "no changes"` response it still reflects the plan that was
+  computed, which happens to equal the outcome since nothing changed.
+- `unmatched` names only keys that landed in `dispositions` as `appended` —
+  keys absent everywhere in the file, active or commented. A key set to
+  JSON `null` that is already absent from the file is *not* in it: nothing
+  changed, so nothing was appended.
+- `reserved` matches key names case-insensitively; today the only reserved
+  key is `fileName`.
+- `restart_error` is not a server error: the configuration write already
+  succeeded before the restart was attempted.
+
+Status codes:
+
+- **200** — applied (a line changed and the file was rewritten), or a no-op
+  (`reason: "no changes"`, nothing to write).
+- **400** — the request body was not valid JSON, was not a JSON object,
+  `fileName` was missing, not a string, failed the path-safety whitelist, or
+  disagreed with the `{service}` URL segment, or one or more submitted keys
+  were rejected (`rejected` is populated).
+- **415** — the request carried no `Content-Type: application/json`.
+- **404** — neither candidate path is a regular file: the service has no
+  configuration file, or the name resolves to a directory or other
+  non-regular file (`tried` is populated).
+- **500** — the resolved configuration file could not be read, or the
+  rewritten content could not be written back.
+
+Every one of these answers in this response shape, including the 400 and 415
+raised by the JSON extractor before the handler body runs.
+
+Example success body:
+
+```json
+{
+  "service": "camera",
+  "path": "/etc/default/camera",
+  "applied": true,
+  "restarted": true,
+  "dispositions": { "RUST_LOG": "updated", "BRAND_NEW_KEY": "appended" },
+  "unmatched": ["BRAND_NEW_KEY"],
+  "reserved": ["fileName"]
+}
+```
+
+Example rejection body (400):
+
+```json
+{
+  "service": "camera",
+  "path": "/etc/default/camera",
+  "applied": false,
+  "restarted": false,
+  "reserved": ["fileName"],
+  "rejected": {
+    "TARGET": { "invalid_value": "value contains control character U+000A" }
+  }
+}
+```
+
+Example not-found body (404):
+
+```json
+{
+  "service": "websrv-test-absent",
+  "applied": false,
+  "restarted": false,
+  "error": "no config file",
+  "tried": [
+    "/etc/default/websrv-test-absent",
+    "/etc/default/edgefirst-websrv-test-absent"
+  ]
+}
 ```
 
 ### Args Structure
@@ -800,6 +959,7 @@ graph TB
 | `--draw-labels` | bool | true | Enable label overlay |
 | `--mirror` | bool | true | Mirror video horizontally |
 | `--storage-path` | String | `.` | MCAP storage directory |
+| `--config-dir` | PathBuf | `/etc/default` | Service configuration directory |
 
 ## Security Architecture
 
@@ -1133,7 +1293,7 @@ Intended for production deployments where EdgeFirst services are managed by syst
   uploader, camera, model, etc.)
 - **Storage path**: Read from `/etc/default/recorder` (`STORAGE_DIR` variable),
   with fallback to `--storage-path`
-- **WebUI config endpoint**: `GET /config/{service}/details` returns the raw
+- **WebUI config endpoint**: `GET /api/config/{service}` returns the raw
   key-value content of `/etc/default/{service}`
 
 #### User Mode (default)
@@ -1144,7 +1304,7 @@ Intended for development, testing, or single-user installations.
   tracks it via `Mutex<Option<Child>>`
 - **Configuration**: All settings come from command-line arguments
 - **Storage path**: Uses `--storage-path` (defaults to `.`)
-- **WebUI config endpoint**: `GET /config/{service}/details` returns the CLI
+- **WebUI config endpoint**: `GET /api/config/{service}` returns the CLI
   arguments as JSON (`WebUISettings`)
 
 #### Handler Routing by Mode

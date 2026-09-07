@@ -109,6 +109,7 @@ HTTPS_PORT=8443 HTTP_PORT=8080 CERT_DIR=/etc/ssl edgefirst-websrv
 | `--generate-cert` | - | `false` | Force regenerate certificate |
 | `--storage-path` | `STORAGE_PATH` | `.` | MCAP storage directory |
 | `--system` | `SYSTEM` | `false` | Run in system mode |
+| `--config-dir` | `CONFIG_DIR` | `/etc/default` | Service configuration directory |
 
 Run `edgefirst-websrv --help` for full options.
 

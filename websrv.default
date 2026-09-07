@@ -56,3 +56,12 @@ LISTEN=""
 # operating in networks where multicast is unavailable or undesired, and use
 # CONNECT/LISTEN for explicit endpoint configuration instead.
 NO_MULTICAST_SCOUTING="false"
+
+# ---------------------------------------------------------------------------
+# Service Configuration Directory
+# ---------------------------------------------------------------------------
+# Directory searched for per-service configuration files read and written by
+# the /api/config/{service} endpoints. Each service has a file named after it,
+# with or without the "edgefirst-" prefix. Change this only for testing
+# against a fake configuration tree.
+CONFIG_DIR="/etc/default"

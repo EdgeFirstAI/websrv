@@ -9,6 +9,7 @@
 pub mod args;
 pub mod auth;
 pub mod config;
+pub mod envfile;
 pub mod mcap;
 pub mod recording;
 pub mod services;

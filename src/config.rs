@@ -3,42 +3,108 @@
 
 //! Configuration file reading and service configuration management.
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Json, Path};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use log::{debug, error};
+use log::{debug, error, warn};
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
+use std::path::{Path as FsPath, PathBuf};
+use std::sync::OnceLock;
+
+use crate::envfile::{parse_config_content, plan_edit, Disposition, Reject};
 
 const EDGEFIRST_PREFIX: &str = "edgefirst-";
 
-/// Resolve a config file path under `/etc/default/`, supporting both
-/// `edgefirst-{service}` and `{service}` naming conventions.
+/// Directory holding service configuration files.
 ///
-/// Tries the given name first; if the file doesn't exist, tries the
-/// alternate name with or without the `edgefirst-` prefix.
-/// Returns the path that exists, or the original path if neither does.
-fn resolve_config_file(service: &str) -> String {
-    let primary = format!("/etc/default/{}", service);
-    if std::path::Path::new(&primary).exists() {
-        return primary;
-    }
+/// Set once at startup from `Args::config_dir`. This is a deliberate scope
+/// call, not a necessity: two of `read_storage_directory`'s four call sites
+/// (`storage::check_storage_availability`, `mcap::list_mcap_files`) already
+/// hold `State<Arc<T>>`, and a third (`mcap::mcap_downloader`) sits on a
+/// `.with_state(ctx)` router and could declare one. Threading the value
+/// instead of using a `OnceLock` would mean adding a `config_dir()` method to
+/// both `StorageContext` and `McapContext`, which is out of scope here. The
+/// price of keeping the global: a whole test binary shares one directory, so
+/// any lib test that calls `init_config_dir` would break
+/// `config_dir_defaults_to_etc_default_when_uninitialised`.
+static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-    let alt_name = if let Some(short) = service.strip_prefix(EDGEFIRST_PREFIX) {
-        short.to_string()
-    } else {
-        format!("{}{}", EDGEFIRST_PREFIX, service)
+/// Set the configuration directory. Only the first call has any effect.
+pub fn init_config_dir(dir: PathBuf) {
+    if CONFIG_DIR.set(dir).is_err() {
+        debug!("Configuration directory already initialised; ignoring");
+    }
+}
+
+/// The configuration directory, defaulting to `/etc/default`.
+fn config_dir() -> &'static FsPath {
+    CONFIG_DIR
+        .get()
+        .map(PathBuf::as_path)
+        .unwrap_or_else(|| FsPath::new("/etc/default"))
+}
+
+/// The outcome of resolving a service name to a configuration file.
+pub(crate) struct Resolved {
+    /// The path to use: the one that exists, or the primary candidate.
+    pub path: PathBuf,
+    /// Whether any candidate is a regular file, as opposed to merely
+    /// existing. `Path::exists` is true for directories too, and
+    /// `CONFIG_DIR` itself is one: a `fileName` of `""` or of an existing
+    /// subdirectory name would otherwise pass this check, skip the 404, and
+    /// turn a directory read into a 500 that leaks the resolved path.
+    pub exists: bool,
+    /// Every candidate examined, in order, for error reporting.
+    pub tried: Vec<String>,
+}
+
+/// Resolve a service name to a config file, supporting both
+/// `edgefirst-{service}` and `{service}` naming conventions.
+pub(crate) fn resolve_config(service: &str) -> Resolved {
+    let alt_name = match service.strip_prefix(EDGEFIRST_PREFIX) {
+        Some(short) => short.to_string(),
+        None => format!("{EDGEFIRST_PREFIX}{service}"),
     };
-    let alternate = format!("/etc/default/{}", alt_name);
-    if std::path::Path::new(&alternate).exists() {
-        debug!("Config '{}' not found, using '{}'", primary, alternate);
-        return alternate;
+
+    let primary = config_dir().join(service);
+    let alternate = config_dir().join(&alt_name);
+    let tried = vec![
+        primary.to_string_lossy().into_owned(),
+        alternate.to_string_lossy().into_owned(),
+    ];
+
+    if primary.is_file() {
+        return Resolved {
+            path: primary,
+            exists: true,
+            tried,
+        };
+    }
+    if alternate.is_file() {
+        debug!("Config {:?} not found, using {:?}", primary, alternate);
+        return Resolved {
+            path: alternate,
+            exists: true,
+            tried,
+        };
     }
 
-    // Neither found — return original so callers get the expected error
-    primary
+    // Neither found — return the primary so callers get the expected error.
+    Resolved {
+        path: primary,
+        exists: false,
+        tried,
+    }
+}
+
+/// Resolve a service name to a config file path.
+fn resolve_config_file(service: &str) -> String {
+    resolve_config(service).path.to_string_lossy().into_owned()
 }
 
 /// Read storage directory from /etc/default/recorder (or edgefirst-recorder)
@@ -67,8 +133,28 @@ pub async fn get_config(Path(path): Path<ConfigPath>) -> impl IntoResponse {
     Json(serde_json::Value::Object(config_map)).into_response()
 }
 
-/// Check service status and restart if active
-pub async fn check_service_status(service_name: &str) -> Result<String, String> {
+/// Outcome of reconciling a service after its configuration changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartOutcome {
+    /// The service was active and `systemctl restart` completed successfully.
+    Restarted,
+    /// The service was not active, so no restart was attempted.
+    NotRunning,
+}
+
+/// Check service status and restart if active.
+///
+/// Reports a restart that actually succeeded, not merely one that was issued:
+/// `systemctl restart`'s exit status is inspected, so a unit that fails to
+/// come back up after the restart is reported as an error even though the
+/// `systemctl` process itself was spawned and ran to completion.
+///
+/// Returns a typed [`RestartOutcome`] rather than a prose `String`: the
+/// caller needs a boolean, and recovering one by substring-matching a log
+/// message is the same shape of defect this module exists to fix elsewhere —
+/// a harmless-looking wording change would silently and permanently turn
+/// `restarted` false.
+pub async fn check_service_status(service_name: &str) -> Result<RestartOutcome, String> {
     use std::process::Command;
 
     use crate::services::resolve_service_name;
@@ -85,17 +171,29 @@ pub async fn check_service_status(service_name: &str) -> Result<String, String> 
         .to_string();
     debug!("{:?} service is {:?}", resolved, status);
     if status == "active" {
-        Command::new("systemctl")
+        let restart = Command::new("systemctl")
             .arg("restart")
             .arg(&resolved)
             .output()
             .map_err(|e| format!("Error restarting service: {:?}", e))?;
-        Ok(format!("Service '{}' restarted successfully.", resolved))
+
+        if !restart.status.success() {
+            let stderr = String::from_utf8_lossy(&restart.stderr).trim().to_string();
+            let detail = if stderr.is_empty() {
+                restart.status.to_string()
+            } else {
+                stderr
+            };
+            return Err(format!(
+                "Service '{}' failed to restart: {}",
+                resolved, detail
+            ));
+        }
+        debug!("Service '{}' restarted successfully.", resolved);
+        Ok(RestartOutcome::Restarted)
     } else {
-        Ok(format!(
-            "Service '{}' is not running. No action taken.",
-            resolved
-        ))
+        debug!("Service '{}' is not running. No action taken.", resolved);
+        Ok(RestartOutcome::NotRunning)
     }
 }
 
@@ -130,165 +228,254 @@ pub fn parse_storage_directory(content: &str) -> io::Result<String> {
     ))
 }
 
-/// Parse config file content into a JSON map
-pub fn parse_config_content(content: &str) -> serde_json::Map<String, serde_json::Value> {
-    let mut config_map = serde_json::Map::new();
+/// JSON body returned by [`set_config`] for every outcome.
+///
+/// Optional members are omitted when empty so a plain successful save stays
+/// compact, and the shape is additive for clients that only check the status.
+#[derive(Serialize, Default)]
+struct ConfigWriteResponse {
+    service: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    applied: bool,
+    restarted: bool,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    dispositions: BTreeMap<String, Disposition>,
+    #[serde(skip_serializing_if = "BTreeSet::is_empty")]
+    unmatched: BTreeSet<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    reserved: Vec<String>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    rejected: BTreeMap<String, Reject>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tried: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restart_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
 
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some((key, value)) = line.split_once('=') {
-            let clean_key = key.trim();
-            let raw_value = value.trim();
-
-            // If the value is quoted, treat it as a single string value
-            if raw_value.starts_with('"') && raw_value.ends_with('"') && raw_value.len() >= 2 {
-                let unquoted = &raw_value[1..raw_value.len() - 1];
-                config_map.insert(
-                    clean_key.to_string(),
-                    serde_json::Value::String(unquoted.to_string()),
-                );
-            } else {
-                // Unquoted: split on whitespace for multiple values
-                let clean_value = raw_value.replace("\"", "");
-                let parts: Vec<&str> = clean_value.split_whitespace().collect();
-
-                if parts.len() > 1 {
-                    config_map.insert(
-                        clean_key.to_string(),
-                        serde_json::Value::Array(
-                            parts
-                                .iter()
-                                .map(|s| serde_json::Value::String(s.to_string()))
-                                .collect(),
-                        ),
-                    );
-                } else {
-                    config_map.insert(
-                        clean_key.to_string(),
-                        serde_json::Value::String(clean_value.to_string()),
-                    );
-                }
-            }
+impl ConfigWriteResponse {
+    fn new(service: &str) -> Self {
+        Self {
+            service: service.to_string(),
+            ..Default::default()
         }
     }
 
-    config_map
-}
-
-/// Update config content with new values
-pub fn update_config_content(
-    original_content: &str,
-    updates: &serde_json::Map<String, serde_json::Value>,
-) -> String {
-    let mut updated_config = String::new();
-
-    for line in original_content.lines() {
-        let mut found = false;
-
-        for (key, value) in updates {
-            let escaped_key = regex::escape(key);
-            let pattern = format!(r"(?i)^\s*{}\s*=\s*.*", escaped_key);
-            let re = Regex::new(&pattern).unwrap();
-
-            if re.is_match(line) {
-                updated_config.push_str(&format!(
-                    "{} = \"{}\"\n",
-                    key.to_uppercase(),
-                    value.as_str().unwrap_or("")
-                ));
-                found = true;
-                break;
-            }
-        }
-        if !found {
-            updated_config.push_str(&format!("{}\n", line));
-        }
+    fn into_response_with(self, status: StatusCode) -> axum::response::Response {
+        (status, Json(self)).into_response()
     }
-
-    updated_config
 }
 
-/// Set service configuration in /etc/default/{service}
-pub async fn set_config(Json(params): Json<Value>) -> impl IntoResponse {
-    let file_name = if let Some(file_name_value) = params.get("fileName") {
-        if let Some(file_name) = file_name_value.as_str() {
-            file_name.to_string()
-        } else {
-            error!("fileName is not a string");
-            return (StatusCode::BAD_REQUEST, "Invalid fileName").into_response();
+/// Key the webui sends alongside the config values to name the target file.
+/// It is stripped rather than rejected: every settings page posts it, so
+/// rejecting it would fail every save.
+const RESERVED_KEY: &str = "filename";
+
+/// Set service configuration in `{config_dir}/{service}`.
+///
+/// The body is taken as a `Result` rather than a bare `Json<Value>`: the
+/// extractor runs before this function, so its rejections would otherwise
+/// answer in axum's `text/plain` default and break the promise that every
+/// outcome of this route is a [`ConfigWriteResponse`]. The rejection's own
+/// status is preserved -- 400 for malformed JSON, 415 for the wrong content
+/// type -- and only the body shape is ours.
+pub async fn set_config(
+    Path(path_params): Path<ConfigPath>,
+    body: Result<Json<Value>, JsonRejection>,
+) -> impl IntoResponse {
+    let params = match body {
+        Ok(Json(value)) => value,
+        Err(rejection) => {
+            error!("Rejected request body: {}", rejection);
+            let mut response = ConfigWriteResponse::new(&path_params.service);
+            response.error = Some(rejection.body_text());
+            return response.into_response_with(rejection.status());
         }
-    } else {
-        error!("fileName not found in JSON");
-        return (StatusCode::BAD_REQUEST, "Missing fileName").into_response();
     };
 
-    // Validate fileName to prevent path traversal
-    if file_name.contains('/') || file_name.contains("..") {
-        error!("Invalid fileName: path traversal attempt detected");
-        return (StatusCode::BAD_REQUEST, "Invalid fileName").into_response();
+    // Take the map by value rather than borrowing via `.as_object()`: this is
+    // what lets the reserved-key strip below mutate `params` in place instead
+    // of deep-cloning the whole request body just to drop one key.
+    let Value::Object(params) = params else {
+        error!("Request body is not a JSON object");
+        let mut response = ConfigWriteResponse::new("");
+        response.error = Some("request body must be a JSON object".to_string());
+        return response.into_response_with(StatusCode::BAD_REQUEST);
+    };
+
+    let file_name = match params.get("fileName").map(|v| v.as_str()) {
+        Some(Some(name)) => name.to_string(),
+        Some(None) => {
+            error!("fileName is not a string");
+            let mut response = ConfigWriteResponse::new("");
+            response.error = Some("fileName must be a string".to_string());
+            return response.into_response_with(StatusCode::BAD_REQUEST);
+        }
+        None => {
+            error!("fileName not found in JSON");
+            let mut response = ConfigWriteResponse::new("");
+            response.error = Some("missing fileName".to_string());
+            return response.into_response_with(StatusCode::BAD_REQUEST);
+        }
+    };
+
+    // Validate fileName to prevent path traversal.
+    //
+    // The alphanumeric/`-`/`_` whitelist already rejects every character in
+    // "..", so the `/` and ".." checks are redundant today. They stay as
+    // defence-in-depth: they become load-bearing the moment the whitelist is
+    // widened (e.g. to allow `.` so names like `foo.conf` work).
+    let safe = !file_name.is_empty()
+        && !file_name.contains('/')
+        && !file_name.contains("..")
+        && file_name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_');
+    if !safe {
+        error!("Invalid fileName: {:?}", file_name);
+        let mut response = ConfigWriteResponse::new(&file_name);
+        response.error = Some("invalid fileName".to_string());
+        return response.into_response_with(StatusCode::BAD_REQUEST);
     }
-    if !file_name
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
-    {
-        error!("Invalid fileName: contains disallowed characters");
-        return (StatusCode::BAD_REQUEST, "Invalid fileName").into_response();
+
+    // The two must name the same file. Checked after the whitelist above so
+    // that a hostile fileName is still reported as invalid rather than as a
+    // mismatch, and so the traversal guard keeps its own test coverage.
+    //
+    // Before this, the {service} segment was inert: the target came only from
+    // the body, so POST /api/config/camera would happily rewrite recorder and
+    // restart it. Every settings page already posts the two in agreement.
+    if file_name != path_params.service {
+        error!(
+            "fileName {:?} does not match the URL service {:?}",
+            file_name, path_params.service
+        );
+        let mut response = ConfigWriteResponse::new(&file_name);
+        response.error = Some("fileName does not match the URL".to_string());
+        return response.into_response_with(StatusCode::BAD_REQUEST);
     }
 
-    let service_name = file_name.clone();
+    let resolved = resolve_config(&file_name);
+    if !resolved.exists {
+        error!("No configuration file for service {:?}", file_name);
+        let mut response = ConfigWriteResponse::new(&file_name);
+        response.error = Some("no config file".to_string());
+        response.tried = resolved.tried;
+        return response.into_response_with(StatusCode::NOT_FOUND);
+    }
+    let path = resolved.path;
+    debug!("Configuration file path: {:?}", path);
 
-    let config_file_path = resolve_config_file(&file_name);
-    debug!("Configuration file path: {}", config_file_path.clone());
-    debug!("{:?}", params);
-
-    let config_content = match std::fs::read_to_string(config_file_path.clone()) {
+    let original = match std::fs::read_to_string(&path) {
         Ok(content) => content,
         Err(e) => {
-            error!("Error reading configuration file: {:?}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Error reading configuration file",
-            )
-                .into_response();
+            error!("Error reading configuration file {:?}: {:?}", path, e);
+            let mut response = ConfigWriteResponse::new(&file_name);
+            response.path = Some(path.to_string_lossy().into_owned());
+            response.error = Some("error reading configuration file".to_string());
+            return response.into_response_with(StatusCode::INTERNAL_SERVER_ERROR);
         }
     };
 
-    let config_map = if let Some(map) = params.as_object() {
-        map.clone()
-    } else {
-        serde_json::Map::new()
+    // Strip the reserved key(s); they name the file rather than a setting.
+    // Scan once to capture every spelling present (matched case-insensitively,
+    // same as before), then remove them from the owned map in place — no
+    // clone of the request body is needed just to drop one key.
+    let reserved: Vec<String> = params
+        .keys()
+        .filter(|key| key.eq_ignore_ascii_case(RESERVED_KEY))
+        .cloned()
+        .collect();
+    let mut updates = params;
+    updates.retain(|key, _| !key.eq_ignore_ascii_case(RESERVED_KEY));
+
+    let mut response = ConfigWriteResponse::new(&file_name);
+    response.path = Some(path.to_string_lossy().into_owned());
+    response.reserved = reserved;
+
+    let plan = match plan_edit(&original, &updates) {
+        Ok(plan) => plan,
+        Err(rejected) => {
+            error!("Rejected configuration keys: {:?}", rejected);
+            response.rejected = rejected;
+            return response.into_response_with(StatusCode::BAD_REQUEST);
+        }
     };
 
-    let updated_config = update_config_content(&config_content, &config_map);
+    if !plan.changed {
+        debug!("No configuration change for {:?}", file_name);
+        response.dispositions = plan.dispositions;
+        response.unmatched = plan.unmatched;
+        response.reason = Some("no changes".to_string());
+        return response.into_response_with(StatusCode::OK);
+    }
 
-    match std::fs::write(config_file_path.clone(), updated_config) {
-        Ok(_) => match check_service_status(&service_name).await {
-            Ok(_) => (
-                StatusCode::OK,
-                "Configuration saved successfully and service status checked.",
-            )
-                .into_response(),
-            Err(e) => {
-                error!("{}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Error handling service status",
-                )
-                    .into_response()
-            }
-        },
+    if let Err(e) = write_atomic(&path, &plan.content) {
+        error!("Error saving configuration {:?}: {:?}", path, e);
+        response.error = Some("error saving configuration".to_string());
+        return response.into_response_with(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    response.applied = true;
+    response.dispositions = plan.dispositions;
+    response.unmatched = plan.unmatched;
+
+    for key in &response.unmatched {
+        warn!(
+            "Key {:?} was not present in {:?} and has been appended; \
+             it may not be a setting this service reads",
+            key, path
+        );
+    }
+
+    match check_service_status(&file_name).await {
+        Ok(outcome) => {
+            response.restarted = matches!(outcome, RestartOutcome::Restarted);
+        }
         Err(e) => {
-            error!("Error saving configuration: {:?}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Error saving configuration",
-            )
-                .into_response()
+            // The configuration was applied, so this is not a server error.
+            error!("{}", e);
+            response.restart_error = Some(e);
         }
     }
+
+    response.into_response_with(StatusCode::OK)
+}
+
+/// Write `content` to `path` atomically.
+///
+/// Writes a sibling temp file, syncs it, copies the original file's mode onto
+/// it, then renames over the target. Same-directory rename is atomic on Linux,
+/// so a reader never sees a partial file and a crash leaves the original
+/// intact — which matters because a truncated `/etc/default` file stops the
+/// service from starting at all.
+///
+/// Ownership is deliberately not copied: websrv must already run as root to
+/// write `/etc/default` and to restart units, so the renamed file lands
+/// root-owned exactly as the original was.
+fn write_atomic(path: &FsPath, content: &str) -> io::Result<()> {
+    use std::io::Write;
+
+    let dir = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "configuration path has no parent directory",
+        )
+    })?;
+    // Fails if the target does not exist, which is what we want: this function
+    // replaces a config file, it does not create one.
+    let permissions = std::fs::metadata(path)?.permissions();
+
+    let mut temp = tempfile::NamedTempFile::new_in(dir)?;
+    temp.write_all(content.as_bytes())?;
+    temp.as_file().sync_all()?;
+    temp.as_file().set_permissions(permissions)?;
+    temp.persist(path).map_err(|e| e.error)?;
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -374,135 +561,6 @@ ANOTHER=123
     }
 
     // ========================================================================
-    // Config content parsing tests
-    // ========================================================================
-
-    #[test]
-    fn test_parse_config_content_simple() {
-        let content = r#"
-KEY1=value1
-KEY2=value2
-"#;
-        let result = parse_config_content(content);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result.get("KEY1").unwrap(), "value1");
-        assert_eq!(result.get("KEY2").unwrap(), "value2");
-    }
-
-    #[test]
-    fn test_parse_config_content_with_quotes() {
-        let content = r#"
-PATH="/usr/local/bin"
-NAME="My Service"
-"#;
-        let result = parse_config_content(content);
-        assert_eq!(result.get("PATH").unwrap(), "/usr/local/bin");
-        assert_eq!(result.get("NAME").unwrap(), "My Service");
-    }
-
-    #[test]
-    fn test_parse_config_content_with_comments() {
-        let content = r#"
-# This is a comment
-KEY1=value1
-# Another comment
-KEY2=value2
-"#;
-        let result = parse_config_content(content);
-        assert_eq!(result.len(), 2);
-        assert!(!result.contains_key("# This is a comment"));
-    }
-
-    #[test]
-    fn test_parse_config_content_empty_lines() {
-        let content = r#"
-KEY1=value1
-
-KEY2=value2
-
-"#;
-        let result = parse_config_content(content);
-        assert_eq!(result.len(), 2);
-    }
-
-    #[test]
-    fn test_parse_config_content_multiple_values() {
-        let content = r#"TOPICS=topic1 topic2 topic3"#;
-        let result = parse_config_content(content);
-        let topics = result.get("TOPICS").unwrap().as_array().unwrap();
-        assert_eq!(topics.len(), 3);
-        assert_eq!(topics[0], "topic1");
-        assert_eq!(topics[1], "topic2");
-        assert_eq!(topics[2], "topic3");
-    }
-
-    #[test]
-    fn test_parse_config_content_empty() {
-        let content = "";
-        let result = parse_config_content(content);
-        assert!(result.is_empty());
-    }
-
-    // ========================================================================
-    // Config update tests
-    // ========================================================================
-
-    #[test]
-    fn test_update_config_content_simple() {
-        let original = "KEY1=old_value\nKEY2=keep_this\n";
-        let mut updates = serde_json::Map::new();
-        updates.insert(
-            "KEY1".to_string(),
-            serde_json::Value::String("new_value".to_string()),
-        );
-
-        let result = update_config_content(original, &updates);
-        assert!(result.contains("KEY1 = \"new_value\""));
-        assert!(result.contains("KEY2=keep_this"));
-    }
-
-    #[test]
-    fn test_update_config_content_case_insensitive() {
-        let original = "key1=old_value\n";
-        let mut updates = serde_json::Map::new();
-        updates.insert(
-            "KEY1".to_string(),
-            serde_json::Value::String("new_value".to_string()),
-        );
-
-        let result = update_config_content(original, &updates);
-        assert!(result.contains("KEY1 = \"new_value\""));
-    }
-
-    #[test]
-    fn test_update_config_content_preserves_comments() {
-        let original = "# Comment line\nKEY1=value\n";
-        let updates = serde_json::Map::new();
-
-        let result = update_config_content(original, &updates);
-        assert!(result.contains("# Comment line"));
-    }
-
-    #[test]
-    fn test_update_config_content_multiple_updates() {
-        let original = "KEY1=old1\nKEY2=old2\nKEY3=old3\n";
-        let mut updates = serde_json::Map::new();
-        updates.insert(
-            "KEY1".to_string(),
-            serde_json::Value::String("new1".to_string()),
-        );
-        updates.insert(
-            "KEY3".to_string(),
-            serde_json::Value::String("new3".to_string()),
-        );
-
-        let result = update_config_content(original, &updates);
-        assert!(result.contains("KEY1 = \"new1\""));
-        assert!(result.contains("KEY2=old2"));
-        assert!(result.contains("KEY3 = \"new3\""));
-    }
-
-    // ========================================================================
     // Struct deserialization tests
     // ========================================================================
 
@@ -514,37 +572,92 @@ KEY2=value2
     }
 
     // ========================================================================
+    // RestartOutcome tests
+    // ========================================================================
+
+    #[test]
+    fn restart_outcome_maps_to_the_right_boolean() {
+        // Pins the enum-to-boolean mapping `set_config` relies on, so the
+        // `restarted` field cannot silently go permanently false the way a
+        // reworded `Ok(String)` once could: `Restarted` is the only variant
+        // that means the service actually came back up.
+        assert!(matches!(
+            RestartOutcome::Restarted,
+            RestartOutcome::Restarted
+        ));
+        assert!(!matches!(
+            RestartOutcome::NotRunning,
+            RestartOutcome::Restarted
+        ));
+    }
+
+    // ========================================================================
     // Config file resolution tests
     // ========================================================================
 
     #[test]
-    fn test_resolve_config_file_neither_exists() {
-        // When neither file exists, returns the primary path
-        let result = resolve_config_file("nonexistent-test-service-xyz");
-        assert_eq!(result, "/etc/default/nonexistent-test-service-xyz");
+    fn resolve_config_reports_both_candidate_paths() {
+        let r = resolve_config("nonexistent-test-service-xyz");
+        assert!(!r.exists);
+        assert_eq!(r.tried.len(), 2);
+        assert!(r.tried[0].ends_with("/nonexistent-test-service-xyz"));
+        assert!(r.tried[1].ends_with("/edgefirst-nonexistent-test-service-xyz"));
     }
 
     #[test]
-    fn test_resolve_config_file_adds_prefix() {
-        // When given "recorder", alternate is "edgefirst-recorder"
-        let service = "recorder";
-        let alt = if let Some(short) = service.strip_prefix(EDGEFIRST_PREFIX) {
-            short.to_string()
-        } else {
-            format!("{}{}", EDGEFIRST_PREFIX, service)
-        };
-        assert_eq!(alt, "edgefirst-recorder");
+    fn resolve_config_strips_the_edgefirst_prefix_for_the_alternate() {
+        let r = resolve_config("edgefirst-nonexistent-test-xyz");
+        assert_eq!(r.tried.len(), 2);
+        assert!(r.tried[0].ends_with("/edgefirst-nonexistent-test-xyz"));
+        assert!(r.tried[1].ends_with("/nonexistent-test-xyz"));
     }
 
     #[test]
-    fn test_resolve_config_file_strips_prefix() {
-        // When given "edgefirst-recorder", alternate is "recorder"
-        let service = "edgefirst-recorder";
-        let alt = if let Some(short) = service.strip_prefix(EDGEFIRST_PREFIX) {
-            short.to_string()
-        } else {
-            format!("{}{}", EDGEFIRST_PREFIX, service)
-        };
-        assert_eq!(alt, "recorder");
+    fn config_dir_defaults_to_etc_default_when_uninitialised() {
+        // Only meaningful when nothing has called init_config_dir in this
+        // binary; the lib test binary does not.
+        assert!(resolve_config("anything").tried[0].starts_with("/etc/default/"));
+    }
+
+    // ========================================================================
+    // Atomic write tests
+    // ========================================================================
+
+    #[test]
+    fn write_atomic_replaces_content_and_preserves_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("svc");
+        std::fs::write(&path, "old\n").expect("seed");
+        // 0o640 is deliberately NOT `tempfile::NamedTempFile`'s default mode
+        // (0o600): using the default would leave this test passing even if
+        // `write_atomic` never copied the mode over. It also grants nothing to
+        // "others", so the test creates no world-readable artifact.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).expect("chmod");
+
+        write_atomic(&path, "new\n").expect("write");
+
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "new\n");
+        let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o640, "mode was not preserved");
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("readdir")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "svc")
+            .collect();
+        assert!(leftovers.is_empty(), "stray temp files: {leftovers:?}");
+    }
+
+    #[test]
+    fn write_atomic_fails_when_the_target_is_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let result = write_atomic(&dir.path().join("absent"), "x\n");
+        assert!(
+            result.is_err(),
+            "should not create a file that does not exist"
+        );
     }
 }

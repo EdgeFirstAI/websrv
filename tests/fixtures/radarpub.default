@@ -1,0 +1,146 @@
+# EdgeFirst Radar Publisher Configuration
+#
+# This file is loaded by the systemd service as an EnvironmentFile. Every
+# variable here maps to a command-line flag of the same name (lower-case,
+# with dashes replaced by underscores). Command-line flags take precedence
+# over environment variables.
+#
+# Syntax rules (systemd EnvironmentFile):
+#   - Lines beginning with # or ; are comments.
+#   - KEY=VALUE pairs, one per line.
+#   - Quoting is optional; quotes are stripped by systemd.
+#   - No spaces around the '=' sign.
+
+# ---------------------------------------------------------------------------
+# Radar Center Frequency
+# ---------------------------------------------------------------------------
+# The center frequency for the radar module. This affects the operating
+# frequency band. Note: ultra-short range is only supported with the low
+# center frequency.
+# Accepted values: low, medium, high
+CENTER_FREQUENCY="medium"
+
+# ---------------------------------------------------------------------------
+# Frequency Sweep (Range)
+# ---------------------------------------------------------------------------
+# The frequency sweep controls the detection range of the radar. Longer
+# sweeps detect targets at greater distances but with lower resolution.
+# Note: ultra-short range is only supported with the low center frequency.
+# Accepted values: long, medium, short, ultra-short
+FREQUENCY_SWEEP="short"
+
+# ---------------------------------------------------------------------------
+# Range Toggle
+# ---------------------------------------------------------------------------
+# The range toggle mode allows the radar to alternate between two different
+# frequency sweeps at runtime. This enables simultaneous coverage of
+# multiple range bands. Set to "off" to use a single fixed sweep.
+# Accepted values: off, short-medium, short-long, medium-long,
+#   long-ultra-short, medium-ultra-short, short-ultra-short
+RANGE_TOGGLE="off"
+
+# ---------------------------------------------------------------------------
+# Detection Sensitivity
+# ---------------------------------------------------------------------------
+# Controls the radar's ability to detect targets. Higher sensitivity
+# detects weaker returns but may increase false positives.
+# Accepted values: low, medium, high
+DETECTION_SENSITIVITY="medium"
+
+# ---------------------------------------------------------------------------
+# Data Cube Streaming
+# ---------------------------------------------------------------------------
+# Enable streaming the low-level radar data cube on the cube topic
+# (radar/cube). The data cube contains raw range-Doppler data useful
+# for advanced signal processing or visualization.
+CUBE="false"
+
+# ---------------------------------------------------------------------------
+# Clustering
+# ---------------------------------------------------------------------------
+# Enable the radar target clustering task. When enabled, individual radar
+# detections are grouped into clusters using the DBSCAN algorithm and
+# published on the clusters topic (radar/clusters).
+CLUSTERING="false"
+
+# Clustering window size in frames. Each radar frame is approximately 55ms.
+# Larger windows accumulate more detections before clustering, improving
+# accuracy but adding latency.
+WINDOW_SIZE="6"
+
+# Clustering DBSCAN distance limit (euclidean distance). Controls how
+# close points must be to be considered part of the same cluster. Smaller
+# values produce tighter clusters; larger values merge nearby targets.
+CLUSTERING_EPS="1"
+
+# Clustering DBSCAN parameter scaling (x y z speed). Each axis can be
+# weighted independently. Set an axis to 0 to ignore it during clustering.
+# For example, "1 1 0 0" clusters in x/y only, ignoring z and speed.
+CLUSTERING_PARAM_SCALE="1 1 0 0"
+
+# Clustering DBSCAN minimum point limit. A cluster must contain at least
+# this many points to be considered valid. Minimum value is 3.
+CLUSTERING_POINT_LIMIT="5"
+
+# ---------------------------------------------------------------------------
+# Mirror
+# ---------------------------------------------------------------------------
+# Mirror the radar data. When enabled, detection coordinates are mirrored
+# (flipped) to correct for radar mounting orientation.
+MIRROR="false"
+
+# ---------------------------------------------------------------------------
+# Radar Transform (TF)
+# ---------------------------------------------------------------------------
+# Static transform from the robot base_link frame to the radar frame,
+# published as a TF message. These values define the physical mounting
+# position and orientation of the radar on the robot.
+
+# Translation vector (x y z) in meters from base_link to radar.
+RADAR_TF_VEC="0 0 0"
+
+# Rotation quaternion (x y z w) from base_link to radar.
+RADAR_TF_QUAT="0 0 0 1"
+
+# TF frame ID for the robot base.
+BASE_FRAME_ID="base_link"
+
+# TF frame ID for the radar frame.
+RADAR_FRAME_ID="radar"
+
+# ---------------------------------------------------------------------------
+# Application Log Level
+# ---------------------------------------------------------------------------
+# Controls the verbosity of application logging output. Uses the standard
+# Rust tracing filter syntax.
+# Accepted values: trace, debug, info, warn, error, off
+RUST_LOG="info"
+
+# ---------------------------------------------------------------------------
+# Zenoh Networking
+# ---------------------------------------------------------------------------
+# Zenoh participant mode. In "peer" mode nodes discover each other via
+# multicast. Use "client" to connect to a Zenoh router, or "router" to act
+# as one.
+# Accepted values: peer, client, router
+MODE="peer"
+
+# Zenoh endpoint(s) to connect to. Required when MODE is "client".
+# Example: CONNECT="tcp/192.168.1.1:7447"
+CONNECT=""
+
+# Zenoh endpoint(s) to listen on. Useful when running as a router or when
+# peers need to reach this node on a specific address/port.
+LISTEN=""
+
+# Disable Zenoh multicast scouting (peer auto-discovery). Set to true when
+# operating in networks where multicast is unavailable or undesired, and use
+# CONNECT/LISTEN for explicit endpoint configuration instead.
+NO_MULTICAST_SCOUTING="false"
+
+# ---------------------------------------------------------------------------
+# Debugging / Profiling
+# ---------------------------------------------------------------------------
+# Enable the Tracy profiler for real-time performance analysis. Requires the
+# binary to be built with Tracy support.
+TRACY="false"

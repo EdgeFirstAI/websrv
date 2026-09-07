@@ -7,6 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `POST /api/config/{service}` can now add keys that are missing from a service
+  configuration file and activate keys that ship commented out, instead of
+  silently returning 200 OK having written nothing. This unblocked the LiDAR
+  settings page, since `lidarpub.default` ships 19 of its 26 keys commented
+  (EDGEAI-1402).
+- Numbers, booleans and arrays submitted to the config API are now written
+  correctly instead of being replaced with an empty value. Space-separated
+  values such as `TF_VEC` and `AZIMUTH` round-trip losslessly through
+  `GET` followed by `POST` (EDGEAI-1402).
+- The `fileName` field the web UI posts alongside config values is no longer
+  treated as a setting (EDGEAI-1402).
+- Lines beginning with `;` are now recognised as comments, matching systemd's
+  own `EnvironmentFile` parser. `GET` no longer returns them as settings named
+  `;KEY`, which made posting back an unmodified `GET` response fail the whole
+  save, and activating a `;`-commented key now inserts the value below that
+  line instead of appending a duplicate (EDGEAI-1402).
+- Configuration files are written atomically, so an interrupted save can no
+  longer leave a truncated file that prevents the service from starting
+  (EDGEAI-1402).
+- `check_service_status` now checks the exit status of `systemctl restart`
+  instead of only whether the process could be spawned. A unit that fails to
+  come back up after a config change now returns an error naming the unit and
+  its stderr, instead of a `restarted: true` response for a restart that
+  never actually succeeded (EDGEAI-1402).
+
+### Added
+
+- `POST /api/config/{service}` returns a JSON report naming the disposition of
+  every submitted key — `updated`, `inserted`, `appended`, `unset` or
+  `unchanged` — plus any keys that matched nothing in the file (EDGEAI-1402).
+- `--config-dir` / `CONFIG_DIR` selects the directory holding service
+  configuration files, defaulting to `/etc/default` (EDGEAI-1402).
+
+### Changed
+
+- `POST /api/config/{service}` now rejects the entire request with 400 if any
+  key or value is invalid, leaving the file untouched, and returns 404 rather
+  than 500 when the service has no configuration file. Values containing
+  newlines or control characters are refused, since they would inject
+  additional lines into a file systemd feeds to services running as root
+  (EDGEAI-1402).
+- The service is no longer restarted when a save changes nothing (EDGEAI-1402).
+- Configuration lines are written as `KEY="value"` without spaces around `=`,
+  matching the convention documented in the shipped `.default` files
+  (EDGEAI-1402).
+- `POST /api/config/{service}` now responds with `application/json` instead of
+  `text/plain`, including for a malformed body or a missing `Content-Type`,
+  which previously bypassed the handler and answered in `text/plain`
+  (EDGEAI-1402).
+- `POST /api/config/{service}` refuses keys that name a loader or
+  language-runtime variable — anything beginning `LD_`, plus `PATH`, `ENV`,
+  `IFS`, `BASH_ENV`, `SHELLOPTS`, `GLIBC_TUNABLES`, `PYTHONPATH`,
+  `PYTHONHOME`, `PYTHONSTARTUP`, `PERL5LIB` and `NODE_OPTIONS`. These are read
+  before a service's own code runs, and since most units run as root and a
+  successful save restarts the unit, an appended `LD_PRELOAD=` line would be
+  code execution as root. They appear in no shipped configuration file, so
+  nothing legitimate is refused (EDGEAI-1402).
+- `POST /api/config/{service}` now requires the body's `fileName` to match the
+  `{service}` URL segment and returns 400 when they disagree. The segment was
+  previously ignored, so a request could name one service in the URL and
+  rewrite and restart another. Every web UI settings page already posts the
+  two in agreement (EDGEAI-1402).
+
 ## [4.1.0] - 2026-08-31
 
 ### Changed

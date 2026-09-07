@@ -185,12 +185,139 @@ async fn an_unchanged_save_writes_nothing() {
     );
 }
 
+/// POST a raw body with an explicit (or absent) content type, so the tests
+/// below can exercise the extractor's own rejection paths.
+async fn post_raw(service: &str, content_type: Option<&str>, body: &str) -> (StatusCode, Value) {
+    let _guard = dir_lock().read().await;
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(format!("/api/config/{service}"));
+    if let Some(value) = content_type {
+        builder = builder.header("content-type", value);
+    }
+    let request = builder
+        .body(Body::from(body.to_string()))
+        .expect("build request");
+    let response = app().oneshot(request).await.expect("handler ran");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("read body");
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// POST a raw body as JSON to a raw (possibly percent-encoded) URL segment.
+async fn post_raw_json(raw_segment: &str, body: &str) -> (StatusCode, Value) {
+    let _guard = dir_lock().read().await;
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/api/config/{raw_segment}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("build request");
+    let response = app().oneshot(request).await.expect("handler ran");
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("read body");
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+#[tokio::test]
+async fn extractor_rejections_still_answer_in_the_json_contract() {
+    // Json<Value> runs before the handler body, so its rejections used to
+    // bypass ConfigWriteResponse entirely and answer in text/plain --
+    // "JSON for every outcome" was not true for the cases a broken client
+    // is most likely to hit.
+    let svc = seed("rejection", "camera").await;
+
+    let cases: [(Option<&str>, &str, StatusCode); 3] = [
+        // Syntactically invalid JSON.
+        (
+            Some("application/json"),
+            "{not json",
+            StatusCode::BAD_REQUEST,
+        ),
+        // Missing content type.
+        (
+            None,
+            r#"{"fileName":"x"}"#,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        ),
+        // Wrong content type.
+        (
+            Some("text/plain"),
+            r#"{"fileName":"x"}"#,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        ),
+    ];
+
+    for (content_type, body, expected) in cases {
+        let (status, parsed) = post_raw(&svc, content_type, body).await;
+        assert_eq!(
+            status, expected,
+            "content_type={content_type:?} body={body:?}"
+        );
+        assert!(
+            parsed.is_object(),
+            "expected a JSON object, got {parsed} for content_type={content_type:?}"
+        );
+        assert_eq!(parsed["applied"], json!(false));
+        assert!(
+            parsed["error"].is_string(),
+            "expected an error string, got {parsed}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_filename_disagreeing_with_the_url_is_rejected() {
+    // The {service} path segment was inert: the handler read the target
+    // exclusively from the body, so POST /api/config/camera could rewrite
+    // recorder. Both name the same file or the request is refused.
+    let target = seed("url-target", "camera").await;
+    let other = seed("url-other", "recorder").await;
+    let before = read(&other);
+
+    let (status, body) = post_config(&target, json!({ "fileName": other, "A": "1" })).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "got {body}");
+    assert!(
+        body["error"].is_string(),
+        "expected an error string: {body}"
+    );
+    assert_eq!(read(&other), before, "the body's target was written anyway");
+}
+
 #[tokio::test]
 async fn path_traversal_in_filename_is_rejected() {
-    for bad in ["../etc/passwd", "a/b", "..", "semi;colon", ""] {
-        let (status, _) = post_config("websrv-test-x", json!({ "fileName": bad, "A": "1" })).await;
+    // The URL is percent-encoded so that the {service} segment decodes to the
+    // same hostile string the body carries. Posting a mismatched pair instead
+    // would prove nothing here: the URL cross-check would reject it before the
+    // character whitelist ever ran, leaving the traversal guard untested.
+    let cases = [
+        ("%2E%2E%2Fetc%2Fpasswd", "../etc/passwd"),
+        ("a%2Fb", "a/b"),
+        ("%2E%2E", ".."),
+        ("semi;colon", "semi;colon"),
+    ];
+    for (encoded, bad) in cases {
+        let (status, body) =
+            post_raw_json(encoded, &json!({ "fileName": bad, "A": "1" }).to_string()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "accepted fileName {bad:?}");
+        assert_eq!(body["error"], json!("invalid fileName"), "for {bad:?}");
     }
+
+    // An empty fileName has no routable URL form, so it can only ever arrive
+    // as a mismatch. Pinned separately: it must still be a 400, not a 500.
+    let (status, _) = post_config("websrv-test-x", json!({ "fileName": "", "A": "1" })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

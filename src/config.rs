@@ -3,6 +3,7 @@
 
 //! Configuration file reading and service configuration management.
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Json, Path};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
@@ -275,7 +276,27 @@ impl ConfigWriteResponse {
 const RESERVED_KEY: &str = "filename";
 
 /// Set service configuration in `{config_dir}/{service}`.
-pub async fn set_config(Json(params): Json<Value>) -> impl IntoResponse {
+///
+/// The body is taken as a `Result` rather than a bare `Json<Value>`: the
+/// extractor runs before this function, so its rejections would otherwise
+/// answer in axum's `text/plain` default and break the promise that every
+/// outcome of this route is a [`ConfigWriteResponse`]. The rejection's own
+/// status is preserved -- 400 for malformed JSON, 415 for the wrong content
+/// type -- and only the body shape is ours.
+pub async fn set_config(
+    Path(path_params): Path<ConfigPath>,
+    body: Result<Json<Value>, JsonRejection>,
+) -> impl IntoResponse {
+    let params = match body {
+        Ok(Json(value)) => value,
+        Err(rejection) => {
+            error!("Rejected request body: {}", rejection);
+            let mut response = ConfigWriteResponse::new(&path_params.service);
+            response.error = Some(rejection.body_text());
+            return response.into_response_with(rejection.status());
+        }
+    };
+
     // Take the map by value rather than borrowing via `.as_object()`: this is
     // what lets the reserved-key strip below mutate `params` in place instead
     // of deep-cloning the whole request body just to drop one key.
@@ -318,6 +339,23 @@ pub async fn set_config(Json(params): Json<Value>) -> impl IntoResponse {
         error!("Invalid fileName: {:?}", file_name);
         let mut response = ConfigWriteResponse::new(&file_name);
         response.error = Some("invalid fileName".to_string());
+        return response.into_response_with(StatusCode::BAD_REQUEST);
+    }
+
+    // The two must name the same file. Checked after the whitelist above so
+    // that a hostile fileName is still reported as invalid rather than as a
+    // mismatch, and so the traversal guard keeps its own test coverage.
+    //
+    // Before this, the {service} segment was inert: the target came only from
+    // the body, so POST /api/config/camera would happily rewrite recorder and
+    // restart it. Every settings page already posts the two in agreement.
+    if file_name != path_params.service {
+        error!(
+            "fileName {:?} does not match the URL service {:?}",
+            file_name, path_params.service
+        );
+        let mut response = ConfigWriteResponse::new(&file_name);
+        response.error = Some("fileName does not match the URL".to_string());
         return response.into_response_with(StatusCode::BAD_REQUEST);
     }
 

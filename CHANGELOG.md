@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Recording duration and per-topic FPS in the recordings list exclude wall-clock steps taken during the recording. Files from recorders that write `clock_sync` metadata take steps only from their `clock_step` metadata, so a pause in the data still counts toward the duration; older files fall back to detecting jumps over 5 s.
+- Recordings without a summary section (power loss, crash) now report topics, duration and FPS instead of an empty entry.
+- Per-topic FPS in the recordings list is computed over each topic's own span, so topics that start recording later than others no longer read low.
+
+### Added
+
+- `clock_steps` in each `/api/recordings` file entry: the number of clock steps excluded from the duration.
+
 ## [4.2.0] - 2026-09-07
 
 ### Fixed

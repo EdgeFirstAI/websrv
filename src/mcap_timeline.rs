@@ -350,13 +350,6 @@ impl ChannelSpans {
     }
 }
 
-/// Removes the signed sum of `steps` from a statistics span, for files
-/// without chunk indexes.
-pub fn subtract_steps(span_ns: u64, steps: &[ClockStep]) -> u64 {
-    let total: i128 = steps.iter().map(|s| i128::from(s.step_ns)).sum();
-    (i128::from(span_ns) - total).clamp(0, i128::from(u64::MAX)) as u64
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -526,21 +519,6 @@ mod tests {
             metadata: BTreeMap::new(),
         };
         assert!(ClockStep::from_metadata(0, &other).is_none());
-    }
-
-    #[test]
-    fn subtract_steps_handles_both_directions_and_saturates() {
-        let fwd = ClockStep {
-            offset: 0,
-            step_ns: STEP,
-        };
-        assert_eq!(subtract_steps(STEP as u64 + 20 * S, &[fwd]), 20 * S);
-        let back = ClockStep {
-            offset: 0,
-            step_ns: -(5 * S as i64),
-        };
-        assert_eq!(subtract_steps(10 * S, &[back]), 15 * S);
-        assert_eq!(subtract_steps(S, &[fwd]), 0);
     }
 
     #[test]

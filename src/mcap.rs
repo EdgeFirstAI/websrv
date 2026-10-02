@@ -28,7 +28,7 @@ use tokio_util::io::ReaderStream;
 
 use crate::config::read_storage_directory;
 use crate::mcap_timeline::{
-    subtract_steps, ChannelExtent, ChannelSpans, ClockStep, Span, Timeline, TimelineAccumulator,
+    ChannelExtent, ChannelSpans, ClockStep, Span, Timeline, TimelineAccumulator,
     CLOCK_STEP_METADATA, CLOCK_STEP_TOPIC, CLOCK_SYNC_METADATA, STEP_GAP_NS,
 };
 
@@ -95,18 +95,39 @@ fn linear_cache() -> &'static LinearCache {
     CACHE.get_or_init(Default::default)
 }
 
+/// How a file's information is obtained.
+enum Source {
+    /// Read from the summary section.
+    Summary(McapInfo),
+    /// Needs a linear scan of the data section. `complete` when the file has
+    /// a summary, so it is not still being written.
+    Linear { complete: bool },
+}
+
+fn classify(buf: &[u8]) -> Source {
+    match Summary::read(buf) {
+        Ok(Some(summary)) if summary.stats.is_some() => {
+            if summary.chunk_indexes.is_empty() {
+                Source::Linear { complete: true }
+            } else {
+                Source::Summary(info_from_summary(buf, &summary))
+            }
+        }
+        _ => Source::Linear { complete: false },
+    }
+}
+
 /// Read MCAP file info including topics and durations.
 pub fn read_mcap_info<P: AsRef<Utf8Path>>(path: P) -> Result<McapInfo> {
     let path = path.as_ref();
     let mapped = map_mcap(path)?;
-    if let Ok(Some(summary)) = Summary::read(&mapped) {
-        if summary.stats.is_some() {
-            return Ok(info_from_summary(&mapped, &summary));
-        }
-    }
+    let complete = match classify(&mapped) {
+        Source::Summary(info) => return Ok(info),
+        Source::Linear { complete } => complete,
+    };
     let meta = std::fs::metadata(path)?;
     let modified = meta.modified()?;
-    if modified.elapsed().is_ok_and(|age| age < IN_PROGRESS_WINDOW) {
+    if !complete && modified.elapsed().is_ok_and(|age| age < IN_PROGRESS_WINDOW) {
         return Ok(McapInfo::default());
     }
     let key = path.as_std_path().to_path_buf();
@@ -129,12 +150,13 @@ pub fn read_mcap_info<P: AsRef<Utf8Path>>(path: P) -> Result<McapInfo> {
 
 /// Read MCAP info from an in-memory file.
 ///
-/// Uses the summary section when it carries statistics; otherwise scans the
-/// data section linearly (files cut short by a crash or power loss).
+/// Uses the summary section when it carries statistics and chunk indexes;
+/// otherwise scans the data section linearly (files cut short by a crash or
+/// power loss, and files written without chunk indexes).
 pub fn read_mcap_info_bytes(buf: &[u8]) -> Result<McapInfo> {
-    match Summary::read(buf) {
-        Ok(Some(summary)) if summary.stats.is_some() => Ok(info_from_summary(buf, &summary)),
-        _ => read_linear(buf),
+    match classify(buf) {
+        Source::Summary(info) => Ok(info),
+        Source::Linear { .. } => read_linear(buf),
     }
 }
 
@@ -151,24 +173,6 @@ fn info_from_summary(buf: &[u8], summary: &Summary) -> McapInfo {
     steps.sort_by_key(|s| s.offset);
 
     let stats = summary.stats.as_ref().expect("checked by caller");
-    if summary.chunk_indexes.is_empty() {
-        let span = stats
-            .message_end_time
-            .saturating_sub(stats.message_start_time);
-        let timeline = Timeline {
-            duration_ns: subtract_steps(span, &steps),
-            clock_steps: steps.len(),
-        };
-        // No chunk indexes, so no per-channel extents: use the recording duration.
-        let extent = ChannelExtent {
-            span_ns: timeline.duration_ns,
-            segments: 1,
-        };
-        let totals: HashMap<u16, ChannelExtent> =
-            summary.channels.keys().map(|id| (*id, extent)).collect();
-        return build_info(channel_counts(summary, stats), &totals, timeline);
-    }
-
     let mut chunks: Vec<_> = summary.chunk_indexes.iter().collect();
     chunks.sort_by_key(|c| c.chunk_start_offset);
     let mut pending = steps.into_iter().peekable();
@@ -401,7 +405,8 @@ fn build_info(
     }
 }
 
-/// Reads a file without a usable summary by walking its top-level records.
+/// Reads a file by walking its top-level records, for files without a usable
+/// summary or without chunk indexes. Messages outside chunks are read directly.
 ///
 /// Chunk bodies are skipped: chunk headers give each chunk's time range and
 /// the MessageIndex records that follow it give per-channel counts and
@@ -429,6 +434,10 @@ fn read_linear(buf: &[u8]) -> Result<McapInfo> {
             Record::Channel(channel) => {
                 scan.flush(false);
                 scan.topics.insert(channel.id, channel.topic);
+            }
+            Record::Message { header, .. } => {
+                scan.flush(false);
+                scan.message(header.log_time, header.channel_id);
             }
             Record::Metadata(metadata) => {
                 scan.flush(false);
@@ -499,6 +508,17 @@ struct LinearScan<'a> {
 }
 
 impl<'a> LinearScan<'a> {
+    /// Records a message read outside any chunk.
+    fn message(&mut self, log_time: u64, channel: u16) {
+        *self.counts.entry(channel).or_default() += 1;
+        if let Some(Entry::Messages(times)) = self.entries.last_mut() {
+            times.push((log_time, channel));
+        } else {
+            self.entries
+                .push(Entry::Messages(vec![(log_time, channel)]));
+        }
+    }
+
     fn message_index(&mut self, offset: usize, end: usize, index: MessageIndex) {
         let Some(chunk) = self.chunk.as_mut() else {
             return;
@@ -1217,6 +1237,15 @@ mod tests {
     /// between the two runs. Returns the finished and the truncated file.
     fn camera_runs(clock_sync: bool, resume: u64, step: Option<i64>) -> [Vec<u8>; 2] {
         let options = mcap::WriteOptions::new().chunk_size(Some(1024));
+        camera_runs_with(options, clock_sync, resume, step)
+    }
+
+    fn camera_runs_with(
+        options: mcap::WriteOptions,
+        clock_sync: bool,
+        resume: u64,
+        step: Option<i64>,
+    ) -> [Vec<u8>; 2] {
         let mut writer: TestWriter =
             mcap::Writer::with_options(Cursor::new(Vec::new()), options).unwrap();
         if clock_sync {
@@ -1317,6 +1346,38 @@ mod tests {
             let info = read_mcap_info_bytes(&buf).unwrap();
             assert_eq!(info.clock_steps, 1);
             assert!((info.duration_s - 41.8).abs() < 1e-6, "{}", info.duration_s);
+        }
+    }
+
+    #[test]
+    fn statistics_without_chunk_indexes_split_at_each_step() {
+        let hour = 3_600 * S;
+        let unindexed = mcap::WriteOptions::new()
+            .chunk_size(Some(1024))
+            .emit_chunk_indexes(false);
+        let unchunked = mcap::WriteOptions::new().use_chunks(false);
+        for (name, options) in [("unindexed", unindexed), ("unchunked", unchunked)] {
+            for (resume, step) in [
+                (T0 + 10 * S + hour, hour as i64),
+                (T0 + 10 * S - hour, -(hour as i64)),
+            ] {
+                let [buf, _] = camera_runs_with(options.clone(), false, resume, Some(step));
+                let summary = Summary::read(&buf).unwrap().unwrap();
+                assert!(summary.stats.is_some() && summary.chunk_indexes.is_empty());
+                let info = read_mcap_info_bytes(&buf).unwrap();
+                assert_eq!(info.clock_steps, 1, "{name} step {step}");
+                assert!(
+                    (info.duration_s - 19.8).abs() < 1e-6,
+                    "{name} step {step}: {}",
+                    info.duration_s
+                );
+                let camera = &info.topics["/camera/h264"];
+                assert_eq!(camera.message_count, 200, "{name} step {step}");
+                assert!(
+                    (camera.video_length - 19.8).abs() < 1e-6,
+                    "{name} step {step}"
+                );
+            }
         }
     }
 

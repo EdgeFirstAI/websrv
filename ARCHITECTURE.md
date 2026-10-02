@@ -260,18 +260,32 @@ graph TB
 
 **MCAP File Structure Analysis**:
 
-Function: `read_mcap_info(path)` → `(HashMap<String, TopicInfo>, f64)`
+Function: `read_mcap_info(path)` → `McapInfo` (`topics: HashMap<String, TopicInfo>`, `duration_s`, `clock_steps`); timeline reconstruction lives in `src/mcap_timeline.rs`
 
-1. Memory-map MCAP file using `memmap::Mmap`
-2. Read summary metadata via `mcap::Summary::read()`
-3. Extract statistics:
-   - Message start/end timestamps
-   - Channel metadata (topics, schemas)
-   - Message counts per channel
-4. Calculate per-topic metrics:
-   - Message count
-   - Average FPS (messages/duration)
-   - Video length (duration in seconds)
+1. Memory-map the MCAP file using `memmap::Mmap`
+2. Summary path, taken when `Summary::read()` succeeds and carries statistics and chunk indexes, and metadata indexes whenever the statistics count Metadata records:
+   - Collect `clock_step` Metadata records from the metadata indexes, ordered by file offset (`step_ns` is a signed decimal-integer string), and note whether a `clock_sync` record is present
+   - Walk the chunk indexes in file order (not time order) and feed each chunk's `log_time` span to `TimelineAccumulator`
+   - Files from recorders that write a `clock_sync` Metadata record (written when the file is opened) take clock steps only from their `clock_step` records. A segment ends at each `clock_step` Metadata offset. An unrecorded forward jump in `log_time` larger than 5 s (`STEP_GAP_NS`) is a pause in the data: it is held as tentative until the data after it either returns as a stray excursion (below) or spans more than 5 s, and a pause joins the segments on either side, so its time counts toward the duration and toward each topic's span. An unrecorded backward jump larger than 5 s cannot be a pause, so it still splits the timeline, but it is not counted as a clock step
+   - Older files without `clock_sync` fall back to gap detection: a segment also ends at any jump in `log_time` larger than 5 s, in either direction, and each such jump counts as a clock step
+   - A record that arrives within 5 s of data after a gap-detected jump describes that jump, and is not counted twice, when its `step_ns` is within 5 s of the jump, or when it is in the same direction as the jump and the jump goes further forward than the step: the step happened during a pause in the data, and with `clock_sync` that pause (jump − `step_ns`) counts toward the duration (without `clock_sync` the whole jump is excluded, as for any gap). A record that does not describe the pending jump, such as a step in the opposite direction or one larger than the jump, is a step of its own: the pending jump is settled as it would be without a record (with `clock_sync`, a pause still counts toward the duration) and the record closes the segment
+   - The recording duration is the sum of the segment durations, and when a record reports the step size, that size is removed from the segment it ended, which corrects for a step that leaked into the preceding chunk
+   - A chunk spanning more than 5 s is resolved message by message from its MessageIndex records, without decompressing the chunk, so a step inside a chunk is still found
+   - A short excursion found by gap detection alone (at most 5 s of data) that returns to within 5 s of the timeline it left, such as a stray message written around a clock step, is not counted as a step and adds no duration; the preceding segment is re-opened and continues, and the excursion's segment is abandoned: its messages still count in `message_count`, but they add no segment and no span to their topics. This applies with or without `clock_sync`. `clock_step` Metadata records always close a segment
+3. Linear scan, used when the summary is missing or has no statistics (power loss, crash), and for complete files whose summary has statistics but no chunk indexes (the global statistics span cannot be split at the steps) or counts Metadata records without indexing them (the `clock_step` and `clock_sync` records can only be found in the data section). Files without Metadata records never take this path for that reason:
+   - Walk the top-level records of the data section without decompressing chunk bodies: each Chunk header gives the chunk's `log_time` range and the MessageIndex records that follow it give per-channel message counts and times, so each chunk is fed to the timeline exactly as on the summary path; messages written outside chunks are fed one by one; `clock_step` Metadata records are taken in file order. The scan stops at DataEnd or Footer when the file is complete; for a complete file the summary's channels are then added, so topics without messages are still listed, and message counts are taken from its statistics where present. `MessageStream` is not used because it skips Metadata records
+   - A chunk is decompressed only when its message indexes name a channel whose Channel record has not been seen yet (writers place Channel records inside chunks; when the record is not in that chunk, earlier undecompressed chunks are searched newest first), or when it has no message indexes; the last chunk before a truncated tail is always decompressed because its indexes may be incomplete. Messages of a decompressed chunk are counted and fed one by one
+   - Cost: the scan touches the chunk headers, message indexes and Metadata records, plus the bodies of the chunks it decompresses (those introducing unseen channels, typically the first; those without message indexes; and the last chunk before a truncated tail) — for a recorder file, well under 1% of the file. The bodies of all other chunks are not paged in
+   - A truncated tail ends the scan and everything read before it is kept
+   - A file without a summary modified within the last 10 s (`IN_PROGRESS_WINDOW`) is assumed to still be recording and returns an empty `McapInfo`; a modification time in the future counts as finished. Files with a summary are complete and are never held back
+   - Results are cached per `(path, len, mtime)`, so an unchanged file is scanned once
+   - `read_mcap_info` scans synchronously. The recordings listing uses `read_mcap_info_for_listing`, which never waits for a scan: on a cache miss it queues the file on a single background thread (started on first use) and reports it with `scanning: true` and empty topics; a file is queued at most once while queued or being scanned, and is released when its scan finishes, fails or panics. The cache is re-checked while holding the in-flight set before queuing, and a finished scan is cached before it leaves the set, so a scan completing concurrently is not queued again; the worker also skips a file whose unchanged scan was cached (for example by `read_mcap_info`) while it was queued. Both readers share the same scan and caching rules: a file that cannot be opened or mapped is not cached (`read_mcap_info` returns the error and the listing reports the file empty), and a scan that panics yields an empty result that is cached until the file changes
+4. Exclude the `/clock_step` timeline-marker channel from the topic list and from all metrics
+5. Calculate per-topic metrics:
+   - `message_count` from the statistics (or the scan)
+   - `video_length`: the topic's own span, the sum over timeline segments of the interval between the channel's first and last message `log_time` in that segment. These times are read from the MessageIndex records of the first and last chunk containing the channel in the segment (an empty index counts as absent); when an index is missing or cannot be parsed, the extent of the containing chunks' `log_time` spans is used instead. Chunks spanning more than 5 s, decompressed chunks and messages outside chunks are resolved to per-message times. Topics without a recorded span use the recording duration
+   - `average_fps`: `(message_count - k) / video_length`, where `k` is the number of timeline segments holding the topic's messages (each segment's first message opens no interval), or 0 when there is no interval or no span; topics without a recorded span use `k = 1`
+6. `/api/recordings` reports `average_video_length` as the whole-recording duration with clock steps removed, `clock_steps` as the number of steps excluded from it, and `scanning` (always present) as `true` while the file's background scan is pending; clients re-request the listing to get the result
 
 **MCAP Download Streaming**:
 

@@ -1175,8 +1175,9 @@ mod tests {
         }
         assert!((info.topics["/camera/h264"].average_fps - 10.0).abs() < 0.3);
     }
-    /// 10 s of 10 Hz camera, a backward step with its record and marker,
-    /// one `/imu` message stamped just before the step, then 10 s more.
+    /// 10 s of 10 Hz camera and 5 Hz `/imu`, a backward step with its record
+    /// and marker, one `/imu` message stamped just before the step, then 10 s
+    /// more of both.
     fn stray_after_backward_record(clock_sync: bool) -> Vec<u8> {
         let options = mcap::WriteOptions::new().chunk_size(Some(256));
         let mut writer: TestWriter =
@@ -1196,6 +1197,9 @@ mod tests {
         let mut sequence = 0;
         for i in 0..100 {
             write(&mut writer, camera, &mut sequence, T0 + i * S / 10);
+            if i % 2 == 0 {
+                write(&mut writer, imu, &mut sequence, T0 + i * S / 10);
+            }
         }
         let step: i64 = -3_600 * S as i64;
         let after = T0 + 10 * S - 3_600 * S;
@@ -1218,6 +1222,9 @@ mod tests {
         );
         for i in 0..100 {
             write(&mut writer, camera, &mut sequence, after + i * S / 10);
+            if i % 2 == 0 {
+                write(&mut writer, imu, &mut sequence, after + i * S / 10);
+            }
         }
         writer.finish().unwrap();
         writer.into_inner().into_inner()
@@ -1230,7 +1237,18 @@ mod tests {
             "duration {}",
             info.duration_s
         );
-        assert_eq!(info.topics["/imu"].message_count, 1);
+        let imu = &info.topics["/imu"];
+        assert_eq!(imu.message_count, 101);
+        assert!(
+            (imu.average_fps - 99.0 / 19.6).abs() < 1e-9,
+            "imu fps {}",
+            imu.average_fps
+        );
+        assert!(
+            (imu.video_length - 19.6).abs() < 1e-9,
+            "imu span {}",
+            imu.video_length
+        );
         let camera = &info.topics["/camera/h264"];
         assert!(
             (camera.average_fps - 198.0 / 19.8).abs() < 0.01,

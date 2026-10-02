@@ -107,6 +107,8 @@ pub struct TimelineAccumulator {
     previous: Option<Closed>,
     /// Segments joined to an earlier one across a pause, as `(from, into)`.
     merged: Vec<(usize, usize)>,
+    /// Stray excursions dropped when the segment before them was re-opened.
+    abandoned: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,7 +218,8 @@ impl TimelineAccumulator {
     }
 
     /// Finishes the timeline and the per-channel spans recorded against its
-    /// segment indexes, joining the spans of segments joined across a pause.
+    /// segment indexes, joining the spans of segments joined across a pause
+    /// and dropping those of stray excursions.
     pub fn finish_with_spans(
         mut self,
         spans: ChannelSpans,
@@ -227,7 +230,7 @@ impl TimelineAccumulator {
             duration_ns: self.total_ns,
             clock_steps: self.clock_steps,
         };
-        (timeline, spans.finish_merged(&self.merged))
+        (timeline, spans.finish_merged(&self.merged, &self.abandoned))
     }
 
     /// Drops the open segment and re-opens the previous one when the open
@@ -245,6 +248,7 @@ impl TimelineAccumulator {
         if gap.kind == GapKind::Step {
             self.clock_steps = self.clock_steps.saturating_sub(1);
         }
+        self.abandoned.push(self.segment);
         self.segment = previous.segment;
         self.earlier = previous.earlier;
         self.last = Some(previous.last);
@@ -320,12 +324,18 @@ impl ChannelSpans {
     }
 
     pub fn finish(self) -> HashMap<u16, ChannelExtent> {
-        self.finish_merged(&[])
+        self.finish_merged(&[], &[])
     }
 
     /// Sums each channel's spans, first joining the spans of each segment
     /// in `merged` (`(from, into)` pairs) to the segment it was joined to.
-    fn finish_merged(self, merged: &[(usize, usize)]) -> HashMap<u16, ChannelExtent> {
+    /// Spans in `abandoned` segments are dropped; a channel seen only there
+    /// has an empty extent.
+    fn finish_merged(
+        self,
+        merged: &[(usize, usize)],
+        abandoned: &[usize],
+    ) -> HashMap<u16, ChannelExtent> {
         let into: HashMap<usize, usize> = merged.iter().copied().collect();
         let canonical = |mut segment: usize| {
             while let Some(&next) = into.get(&segment) {
@@ -333,14 +343,18 @@ impl ChannelSpans {
             }
             segment
         };
+        let mut totals: HashMap<u16, ChannelExtent> = HashMap::new();
         let mut joined: HashMap<(usize, u16), Span> = HashMap::new();
         for ((segment, channel), span) in self.open {
+            if abandoned.contains(&segment) {
+                totals.entry(channel).or_default();
+                continue;
+            }
             joined
                 .entry((canonical(segment), channel))
                 .and_modify(|s| *s = s.merge(span))
                 .or_insert(span);
         }
-        let mut totals: HashMap<u16, ChannelExtent> = HashMap::new();
         for ((_, channel), span) in joined {
             let total = totals.entry(channel).or_default();
             total.span_ns += span.len();
@@ -670,7 +684,7 @@ mod tests {
         spans.push(2, 7, span(T0, T0 + S));
         spans.push(2, 9, span(T0, T0 + S));
         spans.push(3, 7, span(T0 + 5 * S, T0 + 6 * S));
-        let totals = spans.finish_merged(&[(3, 2)]);
+        let totals = spans.finish_merged(&[(3, 2)], &[]);
         assert_eq!(totals[&7].segments, 2);
         assert_eq!(totals[&7].span_ns, 3 * S + 6 * S);
         assert_eq!(totals[&9].segments, 1);
@@ -841,6 +855,49 @@ mod tests {
                 2 * (10 * S - S / 10) + (2 * S - S / 10),
                 "step {step_ns}"
             );
+        }
+    }
+
+    #[test]
+    fn abandoned_excursion_adds_no_channel_segment_or_span() {
+        let point = |t: u64| Span {
+            start_ns: t,
+            end_ns: t,
+        };
+        let post = T0 + 10 * S - HOUR as u64;
+        for strays in [1, 2] {
+            let mut acc = TimelineAccumulator::default();
+            let mut spans = ChannelSpans::default();
+            let mut feed = |acc: &mut TimelineAccumulator, channel: u16, t: u64| {
+                acc.push(point(t));
+                spans.push(acc.segment(), channel, point(t));
+            };
+            for i in 0..100 {
+                feed(&mut acc, 7, T0 + i * S / 10);
+            }
+            acc.clock_step(&ClockStep {
+                offset: 0,
+                step_ns: -HOUR,
+            });
+            feed(&mut acc, 7, post);
+            for i in 0..strays {
+                feed(&mut acc, 7, PRE_END - 2_000_000 + i * 1_000_000);
+                feed(&mut acc, 9, PRE_END - 2_000_000 + i * 1_000_000);
+            }
+            for i in 1..100 {
+                feed(&mut acc, 7, post + i * S / 10);
+            }
+            let (timeline, totals) = acc.finish_with_spans(spans);
+            assert_eq!(timeline.clock_steps, 1, "strays {strays}");
+            assert_eq!(
+                totals[&7],
+                ChannelExtent {
+                    span_ns: 2 * (99 * S / 10),
+                    segments: 2
+                },
+                "strays {strays}"
+            );
+            assert_eq!(totals[&9], ChannelExtent::default(), "strays {strays}");
         }
     }
 

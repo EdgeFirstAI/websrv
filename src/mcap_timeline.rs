@@ -131,12 +131,22 @@ struct Gap {
 }
 
 impl Gap {
-    /// Whether `step` describes this jump: it arrives within [`STEP_GAP_NS`]
-    /// of data after the jump and differs from it by at most [`STEP_GAP_NS`].
-    fn described_by(self, step: &ClockStep, last: Option<Span>) -> bool {
+    /// Whether `step` describes this jump, which it does when it arrives
+    /// within [`STEP_GAP_NS`] of data after the jump and either matches the
+    /// jump to within [`STEP_GAP_NS`] or is in the same direction and smaller
+    /// in forward time, the rest being a pause in the data around the step.
+    /// Returns the length of that pause, zero for a match.
+    fn described_by(self, step: &ClockStep, last: Option<Span>) -> Option<u64> {
         let since = last.map_or(0, |l| l.end_ns.saturating_sub(self.at));
-        let mismatch = self.jump - i128::from(step.step_ns);
-        since <= STEP_GAP_NS && mismatch.unsigned_abs() <= u128::from(STEP_GAP_NS)
+        if since > STEP_GAP_NS {
+            return None;
+        }
+        let paused = self.jump - i128::from(step.step_ns);
+        if paused.unsigned_abs() <= u128::from(STEP_GAP_NS) {
+            return Some(0);
+        }
+        let same_direction = (self.jump > 0) == (step.step_ns > 0);
+        (paused > 0 && same_direction).then(|| u64::try_from(paused).unwrap_or(u64::MAX))
     }
 }
 
@@ -191,13 +201,18 @@ impl TimelineAccumulator {
 
     /// Records a clock step. A step that describes the gap-detected jump
     /// opening the current segment confirms that jump as a step; any other
-    /// closes the current segment as a step of its own.
+    /// closes the current segment as a step of its own. When records are
+    /// authoritative, a pause found in the jump beside the step counts toward
+    /// the duration; otherwise the whole jump is excluded, as for any gap.
     pub fn clock_step(&mut self, step: &ClockStep) {
         if let Some(gap) = self.gap {
-            if gap.described_by(step, self.last) {
+            if let Some(paused) = gap.described_by(step, self.last) {
                 self.gap = None;
                 if gap.kind != GapKind::Step {
                     self.clock_steps += 1;
+                }
+                if self.authoritative {
+                    self.total_ns = self.total_ns.saturating_add(paused);
                 }
                 return;
             }
@@ -827,14 +842,55 @@ mod tests {
     }
 
     /// Ten 1 s spans, a 20 s unrecorded pause, two 1 s spans, then a
-    /// recorded forward step of `step_ns` and ten more 1 s spans.
+    /// recorded step of `step_ns` and ten more 1 s spans.
     fn pause_then_recorded_step(step_ns: i64) -> Vec<Item> {
         let mut items = one_second_chunks(T0, 10);
         let resume = PRE_END + 20 * S;
         items.extend(one_second_chunks(resume, 2));
         items.push(Item::Step(step_ns));
-        items.extend(one_second_chunks(resume + 2 * S + step_ns as u64, 10));
+        let after = (resume + 2 * S).checked_add_signed(step_ns).unwrap();
+        items.extend(one_second_chunks(after, 10));
         items
+    }
+
+    /// Ten 1 s spans, then a jump of a 20 s pause plus `step_ns`, two 1 s
+    /// spans, the record of `step_ns`, and ten more 1 s spans.
+    fn step_during_pause(step_ns: i64) -> Vec<Item> {
+        let mut items = one_second_chunks(T0, 10);
+        let resume = (PRE_END + 20 * S).checked_add_signed(step_ns).unwrap();
+        items.extend(one_second_chunks(resume, 2));
+        items.push(Item::Step(step_ns));
+        items.extend(one_second_chunks(resume + 2 * S, 10));
+        items
+    }
+
+    #[test]
+    fn record_after_a_step_during_a_pause_describes_it() {
+        for step_ns in [STEP, -HOUR] {
+            let t = run_synced(&step_during_pause(step_ns));
+            assert_eq!(t.clock_steps, 1, "step {step_ns}");
+            assert_eq!(
+                t.duration_ns,
+                (10 * S - S / 10) + 20 * S + (12 * S - S / 10),
+                "step {step_ns}"
+            );
+
+            let t = run(&step_during_pause(step_ns));
+            assert_eq!(t.clock_steps, 1, "step {step_ns}");
+            assert_eq!(
+                t.duration_ns,
+                (10 * S - S / 10) + (12 * S - S / 10),
+                "step {step_ns}"
+            );
+        }
+    }
+
+    #[test]
+    fn opposite_record_after_a_pause_is_its_own_step() {
+        let t = run_synced(&pause_then_recorded_step(-HOUR));
+        assert_eq!(t.clock_steps, 1);
+        let before = PRE_END + 20 * S + 2 * S - S / 10 - T0;
+        assert_eq!(t.duration_ns, before + (10 * S - S / 10));
     }
 
     #[test]
@@ -847,7 +903,7 @@ mod tests {
 
     #[test]
     fn record_not_matching_a_gap_is_a_separate_step() {
-        for step_ns in [STEP, 2 * S as i64] {
+        for step_ns in [STEP, -2 * S as i64] {
             let t = run(&pause_then_recorded_step(step_ns));
             assert_eq!(t.clock_steps, 2, "step {step_ns}");
             assert_eq!(

@@ -20,9 +20,10 @@ use mcap::Summary;
 use memmap::Mmap;
 use serde::Serialize;
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path as StdPath, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio_util::io::ReaderStream;
 
@@ -46,6 +47,9 @@ pub struct FileInfo {
     pub average_video_length: f64,
     /// Clock steps excluded from `average_video_length`.
     pub clock_steps: usize,
+    /// The file is being scanned in the background; `topics` and
+    /// `average_video_length` are empty until a later listing.
+    pub scanning: bool,
 }
 
 /// Directory response with MCAP files
@@ -95,6 +99,23 @@ fn linear_cache() -> &'static LinearCache {
     CACHE.get_or_init(Default::default)
 }
 
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Cached linear-scan result for `key`, if the file is unchanged since.
+fn cached(key: &StdPath, meta: &std::fs::Metadata, modified: SystemTime) -> Option<McapInfo> {
+    let cache = lock(linear_cache());
+    let (len, mtime, info) = cache.get(key)?;
+    (*len == meta.len() && *mtime == modified).then(|| info.clone())
+}
+
+fn cache_insert(key: PathBuf, meta: &std::fs::Metadata, modified: SystemTime, info: McapInfo) {
+    lock(linear_cache()).insert(key, (meta.len(), modified, info));
+}
+
 /// How a file's information is obtained.
 enum Source {
     /// Read from the summary section.
@@ -117,35 +138,179 @@ fn classify(buf: &[u8]) -> Source {
     }
 }
 
-/// Read MCAP file info including topics and durations.
-pub fn read_mcap_info<P: AsRef<Utf8Path>>(path: P) -> Result<McapInfo> {
-    let path = path.as_ref();
+/// What a listing needs to know about a file before reading it.
+enum Lookup {
+    Ready(McapInfo),
+    /// Needs a linear scan that is not cached.
+    Scan {
+        key: PathBuf,
+        meta: std::fs::Metadata,
+        modified: SystemTime,
+        mapped: Mmap,
+    },
+}
+
+/// Reads a file from its summary, or from the linear-scan cache. Files
+/// without a summary modified within [`IN_PROGRESS_WINDOW`] are still being
+/// recorded and read as empty.
+fn lookup(path: &Utf8Path) -> Result<Lookup> {
     let mapped = map_mcap(path)?;
     let complete = match classify(&mapped) {
-        Source::Summary(info) => return Ok(info),
+        Source::Summary(info) => return Ok(Lookup::Ready(info)),
         Source::Linear { complete } => complete,
     };
     let meta = std::fs::metadata(path)?;
     let modified = meta.modified()?;
     if !complete && modified.elapsed().is_ok_and(|age| age < IN_PROGRESS_WINDOW) {
-        return Ok(McapInfo::default());
+        return Ok(Lookup::Ready(McapInfo::default()));
     }
     let key = path.as_std_path().to_path_buf();
-    if let Some((len, mtime, info)) = linear_cache()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&key)
-    {
-        if *len == meta.len() && *mtime == modified {
-            return Ok(info.clone());
+    if let Some(info) = cached(&key, &meta, modified) {
+        return Ok(Lookup::Ready(info));
+    }
+    Ok(Lookup::Scan {
+        key,
+        meta,
+        modified,
+        mapped,
+    })
+}
+
+/// Read MCAP file info including topics and durations.
+pub fn read_mcap_info<P: AsRef<Utf8Path>>(path: P) -> Result<McapInfo> {
+    match lookup(path.as_ref())? {
+        Lookup::Ready(info) => Ok(info),
+        Lookup::Scan {
+            key,
+            meta,
+            modified,
+            mapped,
+        } => {
+            let info = read_linear(&mapped)?;
+            cache_insert(key, &meta, modified, info.clone());
+            Ok(info)
         }
     }
-    let info = read_linear(&mapped)?;
-    linear_cache()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(key, (meta.len(), modified, info.clone()));
-    Ok(info)
+}
+
+/// Read MCAP file info for the recordings listing without waiting for a
+/// linear scan. Returns `(info, scanning)`: when the file needs a scan that
+/// is not cached, the scan is queued on a background thread and the empty
+/// info is returned with `scanning` set; a later call returns the result.
+pub fn read_mcap_info_for_listing<P: AsRef<Utf8Path>>(path: P) -> Result<(McapInfo, bool)> {
+    match lookup(path.as_ref())? {
+        Lookup::Ready(info) => Ok((info, false)),
+        Lookup::Scan { key, .. } => {
+            scanner().enqueue(key);
+            Ok((McapInfo::default(), true))
+        }
+    }
+}
+
+/// A single background thread running linear scans into the cache.
+struct Scanner {
+    queue: Mutex<Option<mpsc::Sender<PathBuf>>>,
+    /// Paths queued or being scanned, keyed like the cache.
+    in_flight: Mutex<HashSet<PathBuf>>,
+}
+
+fn scanner() -> &'static Scanner {
+    static SCANNER: OnceLock<Scanner> = OnceLock::new();
+    SCANNER.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<PathBuf>();
+        let queue = std::thread::Builder::new()
+            .name("mcap-scan".into())
+            .spawn(move || {
+                for key in rx {
+                    let _ = catch_unwind(AssertUnwindSafe(|| scan_into_cache(&key)));
+                    lock(&scanner().in_flight).remove(&key);
+                }
+            })
+            .ok()
+            .map(|_| tx);
+        Scanner {
+            queue: Mutex::new(queue),
+            in_flight: Mutex::default(),
+        }
+    })
+}
+
+impl Scanner {
+    /// Queues `key` unless it is already queued or being scanned. Scans in
+    /// place when the background thread could not be started.
+    fn enqueue(&self, key: PathBuf) {
+        if !lock(&self.in_flight).insert(key.clone()) {
+            return;
+        }
+        #[cfg(test)]
+        test_hooks::enqueued(&key);
+        let sent = lock(&self.queue)
+            .as_ref()
+            .is_some_and(|tx| tx.send(key.clone()).is_ok());
+        if !sent {
+            scan_into_cache(&key);
+            lock(&self.in_flight).remove(&key);
+        }
+    }
+}
+
+/// Scans the file at `key` and caches the result. A file that cannot be
+/// opened is left uncached; a scan that panics caches empty info so the file
+/// is not scanned again until it changes.
+fn scan_into_cache(key: &StdPath) {
+    #[cfg(test)]
+    let _paused = test_hooks::wait_for_scanner();
+    let Ok(meta) = std::fs::metadata(key) else {
+        return;
+    };
+    let Ok(modified) = meta.modified() else {
+        return;
+    };
+    let Some(path) = Utf8Path::from_path(key) else {
+        return;
+    };
+    let Ok(mapped) = map_mcap(path) else {
+        return;
+    };
+    let info = match catch_unwind(AssertUnwindSafe(|| read_linear(&mapped))) {
+        Ok(Ok(info)) => info,
+        Ok(Err(_)) | Err(_) => McapInfo::default(),
+    };
+    cache_insert(key.to_path_buf(), &meta, modified, info);
+}
+
+#[cfg(test)]
+mod test_hooks {
+    use super::lock;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENQUEUED: Mutex<Option<HashMap<PathBuf, usize>>> = Mutex::new(None);
+    static PAUSE: Mutex<()> = Mutex::new(());
+
+    pub fn enqueued(key: &Path) {
+        *lock(&ENQUEUED)
+            .get_or_insert_with(HashMap::new)
+            .entry(key.to_path_buf())
+            .or_default() += 1;
+    }
+
+    pub fn times_enqueued(key: &Path) -> usize {
+        lock(&ENQUEUED)
+            .as_ref()
+            .and_then(|m| m.get(key).copied())
+            .unwrap_or(0)
+    }
+
+    /// Holds background scans until the guard is dropped.
+    pub fn scanner_paused() -> MutexGuard<'static, ()> {
+        lock(&PAUSE)
+    }
+
+    pub fn wait_for_scanner() -> MutexGuard<'static, ()> {
+        lock(&PAUSE)
+    }
 }
 
 /// Read MCAP info from an in-memory file.
@@ -681,8 +846,9 @@ pub async fn list_mcap_files<T: McapContext>(State(data): State<Arc<T>>) -> impl
                             .ok()?
                             .as_secs();
 
-                        let info =
-                            read_mcap_info(Utf8Path::from_path(&entry.path())?).unwrap_or_default();
+                        let (info, scanning) =
+                            read_mcap_info_for_listing(Utf8Path::from_path(&entry.path())?)
+                                .unwrap_or_default();
 
                         Some(FileInfo {
                             name: entry.file_name().to_string_lossy().to_string(),
@@ -695,6 +861,7 @@ pub async fn list_mcap_files<T: McapContext>(State(data): State<Arc<T>>) -> impl
                             topics: info.topics,
                             average_video_length: info.duration_s,
                             clock_steps: info.clock_steps,
+                            scanning,
                         })
                     } else {
                         None
@@ -805,6 +972,7 @@ pub async fn mcap_downloader(Path(path): Path<String>) -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
+    use super::test_hooks::{scanner_paused, times_enqueued};
     use super::*;
 
     use crate::mcap_timeline::{CLOCK_STEP_METADATA, CLOCK_STEP_TOPIC, CLOCK_SYNC_METADATA};
@@ -956,9 +1124,11 @@ mod tests {
             topics,
             average_video_length: 10.0,
             clock_steps: 0,
+            scanning: false,
         };
 
         let json = serde_json::to_string(&file_info).expect("Failed to serialize");
+        assert!(json.contains("\"scanning\":false"));
         assert!(json.contains("\"name\":\"test.mcap\""));
         assert!(json.contains("\"size\":1024"));
         assert!(json.contains("\"clock_steps\":0"));
@@ -1060,6 +1230,75 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_file(&path_a);
+    }
+
+    /// A file path under the build directory, unique to `name`.
+    fn scratch_file(name: &str, contents: &[u8]) -> camino::Utf8PathBuf {
+        let dir = camino::Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/test-scratch");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    fn set_age(path: &camino::Utf8Path, age: Duration) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - age)
+            .unwrap();
+    }
+
+    #[test]
+    fn listing_scans_summaryless_files_in_the_background() {
+        let mut buf = recording_across_step(mcap::WriteOptions::new().chunk_size(Some(1024)), true);
+        buf.truncate(buf.len() - 8);
+        let path = scratch_file("listing_background.mcap", &buf);
+        set_age(&path, Duration::from_secs(60));
+
+        {
+            let _paused = scanner_paused();
+            let (info, scanning) = read_mcap_info_for_listing(&path).unwrap();
+            assert!(scanning);
+            assert!(info.topics.is_empty());
+            let (_, scanning) = read_mcap_info_for_listing(&path).unwrap();
+            assert!(scanning, "still queued");
+            assert_eq!(times_enqueued(path.as_std_path()), 1);
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let info = loop {
+            let (info, scanning) = read_mcap_info_for_listing(&path).unwrap();
+            if !scanning {
+                break info;
+            }
+            assert!(std::time::Instant::now() < deadline, "scan did not finish");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_true_duration(&info);
+        assert_eq!(info.clock_steps, 1);
+        assert_eq!(times_enqueued(path.as_std_path()), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn listing_does_not_queue_complete_or_in_progress_files() {
+        let buf = recording_across_step(mcap::WriteOptions::new().chunk_size(Some(1024)), true);
+        let complete = scratch_file("listing_complete.mcap", &buf);
+        let (info, scanning) = read_mcap_info_for_listing(&complete).unwrap();
+        assert!(!scanning);
+        assert_true_duration(&info);
+
+        let truncated = scratch_file("listing_in_progress.mcap", &buf[..buf.len() - 8]);
+        let (info, scanning) = read_mcap_info_for_listing(&truncated).unwrap();
+        assert!(!scanning);
+        assert!(info.topics.is_empty());
+
+        assert_eq!(times_enqueued(complete.as_std_path()), 0);
+        assert_eq!(times_enqueued(truncated.as_std_path()), 0);
+        let _ = std::fs::remove_file(&complete);
+        let _ = std::fs::remove_file(&truncated);
     }
 
     /// Camera for 10 s; radar joins 3 s in; gps every 8 s; optional forward step at 10 s.

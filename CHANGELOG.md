@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `clock_steps` in each `/api/recordings` file entry: the number of clock steps excluded from the duration.
+- `scanning` in each `/api/recordings` file entry: `true` while a recording without a summary is being scanned in the background, so the listing no longer waits for it; re-request the listing for the result.
 
 ## [4.2.0] - 2026-09-07
 

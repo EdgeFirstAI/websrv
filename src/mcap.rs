@@ -706,6 +706,9 @@ fn read_linear(buf: &[u8]) -> McapInfo {
     }
     // Without the end of the data section, the last chunk's indexes may be incomplete.
     scan.flush(!complete);
+    if complete {
+        scan.seed_from_summary(buf);
+    }
     let (timeline, spans) = feed_entries(buf, &scan.entries, scan.clock_sync);
     let counts = scan
         .counts
@@ -758,6 +761,24 @@ struct LinearScan<'a> {
 }
 
 impl<'a> LinearScan<'a> {
+    /// Adds the channels the summary declares, so topics without messages
+    /// are listed, and takes message counts from its statistics where present.
+    fn seed_from_summary(&mut self, buf: &[u8]) {
+        let Ok(Some(summary)) = Summary::read(buf) else {
+            return;
+        };
+        let stats = summary.stats.as_ref();
+        for (id, channel) in &summary.channels {
+            self.topics
+                .entry(*id)
+                .or_insert_with(|| channel.topic.clone());
+            let count = self.counts.entry(*id).or_default();
+            if let Some(&n) = stats.and_then(|s| s.channel_message_counts.get(id)) {
+                *count = n;
+            }
+        }
+    }
+
     /// Records a message read outside any chunk.
     fn message(&mut self, log_time: u64, channel: u16) {
         *self.counts.entry(channel).or_default() += 1;
@@ -1868,6 +1889,44 @@ mod tests {
         let info = read_mcap_info_bytes(&buf).unwrap();
         assert_eq!(info.clock_steps, 0);
         assert!((info.duration_s - 39.9).abs() < 1e-6, "{}", info.duration_s);
+    }
+
+    #[test]
+    fn linear_scan_of_a_complete_file_keeps_topics_without_messages() {
+        let unindexed = mcap::WriteOptions::new()
+            .chunk_size(Some(1024))
+            .emit_chunk_indexes(false);
+        let unchunked = mcap::WriteOptions::new().use_chunks(false);
+        let unindexed_metadata = mcap::WriteOptions::new()
+            .chunk_size(Some(1024))
+            .emit_metadata_indexes(false);
+        for (name, options) in [
+            ("unindexed", unindexed),
+            ("unchunked", unchunked),
+            ("unindexed metadata", unindexed_metadata),
+        ] {
+            let mut writer: TestWriter =
+                mcap::Writer::with_options(Cursor::new(Vec::new()), options).unwrap();
+            write_clock_sync(&mut writer);
+            let camera = writer
+                .add_channel(0, "/camera/h264", "cdr", &BTreeMap::new())
+                .unwrap();
+            writer
+                .add_channel(0, "/radar/targets", "cdr", &BTreeMap::new())
+                .unwrap();
+            let mut sequence = 0;
+            for i in 0..100 {
+                write(&mut writer, camera, &mut sequence, T0 + i * S / 10);
+            }
+            writer.finish().unwrap();
+            let buf = writer.into_inner().into_inner();
+            assert!(matches!(classify(&buf), Source::Linear { complete: true }));
+            let info = read_mcap_info_bytes(&buf).unwrap();
+            assert_eq!(info.topics["/camera/h264"].message_count, 100, "{name}");
+            let radar = info.topics.get("/radar/targets");
+            assert_eq!(radar.map(|t| t.message_count), Some(0), "{name}");
+            assert_eq!(radar.map(|t| t.average_fps), Some(0.0), "{name}");
+        }
     }
 
     #[test]

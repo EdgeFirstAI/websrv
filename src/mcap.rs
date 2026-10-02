@@ -15,7 +15,7 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use camino::Utf8Path;
 use chrono::DateTime;
-use mcap::records::{ChunkHeader, ChunkIndex, MessageIndex, Record};
+use mcap::records::{op, ChunkHeader, ChunkIndex, MessageIndex, Record};
 use mcap::Summary;
 use memmap::Mmap;
 use serde::Serialize;
@@ -161,18 +161,15 @@ pub fn read_mcap_info_bytes(buf: &[u8]) -> Result<McapInfo> {
 }
 
 fn info_from_summary(buf: &[u8], summary: &Summary) -> McapInfo {
-    let mut steps: Vec<ClockStep> = summary
-        .metadata_indexes
-        .iter()
-        .filter(|index| index.name == CLOCK_STEP_METADATA)
-        .filter_map(|index| {
-            let record = mcap::read::metadata(buf, index).ok()?;
-            ClockStep::from_metadata(index.offset, &record)
-        })
-        .collect();
+    let stats = summary.stats.as_ref().expect("checked by caller");
+    let (mut steps, authoritative) =
+        if stats.metadata_count > 0 && summary.metadata_indexes.is_empty() {
+            data_section_clock_metadata(buf)
+        } else {
+            indexed_clock_metadata(buf, summary)
+        };
     steps.sort_by_key(|s| s.offset);
 
-    let stats = summary.stats.as_ref().expect("checked by caller");
     let mut chunks: Vec<_> = summary.chunk_indexes.iter().collect();
     chunks.sort_by_key(|c| c.chunk_start_offset);
     let mut pending = steps.into_iter().peekable();
@@ -184,12 +181,53 @@ fn info_from_summary(buf: &[u8], summary: &Summary) -> McapInfo {
         entries.push(Entry::Chunk(Cow::Borrowed(chunk)));
     }
     entries.extend(pending.map(Entry::Step));
-    let authoritative = summary
+    let (timeline, spans) = feed_entries(buf, &entries, authoritative);
+    build_info(channel_counts(summary, stats), &spans, timeline)
+}
+
+/// `clock_step` records and whether a `clock_sync` record is present, read
+/// through the summary's metadata indexes.
+fn indexed_clock_metadata(buf: &[u8], summary: &Summary) -> (Vec<ClockStep>, bool) {
+    let steps = summary
+        .metadata_indexes
+        .iter()
+        .filter(|index| index.name == CLOCK_STEP_METADATA)
+        .filter_map(|index| {
+            let record = mcap::read::metadata(buf, index).ok()?;
+            ClockStep::from_metadata(index.offset, &record)
+        })
+        .collect();
+    let clock_sync = summary
         .metadata_indexes
         .iter()
         .any(|index| index.name == CLOCK_SYNC_METADATA);
-    let (timeline, spans) = feed_entries(buf, &entries, authoritative);
-    build_info(channel_counts(summary, stats), &spans, timeline)
+    (steps, clock_sync)
+}
+
+/// `clock_step` records and whether a `clock_sync` record is present, read
+/// by walking the data section's top-level records, for files whose summary
+/// counts Metadata records but does not index them. Only record headers and
+/// Metadata bodies are read; chunk bodies are skipped.
+fn data_section_clock_metadata(buf: &[u8]) -> (Vec<ClockStep>, bool) {
+    let mut steps = Vec::new();
+    let mut clock_sync = false;
+    let Some(mut offset) = buf.starts_with(mcap::MAGIC).then_some(mcap::MAGIC.len()) else {
+        return (steps, clock_sync);
+    };
+    while let Some((op, body, next)) = record_at(buf, offset) {
+        match op {
+            op::METADATA => {
+                if let Ok(Record::Metadata(metadata)) = mcap::read::parse_record(op, body) {
+                    clock_sync |= metadata.name == CLOCK_SYNC_METADATA;
+                    steps.extend(ClockStep::from_metadata(offset as u64, &metadata));
+                }
+            }
+            op::DATA_END | op::FOOTER => break,
+            _ => {}
+        }
+        offset = next;
+    }
+    (steps, clock_sync)
 }
 
 /// A data-section item in file order, as fed to the timeline.
@@ -1379,6 +1417,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn metadata_without_metadata_indexes_is_found_in_the_data_section() {
+        let options = mcap::WriteOptions::new()
+            .chunk_size(Some(1024))
+            .emit_metadata_indexes(false);
+        let [buf, _] = camera_runs_with(options.clone(), false, T0 + 12 * S, Some(2 * S as i64));
+        let summary = Summary::read(&buf).unwrap().unwrap();
+        assert!(summary.metadata_indexes.is_empty() && !summary.chunk_indexes.is_empty());
+        assert_eq!(summary.stats.as_ref().unwrap().metadata_count, 1);
+        let info = read_mcap_info_bytes(&buf).unwrap();
+        assert_eq!(info.clock_steps, 1);
+        assert!((info.duration_s - 19.8).abs() < 1e-6, "{}", info.duration_s);
+
+        let [buf, _] = camera_runs_with(options, true, T0 + 30 * S, None);
+        let info = read_mcap_info_bytes(&buf).unwrap();
+        assert_eq!(info.clock_steps, 0);
+        assert!((info.duration_s - 39.9).abs() < 1e-6, "{}", info.duration_s);
     }
 
     #[test]

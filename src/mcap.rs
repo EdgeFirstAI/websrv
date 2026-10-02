@@ -185,11 +185,7 @@ pub fn read_mcap_info<P: AsRef<Utf8Path>>(path: P) -> Result<McapInfo> {
             meta,
             modified,
             mapped,
-        } => {
-            let info = read_linear(&mapped)?;
-            cache_insert(key, &meta, modified, info.clone());
-            Ok(info)
-        }
+        } => Ok(scan_and_cache(key, &meta, modified, &mapped)),
     }
 }
 
@@ -254,9 +250,28 @@ impl Scanner {
     }
 }
 
-/// Scans the file at `key` and caches the result. A file that cannot be
-/// opened is left uncached; a scan that panics caches empty info so the file
-/// is not scanned again until it changes.
+/// Runs the linear scan of `buf`, the file at `key`, and caches the result
+/// under the file's length and modification time. A scan that panics yields
+/// empty info, cached the same way, so the file is not scanned again until
+/// it changes.
+fn scan_and_cache(
+    key: PathBuf,
+    meta: &std::fs::Metadata,
+    modified: SystemTime,
+    buf: &[u8],
+) -> McapInfo {
+    let info = catch_unwind(AssertUnwindSafe(|| {
+        #[cfg(test)]
+        test_hooks::scanning(&key);
+        read_linear(buf)
+    }))
+    .unwrap_or_default();
+    cache_insert(key, meta, modified, info.clone());
+    info
+}
+
+/// Background scan of the file at `key`. A file that cannot be opened is
+/// left uncached, as `read_mcap_info` returns an error for it.
 fn scan_into_cache(key: &StdPath) {
     #[cfg(test)]
     let _paused = test_hooks::wait_for_scanner();
@@ -272,35 +287,66 @@ fn scan_into_cache(key: &StdPath) {
     let Ok(mapped) = map_mcap(path) else {
         return;
     };
-    let info = match catch_unwind(AssertUnwindSafe(|| read_linear(&mapped))) {
-        Ok(Ok(info)) => info,
-        Ok(Err(_)) | Err(_) => McapInfo::default(),
-    };
-    cache_insert(key.to_path_buf(), &meta, modified, info);
+    scan_and_cache(key.to_path_buf(), &meta, modified, &mapped);
 }
 
 #[cfg(test)]
 mod test_hooks {
     use super::lock;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, MutexGuard};
 
-    static ENQUEUED: Mutex<Option<HashMap<PathBuf, usize>>> = Mutex::new(None);
+    type Counts = Mutex<Option<HashMap<PathBuf, usize>>>;
+
+    static ENQUEUED: Counts = Mutex::new(None);
+    static SCANNED: Counts = Mutex::new(None);
+    static PANIC_ON: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
     static PAUSE: Mutex<()> = Mutex::new(());
 
-    pub fn enqueued(key: &Path) {
-        *lock(&ENQUEUED)
+    fn bump(counts: &Counts, key: &Path) {
+        *lock(counts)
             .get_or_insert_with(HashMap::new)
             .entry(key.to_path_buf())
             .or_default() += 1;
     }
 
-    pub fn times_enqueued(key: &Path) -> usize {
-        lock(&ENQUEUED)
+    fn count(counts: &Counts, key: &Path) -> usize {
+        lock(counts)
             .as_ref()
             .and_then(|m| m.get(key).copied())
             .unwrap_or(0)
+    }
+
+    pub fn enqueued(key: &Path) {
+        bump(&ENQUEUED, key);
+    }
+
+    pub fn times_enqueued(key: &Path) -> usize {
+        count(&ENQUEUED, key)
+    }
+
+    /// Called as a linear scan of `key` starts; panics when `key` is marked.
+    pub fn scanning(key: &Path) {
+        bump(&SCANNED, key);
+        if lock(&PANIC_ON).as_ref().is_some_and(|s| s.contains(key)) {
+            panic!("test scan panic for {}", key.display());
+        }
+    }
+
+    pub fn times_scanned(key: &Path) -> usize {
+        count(&SCANNED, key)
+    }
+
+    /// Makes scans of `key` panic until `panic` is called again with `false`.
+    pub fn panic_on_scan(key: &Path, panic: bool) {
+        let mut set = lock(&PANIC_ON);
+        let set = set.get_or_insert_with(HashSet::new);
+        if panic {
+            set.insert(key.to_path_buf());
+        } else {
+            set.remove(key);
+        }
     }
 
     /// Holds background scans until the guard is dropped.
@@ -321,7 +367,7 @@ mod test_hooks {
 pub fn read_mcap_info_bytes(buf: &[u8]) -> Result<McapInfo> {
     match classify(buf) {
         Source::Summary(info) => Ok(info),
-        Source::Linear { .. } => read_linear(buf),
+        Source::Linear { .. } => Ok(read_linear(buf)),
     }
 }
 
@@ -617,9 +663,9 @@ fn build_info(
 /// channel whose Channel record has not been seen yet, or when it has no
 /// indexes (such as the last chunk before a truncated tail). A truncated
 /// tail ends the scan and everything read before it is kept.
-fn read_linear(buf: &[u8]) -> Result<McapInfo> {
+fn read_linear(buf: &[u8]) -> McapInfo {
     let Some(mut offset) = buf.starts_with(mcap::MAGIC).then_some(mcap::MAGIC.len()) else {
-        return Ok(McapInfo::default());
+        return McapInfo::default();
     };
     let mut scan = LinearScan::default();
     let mut complete = false;
@@ -664,7 +710,7 @@ fn read_linear(buf: &[u8]) -> Result<McapInfo> {
         .counts
         .into_iter()
         .filter_map(|(id, count)| Some((id, scan.topics.get(&id)?.clone(), count)));
-    Ok(build_info(counts, &spans, timeline))
+    build_info(counts, &spans, timeline)
 }
 
 /// A chunk whose MessageIndex records are still being read.
@@ -972,7 +1018,7 @@ pub async fn mcap_downloader(Path(path): Path<String>) -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::test_hooks::{scanner_paused, times_enqueued};
+    use super::test_hooks::{panic_on_scan, scanner_paused, times_enqueued, times_scanned};
     use super::*;
 
     use crate::mcap_timeline::{CLOCK_STEP_METADATA, CLOCK_STEP_TOPIC, CLOCK_SYNC_METADATA};
@@ -1279,6 +1325,26 @@ mod tests {
         assert_true_duration(&info);
         assert_eq!(info.clock_steps, 1);
         assert_eq!(times_enqueued(path.as_std_path()), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_scan_that_panics_is_cached_as_empty_by_the_synchronous_reader() {
+        let mut buf = recording_across_step(mcap::WriteOptions::new().chunk_size(Some(1024)), true);
+        buf.truncate(buf.len() - 8);
+        let path = scratch_file("sync_scan_panics.mcap", &buf);
+        set_age(&path, Duration::from_secs(60));
+        panic_on_scan(path.as_std_path(), true);
+        let info = read_mcap_info(&path).unwrap();
+        assert!(info.topics.is_empty());
+        let info = read_mcap_info(&path).unwrap();
+        assert!(info.topics.is_empty());
+        assert_eq!(
+            times_scanned(path.as_std_path()),
+            1,
+            "cached until the file changes"
+        );
+        panic_on_scan(path.as_std_path(), false);
         let _ = std::fs::remove_file(&path);
     }
 

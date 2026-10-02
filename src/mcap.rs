@@ -196,10 +196,15 @@ pub fn read_mcap_info<P: AsRef<Utf8Path>>(path: P) -> Result<McapInfo> {
 pub fn read_mcap_info_for_listing<P: AsRef<Utf8Path>>(path: P) -> Result<(McapInfo, bool)> {
     match lookup(path.as_ref())? {
         Lookup::Ready(info) => Ok((info, false)),
-        Lookup::Scan { key, .. } => {
-            scanner().enqueue(key);
-            Ok((McapInfo::default(), true))
-        }
+        Lookup::Scan {
+            key,
+            meta,
+            modified,
+            ..
+        } => Ok(match scanner().enqueue(key, &meta, modified) {
+            Some(info) => (info, false),
+            None => (McapInfo::default(), true),
+        }),
     }
 }
 
@@ -232,21 +237,38 @@ fn scanner() -> &'static Scanner {
 }
 
 impl Scanner {
-    /// Queues `key` unless it is already queued or being scanned. Scans in
-    /// place when the background thread could not be started.
-    fn enqueue(&self, key: PathBuf) {
-        if !lock(&self.in_flight).insert(key.clone()) {
-            return;
+    /// Queues `key` unless it is already queued or being scanned, or its
+    /// scan has been cached since the caller looked. Returns the cached info
+    /// when there is one. The cache is checked while holding the in-flight
+    /// set, and a scan is cached before it leaves the set, so a scan that
+    /// finishes concurrently is never queued again. Scans in place when the
+    /// background thread could not be started.
+    fn enqueue(
+        &self,
+        key: PathBuf,
+        meta: &std::fs::Metadata,
+        modified: SystemTime,
+    ) -> Option<McapInfo> {
+        {
+            let mut in_flight = lock(&self.in_flight);
+            if let Some(info) = cached(&key, meta, modified) {
+                return Some(info);
+            }
+            if !in_flight.insert(key.clone()) {
+                return None;
+            }
         }
         #[cfg(test)]
         test_hooks::enqueued(&key);
         let sent = lock(&self.queue)
             .as_ref()
             .is_some_and(|tx| tx.send(key.clone()).is_ok());
-        if !sent {
-            scan_into_cache(&key);
-            lock(&self.in_flight).remove(&key);
+        if sent {
+            return None;
         }
+        scan_into_cache(&key);
+        lock(&self.in_flight).remove(&key);
+        cached(&key, meta, modified)
     }
 }
 
@@ -270,8 +292,9 @@ fn scan_and_cache(
     info
 }
 
-/// Background scan of the file at `key`. A file that cannot be opened is
-/// left uncached, as `read_mcap_info` returns an error for it.
+/// Background scan of the file at `key`, skipped when the unchanged file
+/// was cached since it was queued. A file that cannot be opened is left
+/// uncached, as `read_mcap_info` returns an error for it.
 fn scan_into_cache(key: &StdPath) {
     #[cfg(test)]
     let _paused = test_hooks::wait_for_scanner();
@@ -281,6 +304,9 @@ fn scan_into_cache(key: &StdPath) {
     let Ok(modified) = meta.modified() else {
         return;
     };
+    if cached(key, &meta, modified).is_some() {
+        return;
+    }
     let Some(path) = Utf8Path::from_path(key) else {
         return;
     };
@@ -1345,6 +1371,49 @@ mod tests {
             "cached until the file changes"
         );
         panic_on_scan(path.as_std_path(), false);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn aged_truncated_file(name: &str) -> camino::Utf8PathBuf {
+        let mut buf = recording_across_step(mcap::WriteOptions::new().chunk_size(Some(1024)), true);
+        buf.truncate(buf.len() - 8);
+        let path = scratch_file(name, &buf);
+        set_age(&path, Duration::from_secs(60));
+        path
+    }
+
+    fn wait_until_not_in_flight(key: &StdPath) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while lock(&scanner().in_flight).contains(key) {
+            assert!(std::time::Instant::now() < deadline, "still in flight");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn a_file_cached_before_it_is_queued_is_not_queued() {
+        let path = aged_truncated_file("cached_before_queue.mcap");
+        let key = path.as_std_path();
+        let info = read_mcap_info(&path).unwrap();
+        let meta = std::fs::metadata(key).unwrap();
+        let cached = scanner().enqueue(key.to_path_buf(), &meta, meta.modified().unwrap());
+        assert_eq!(times_enqueued(key), 0);
+        assert_same_info(&cached.expect("cached info"), &info);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_scanner_skips_a_file_cached_while_it_was_queued() {
+        let path = aged_truncated_file("cached_while_queued.mcap");
+        let key = path.as_std_path();
+        {
+            let _paused = scanner_paused();
+            let (_, scanning) = read_mcap_info_for_listing(&path).unwrap();
+            assert!(scanning);
+            assert_true_duration(&read_mcap_info(&path).unwrap());
+        }
+        wait_until_not_in_flight(key);
+        assert_eq!(times_scanned(key), 1);
         let _ = std::fs::remove_file(&path);
     }
 

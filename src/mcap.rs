@@ -15,7 +15,7 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use camino::Utf8Path;
 use chrono::DateTime;
-use mcap::records::{op, ChunkHeader, ChunkIndex, MessageIndex, Record};
+use mcap::records::{ChunkHeader, ChunkIndex, MessageIndex, Record};
 use mcap::Summary;
 use memmap::Mmap;
 use serde::Serialize;
@@ -125,10 +125,15 @@ enum Source {
     Linear { complete: bool },
 }
 
+/// Files whose summary lacks chunk indexes, or counts Metadata records
+/// without indexing them, need the data section to place clock steps, so
+/// they are scanned like files without a summary.
 fn classify(buf: &[u8]) -> Source {
     match Summary::read(buf) {
         Ok(Some(summary)) if summary.stats.is_some() => {
-            if summary.chunk_indexes.is_empty() {
+            let unindexed_metadata = summary.stats.as_ref().is_some_and(|s| s.metadata_count > 0)
+                && summary.metadata_indexes.is_empty();
+            if summary.chunk_indexes.is_empty() || unindexed_metadata {
                 Source::Linear { complete: true }
             } else {
                 Source::Summary(info_from_summary(buf, &summary))
@@ -387,9 +392,10 @@ mod test_hooks {
 
 /// Read MCAP info from an in-memory file.
 ///
-/// Uses the summary section when it carries statistics and chunk indexes;
-/// otherwise scans the data section linearly (files cut short by a crash or
-/// power loss, and files written without chunk indexes).
+/// Uses the summary section when it carries statistics and chunk indexes,
+/// and metadata indexes when there is Metadata; otherwise scans the data
+/// section linearly (files cut short by a crash or power loss, and files
+/// written without those indexes).
 pub fn read_mcap_info_bytes(buf: &[u8]) -> Result<McapInfo> {
     match classify(buf) {
         Source::Summary(info) => Ok(info),
@@ -399,12 +405,7 @@ pub fn read_mcap_info_bytes(buf: &[u8]) -> Result<McapInfo> {
 
 fn info_from_summary(buf: &[u8], summary: &Summary) -> McapInfo {
     let stats = summary.stats.as_ref().expect("checked by caller");
-    let (mut steps, authoritative) =
-        if stats.metadata_count > 0 && summary.metadata_indexes.is_empty() {
-            data_section_clock_metadata(buf)
-        } else {
-            indexed_clock_metadata(buf, summary)
-        };
+    let (mut steps, authoritative) = indexed_clock_metadata(buf, summary);
     steps.sort_by_key(|s| s.offset);
 
     let mut chunks: Vec<_> = summary.chunk_indexes.iter().collect();
@@ -438,32 +439,6 @@ fn indexed_clock_metadata(buf: &[u8], summary: &Summary) -> (Vec<ClockStep>, boo
         .metadata_indexes
         .iter()
         .any(|index| index.name == CLOCK_SYNC_METADATA);
-    (steps, clock_sync)
-}
-
-/// `clock_step` records and whether a `clock_sync` record is present, read
-/// by walking the data section's top-level records, for files whose summary
-/// counts Metadata records but does not index them. Only record headers and
-/// Metadata bodies are read; chunk bodies are skipped.
-fn data_section_clock_metadata(buf: &[u8]) -> (Vec<ClockStep>, bool) {
-    let mut steps = Vec::new();
-    let mut clock_sync = false;
-    let Some(mut offset) = buf.starts_with(mcap::MAGIC).then_some(mcap::MAGIC.len()) else {
-        return (steps, clock_sync);
-    };
-    while let Some((op, body, next)) = record_at(buf, offset) {
-        match op {
-            op::METADATA => {
-                if let Ok(Record::Metadata(metadata)) = mcap::read::parse_record(op, body) {
-                    clock_sync |= metadata.name == CLOCK_SYNC_METADATA;
-                    steps.extend(ClockStep::from_metadata(offset as u64, &metadata));
-                }
-            }
-            op::DATA_END | op::FOOTER => break,
-            _ => {}
-        }
-        offset = next;
-    }
     (steps, clock_sync)
 }
 
@@ -1414,6 +1389,27 @@ mod tests {
         }
         wait_until_not_in_flight(key);
         assert_eq!(times_scanned(key), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn listing_scans_unindexed_metadata_in_the_background() {
+        let options = mcap::WriteOptions::new()
+            .chunk_size(Some(1024))
+            .emit_metadata_indexes(false);
+        let [buf, _] = camera_runs_with(options, false, T0 + 12 * S, Some(2 * S as i64));
+        let path = scratch_file("listing_unindexed_metadata.mcap", &buf);
+        {
+            let _paused = scanner_paused();
+            let (info, scanning) = read_mcap_info_for_listing(&path).unwrap();
+            assert!(scanning, "the data section is not walked on the request");
+            assert!(info.topics.is_empty());
+        }
+        wait_until_not_in_flight(path.as_std_path());
+        let (info, scanning) = read_mcap_info_for_listing(&path).unwrap();
+        assert!(!scanning);
+        assert_eq!(info.clock_steps, 1);
+        assert!((info.duration_s - 19.8).abs() < 1e-6, "{}", info.duration_s);
         let _ = std::fs::remove_file(&path);
     }
 

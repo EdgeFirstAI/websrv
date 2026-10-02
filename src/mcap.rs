@@ -1434,6 +1434,59 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    fn listing_when_scanned(path: &camino::Utf8Path) -> McapInfo {
+        wait_until_not_in_flight(path.as_std_path());
+        let (info, scanning) = read_mcap_info_for_listing(path).unwrap();
+        assert!(!scanning, "a finished scan is not queued again");
+        info
+    }
+
+    #[test]
+    fn a_scan_that_panics_or_fails_releases_the_file() {
+        let path = aged_truncated_file("listing_scan_panics.mcap");
+        let key = path.as_std_path();
+        panic_on_scan(key, true);
+        let (_, scanning) = read_mcap_info_for_listing(&path).unwrap();
+        assert!(scanning);
+        let info = listing_when_scanned(&path);
+        panic_on_scan(key, false);
+        assert!(info.topics.is_empty());
+        assert_eq!(times_enqueued(key), 1);
+        assert_eq!(times_scanned(key), 1);
+
+        let gone = aged_truncated_file("listing_scan_fails.mcap");
+        {
+            let _paused = scanner_paused();
+            let (_, scanning) = read_mcap_info_for_listing(&gone).unwrap();
+            assert!(scanning);
+            std::fs::remove_file(&gone).unwrap();
+        }
+        wait_until_not_in_flight(gone.as_std_path());
+        assert_eq!(times_scanned(gone.as_std_path()), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_file_changed_after_its_scan_is_queued_again() {
+        let path = aged_truncated_file("listing_changed.mcap");
+        let key = path.as_std_path();
+        let (_, scanning) = read_mcap_info_for_listing(&path).unwrap();
+        assert!(scanning);
+        assert_true_duration(&listing_when_scanned(&path));
+
+        let mut buf = recording_across_step(mcap::WriteOptions::new().chunk_size(Some(1024)), true);
+        buf.truncate(buf.len() / 2);
+        std::fs::write(&path, &buf).unwrap();
+        set_age(&path, Duration::from_secs(30));
+        let (_, scanning) = read_mcap_info_for_listing(&path).unwrap();
+        assert!(scanning, "the changed file is queued again");
+        assert_eq!(times_enqueued(key), 2);
+        let info = listing_when_scanned(&path);
+        assert!(info.topics["/camera/h264"].message_count < 200);
+        assert_eq!(times_scanned(key), 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn listing_does_not_queue_complete_or_in_progress_files() {
         let buf = recording_across_step(mcap::WriteOptions::new().chunk_size(Some(1024)), true);

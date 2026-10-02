@@ -1276,6 +1276,50 @@ mod tests {
         }
     }
 
+    /// With `clock_sync`: 10 s of 10 Hz camera, a 20.1 s unrecorded pause,
+    /// 2 s of camera, a recorded forward step, then 10 s of camera.
+    /// Returns the finished and the truncated file.
+    fn pause_then_recorded_step() -> [Vec<u8>; 2] {
+        let options = mcap::WriteOptions::new().chunk_size(Some(1024));
+        let mut writer: TestWriter =
+            mcap::Writer::with_options(Cursor::new(Vec::new()), options).unwrap();
+        write_clock_sync(&mut writer);
+        let camera = writer
+            .add_channel(0, "/camera/h264", "cdr", &BTreeMap::new())
+            .unwrap();
+        let mut sequence = 0;
+        for i in 0..100 {
+            write(&mut writer, camera, &mut sequence, T0 + i * S / 10);
+        }
+        for i in 0..20 {
+            write(&mut writer, camera, &mut sequence, T0 + 30 * S + i * S / 10);
+        }
+        let metadata = BTreeMap::from([("step_ns".to_string(), STEP.to_string())]);
+        writer
+            .write_metadata(&Metadata {
+                name: CLOCK_STEP_METADATA.into(),
+                metadata,
+            })
+            .unwrap();
+        for i in 0..100 {
+            let t = T0 + 32 * S + STEP as u64 + i * S / 10;
+            write(&mut writer, camera, &mut sequence, t);
+        }
+        writer.finish().unwrap();
+        let buf = writer.into_inner().into_inner();
+        let truncated = buf[..buf.len() - 8].to_vec();
+        [buf, truncated]
+    }
+
+    #[test]
+    fn recorded_step_soon_after_a_pause_is_not_absorbed_by_it() {
+        for buf in pause_then_recorded_step() {
+            let info = read_mcap_info_bytes(&buf).unwrap();
+            assert_eq!(info.clock_steps, 1);
+            assert!((info.duration_s - 41.8).abs() < 1e-6, "{}", info.duration_s);
+        }
+    }
+
     #[test]
     fn low_rate_topic_spans_its_own_messages_across_chunks() {
         // About 2 s of data per chunk: far coarser than the 1 Hz topic's

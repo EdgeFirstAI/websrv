@@ -101,7 +101,7 @@ pub struct TimelineAccumulator {
     earlier: Option<Span>,
     last: Option<Span>,
     /// The jump that opened the current segment, when gap-detected; a record
-    /// arriving soon after describes that same jump.
+    /// of about the same size arriving soon after describes that same jump.
     gap: Option<Gap>,
     /// The segment closed most recently, kept so an excursion can re-open it.
     previous: Option<Closed>,
@@ -123,7 +123,19 @@ enum GapKind {
 struct Gap {
     /// Log time of the first span after the jump.
     at: u64,
+    /// Signed size of the jump, from the end of the span before it.
+    jump: i128,
     kind: GapKind,
+}
+
+impl Gap {
+    /// Whether `step` describes this jump: it arrives within [`STEP_GAP_NS`]
+    /// of data after the jump and differs from it by at most [`STEP_GAP_NS`].
+    fn described_by(self, step: &ClockStep, last: Option<Span>) -> bool {
+        let since = last.map_or(0, |l| l.end_ns.saturating_sub(self.at));
+        let mismatch = self.jump - i128::from(step.step_ns);
+        since <= STEP_GAP_NS && mismatch.unsigned_abs() <= u128::from(STEP_GAP_NS)
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -160,6 +172,7 @@ impl TimelineAccumulator {
                 }
                 self.gap = Some(Gap {
                     at: span.start_ns,
+                    jump: gap,
                     kind,
                 });
             }
@@ -174,10 +187,12 @@ impl TimelineAccumulator {
         }
     }
 
+    /// Records a clock step. A step that describes the gap-detected jump
+    /// opening the current segment confirms that jump as a step; any other
+    /// closes the current segment as a step of its own.
     pub fn clock_step(&mut self, step: &ClockStep) {
         if let Some(gap) = self.gap {
-            let since = self.last.map_or(0, |l| l.end_ns.saturating_sub(gap.at));
-            if since <= STEP_GAP_NS {
+            if gap.described_by(step, self.last) {
                 self.gap = None;
                 if gap.kind != GapKind::Step {
                     self.clock_steps += 1;
@@ -817,6 +832,38 @@ mod tests {
         let t = run_synced(&items);
         assert_eq!(t.clock_steps, 0);
         assert_eq!(t.duration_ns, 2 * (10 * S - S / 10));
+    }
+
+    /// Ten 1 s spans, a 20 s unrecorded pause, two 1 s spans, then a
+    /// recorded forward step of `step_ns` and ten more 1 s spans.
+    fn pause_then_recorded_step(step_ns: i64) -> Vec<Item> {
+        let mut items = one_second_chunks(T0, 10);
+        let resume = PRE_END + 20 * S;
+        items.extend(one_second_chunks(resume, 2));
+        items.push(Item::Step(step_ns));
+        items.extend(one_second_chunks(resume + 2 * S + step_ns as u64, 10));
+        items
+    }
+
+    #[test]
+    fn record_after_an_unrelated_pause_is_its_own_step_when_authoritative() {
+        let t = run_synced(&pause_then_recorded_step(STEP));
+        assert_eq!(t.clock_steps, 1);
+        let before = PRE_END + 20 * S + 2 * S - S / 10 - T0;
+        assert_eq!(t.duration_ns, before + (10 * S - S / 10));
+    }
+
+    #[test]
+    fn record_not_matching_a_gap_is_a_separate_step() {
+        for step_ns in [STEP, 2 * S as i64] {
+            let t = run(&pause_then_recorded_step(step_ns));
+            assert_eq!(t.clock_steps, 2, "step {step_ns}");
+            assert_eq!(
+                t.duration_ns,
+                2 * (10 * S - S / 10) + (2 * S - S / 10),
+                "step {step_ns}"
+            );
+        }
     }
 
     #[test]

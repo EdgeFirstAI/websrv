@@ -125,9 +125,9 @@ enum Source {
     Linear { complete: bool },
 }
 
-/// Files whose summary lacks chunk indexes, or counts Metadata records
-/// without indexing them, need the data section to place clock steps, so
-/// they are scanned like files without a summary.
+/// Files whose summary lacks statistics or chunk indexes, or counts Metadata
+/// records without indexing them, are scanned like files without a summary;
+/// any summary means the file is complete.
 fn classify(buf: &[u8]) -> Source {
     match Summary::read(buf) {
         Ok(Some(summary)) if summary.stats.is_some() => {
@@ -139,6 +139,7 @@ fn classify(buf: &[u8]) -> Source {
                 Source::Summary(info_from_summary(buf, &summary))
             }
         }
+        Ok(Some(_)) => Source::Linear { complete: true },
         _ => Source::Linear { complete: false },
     }
 }
@@ -1254,11 +1255,10 @@ mod tests {
         // Create a summary-less file with a clock step
         let options = mcap::WriteOptions::new()
             .chunk_size(Some(1024))
-            .emit_statistics(false)
-            .emit_chunk_indexes(false)
-            .emit_metadata_indexes(false)
+            .emit_summary_records(false)
             .emit_summary_offsets(false);
         let buf = recording_across_step(options, false);
+        assert!(Summary::read(&buf).unwrap().is_none());
 
         // Test (a): freshly written file → in-progress guard returns empty
         let temp_dir = std::env::temp_dir();
@@ -1485,6 +1485,29 @@ mod tests {
         assert!(info.topics["/camera/h264"].message_count < 200);
         assert_eq!(times_scanned(key), 2);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_fresh_file_with_a_summary_but_no_statistics_is_complete() {
+        let options = mcap::WriteOptions::new()
+            .chunk_size(Some(1024))
+            .emit_statistics(false);
+        let buf = recording_across_step(options, true);
+        let summary = Summary::read(&buf).unwrap().unwrap();
+        assert!(summary.stats.is_none());
+        let path = scratch_file("fresh_without_statistics.mcap", &buf);
+        let info = read_mcap_info(&path).unwrap();
+        assert_true_duration(&info);
+        assert_eq!(info.clock_steps, 1);
+
+        let listed = scratch_file("fresh_without_statistics_listed.mcap", &buf);
+        let (_, scanning) = read_mcap_info_for_listing(&listed).unwrap();
+        assert!(
+            scanning,
+            "a complete file is scanned, not held back as recording"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&listed);
     }
 
     #[test]

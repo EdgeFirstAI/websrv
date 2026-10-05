@@ -1,7 +1,7 @@
 {
   "bomFormat": "CycloneDX",
   "specVersion": "1.6",
-  "serialNumber": "urn:uuid:aecaf0e7-eeb9-40ef-8e8d-437e99776ad1",
+  "serialNumber": "urn:uuid:fe2269e6-1044-4c00-87d7-a3157c24e8ef",
   "version": 1,
   "metadata": {
     "tools": [
@@ -14,7 +14,7 @@
     "component": {
       "type": "application",
       "name": "edgefirst-websrv",
-      "version": "4.2.0",
+      "version": "4.3.0",
       "licenses": [
         {
           "license": {
@@ -22,7 +22,7 @@
           }
         }
       ],
-      "bom-ref": "path+file:///home/sebastien/Software/Maivin/websrv#edgefirst-websrv@4.2.0"
+      "bom-ref": "path+file:///home/sebastien/Software/Maivin/websrv#edgefirst-websrv@4.3.0"
     }
   },
   "components": [
@@ -17542,7 +17542,7 @@
   ],
   "dependencies": [
     {
-      "ref": "path+file:///home/sebastien/Software/Maivin/websrv#edgefirst-websrv@4.2.0",
+      "ref": "path+file:///home/sebastien/Software/Maivin/websrv#edgefirst-websrv@4.3.0",
       "dependsOn": [
         "registry+https://github.com/rust-lang/crates.io-index#anyhow@1.0.104",
         "registry+https://github.com/rust-lang/crates.io-index#async-stream@0.3.6",

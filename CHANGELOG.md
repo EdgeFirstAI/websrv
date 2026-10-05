@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.3.0] - 2026-10-05
+
 ### Fixed
 
 - Recording duration and per-topic FPS in the recordings list exclude wall-clock steps taken during the recording. Files from recorders that write `clock_sync` metadata take steps only from their `clock_step` metadata, so a pause in the data still counts toward the duration; older files fall back to detecting jumps over 5 s.
@@ -17,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `clock_steps` in each `/api/recordings` file entry: the number of clock steps excluded from the duration.
 - `scanning` in each `/api/recordings` file entry: `true` while a recording without a summary is being scanned in the background, so the listing no longer waits for it; re-request the listing for the result.
+
+### Changed
+
+- Updated all dependencies to their latest releases, including the major upgrades axum-server 0.8, mcap 0.25, sysinfo 0.39 and tower-http 0.7, and zenoh 1.10, edgefirst-client 2.16, tokio 1.53 and rustls 0.23.45. With tower-http 0.7 the web UI's static files carry `ETag` validators and answer conditional requests with `304 Not Modified`.
 
 ## [4.2.0] - 2026-09-07
 
@@ -255,3 +261,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Added security policy and vulnerability reporting process
 - Sanitized authentication error messages to prevent information leakage
+
+[Unreleased]: https://github.com/EdgeFirstAI/websrv/compare/v4.3.0...HEAD
+[4.3.0]: https://github.com/EdgeFirstAI/websrv/compare/v4.2.0...v4.3.0

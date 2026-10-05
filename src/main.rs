@@ -446,7 +446,7 @@ async fn main() -> anyhow::Result<()> {
         Some(listener) => {
             listener.set_nonblocking(true)?;
             info!("Using socket-activated HTTPS listener");
-            axum_server::from_tcp_rustls(listener, tls_config)
+            axum_server::from_tcp_rustls(listener, tls_config)?
         }
         None => {
             let addr: std::net::SocketAddr = format!("[::]:{}", https_port).parse()?;

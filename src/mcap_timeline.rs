@@ -308,7 +308,10 @@ impl TimelineAccumulator {
 
     /// Joins the previous segment to the open one across a recorded step
     /// with `paused` of extra time beside it, moving the previous segment by
-    /// `step_ns` into the open segment's clock.
+    /// `step_ns` into the open segment's clock. The joined segment has no
+    /// pending gap: the gap that opened the previous segment was on the old
+    /// clock. Without a previous segment, `paused` counts in the duration
+    /// only.
     fn join_across_step(&mut self, step_ns: i64, paused: u64) {
         let Some(previous) = self.previous.take() else {
             self.total_ns = self.total_ns.saturating_add(paused);
@@ -321,7 +324,7 @@ impl TimelineAccumulator {
             .map_or(previous.last, |e| e.merge(previous.last))
             .shifted(i128::from(step_ns));
         self.earlier = Some(self.earlier.map_or(before, |e| e.merge(before)));
-        self.gap = previous.gap;
+        self.gap = None;
     }
 
     /// Joins the open segment to the previous one when a tentative pause opened it.
@@ -1199,6 +1202,29 @@ mod tests {
             segments: 1,
         };
         assert_eq!(totals[&9], one_side);
+    }
+
+    #[test]
+    fn a_record_after_a_join_closes_its_own_segment() {
+        // A: 10 s. Unrecorded backward jump of 19.9 s (a split) to B: 10 s.
+        // A 20 s pause around a recorded −1 h step to C: 12 s. A later −1 h
+        // record, then D: 10 s on the new clock.
+        let mut items = one_second_chunks(T0, 10);
+        items.extend(one_second_chunks(T0 - 10 * S, 10));
+        let c = T0 - S / 10 + 20 * S - HOUR as u64;
+        items.extend(one_second_chunks(c, 2));
+        items.push(Item::Step(-HOUR));
+        items.extend(one_second_chunks(c + 2 * S, 10));
+        items.push(Item::Step(-HOUR));
+        items.extend(one_second_chunks(c + 12 * S - HOUR as u64, 10));
+        let t = run_synced(&items);
+        assert_eq!(t.clock_steps, 2);
+        // A, then B + the 20 s pause + C joined, then D.
+        let joined = (10 * S - S / 10) + 20 * S + (12 * S - S / 10);
+        assert_eq!(
+            t.duration_ns,
+            (10 * S - S / 10) + joined + (10 * S - S / 10)
+        );
     }
 
     #[test]

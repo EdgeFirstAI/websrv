@@ -7,9 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.4.0] - 2026-10-05
+
 ### Added
 
 - `GET /api/topics/status` reports which topics are publishing. websrv samples the `/api/rt` topics the web UI uses at start-up and every 10 s, holding each subscriber only until its first sample or for at most 2 s, and also counts samples forwarded by open `/api/rt` bridges. Each topic reports `available` (seen within the last 15 s) and `last_seen_ms` (`null` before the first sighting), and the response gives `refresh_ms` and `last_cycle_ms`. The optional `topics=a,b` parameter limits the response to those topics and adds unknown ones to the sampled set until they go 60 s unrequested; wildcards and the admin space are rejected with `400`. Rate and bandwidth metrics are planned once zero-copy shared-memory publishing makes continuous subscription cheap.
+
+### Changed
+
+- Updated edgefirst-client to 2.16.1 and refreshed locked dependencies.
 
 ## [4.3.0] - 2026-10-05
 
@@ -266,5 +272,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added security policy and vulnerability reporting process
 - Sanitized authentication error messages to prevent information leakage
 
-[Unreleased]: https://github.com/EdgeFirstAI/websrv/compare/v4.3.0...HEAD
+[Unreleased]: https://github.com/EdgeFirstAI/websrv/compare/v4.4.0...HEAD
+[4.4.0]: https://github.com/EdgeFirstAI/websrv/compare/v4.3.0...v4.4.0
 [4.3.0]: https://github.com/EdgeFirstAI/websrv/compare/v4.2.0...v4.3.0

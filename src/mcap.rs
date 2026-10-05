@@ -29,7 +29,7 @@ use tokio_util::io::ReaderStream;
 
 use crate::config::read_storage_directory;
 use crate::mcap_timeline::{
-    ChannelExtent, ChannelSpans, ClockStep, Span, Timeline, TimelineAccumulator,
+    leak_split, ChannelExtent, ChannelSpans, ClockStep, Span, Timeline, TimelineAccumulator,
     CLOCK_STEP_METADATA, CLOCK_STEP_TOPIC, CLOCK_SYNC_METADATA, STEP_GAP_NS,
 };
 
@@ -466,26 +466,27 @@ fn feed_entries(
         TimelineAccumulator::default()
     };
     let mut spans = ChannelSpans::default();
-    let mut push_points = |acc: &mut TimelineAccumulator, times: &[(u64, u16)]| {
-        for &(t, channel) in times {
-            let point = Span {
-                start_ns: t,
-                end_ns: t,
-            };
-            acc.push(point);
-            spans.push(acc.segment(), channel, point);
-        }
-    };
     // Unexpanded chunks holding each channel, per segment, in file order.
     let mut holding: HashMap<(usize, u16), Vec<&ChunkIndex>> = HashMap::new();
-    for entry in entries {
+    let mut entries = entries.iter().peekable();
+    while let Some(entry) = entries.next() {
+        let next_step = match entries.peek() {
+            Some(Entry::Step(step)) => Some(*step),
+            _ => None,
+        };
         let chunk = match entry {
             Entry::Step(step) => {
                 acc.clock_step(step);
                 continue;
             }
             Entry::Messages(times) => {
-                push_points(&mut acc, times);
+                match next_step {
+                    Some(step) => {
+                        entries.next();
+                        push_across_step(&mut acc, &mut spans, times, &step);
+                    }
+                    None => push_points(&mut acc, &mut spans, times),
+                }
                 continue;
             }
             Entry::Chunk(chunk) => chunk.as_ref(),
@@ -501,16 +502,30 @@ fn feed_entries(
             start_ns: chunk.message_start_time,
             end_ns: chunk.message_end_time,
         };
+        // The chunk before a record may hold post-step messages, and one
+        // spanning more than the gap threshold may hold a step itself: both
+        // are resolved to their messages.
         let straddles = span.end_ns.saturating_sub(span.start_ns) > STEP_GAP_NS;
-        match straddles.then(|| chunk_message_times(buf, chunk)).flatten() {
-            Some(times) => push_points(&mut acc, &times),
-            None => {
+        let times = (straddles || next_step.is_some())
+            .then(|| chunk_message_times(buf, chunk))
+            .flatten();
+        match (times, next_step) {
+            (Some(times), Some(step)) => {
+                entries.next();
+                push_across_step(&mut acc, &mut spans, &times, &step);
+            }
+            (Some(times), None) => push_points(&mut acc, &mut spans, &times),
+            (None, _) => {
                 acc.push(span);
                 for channel in chunk.message_index_offsets.keys() {
                     holding
                         .entry((acc.segment(), *channel))
                         .or_default()
                         .push(chunk);
+                }
+                if let Some(step) = next_step {
+                    entries.next();
+                    acc.clock_step_after_unresolved(&step);
                 }
             }
         }
@@ -531,6 +546,32 @@ fn feed_entries(
         }
     }
     acc.finish_with_spans(spans)
+}
+
+/// Pushes each `(log_time, channel)` as a point, in order.
+fn push_points(acc: &mut TimelineAccumulator, spans: &mut ChannelSpans, times: &[(u64, u16)]) {
+    for &(t, channel) in times {
+        let point = Span {
+            start_ns: t,
+            end_ns: t,
+        };
+        acc.push(point);
+        spans.push(acc.segment(), channel, point);
+    }
+}
+
+/// Pushes the messages written before `step`'s record, placing any that
+/// were taken after the step on the far side of it.
+fn push_across_step(
+    acc: &mut TimelineAccumulator,
+    spans: &mut ChannelSpans,
+    times: &[(u64, u16)],
+    step: &ClockStep,
+) {
+    let (before, after) = times.split_at(leak_split(times, step.step_ns).unwrap_or(times.len()));
+    push_points(acc, spans, before);
+    acc.clock_step(step);
+    push_points(acc, spans, after);
 }
 
 fn channel_counts<'a>(
@@ -1913,6 +1954,102 @@ mod tests {
             let info = read_mcap_info_bytes(&buf).unwrap();
             assert_eq!(info.clock_steps, 1);
             assert!((info.duration_s - 41.9).abs() < 1e-6, "{}", info.duration_s);
+        }
+    }
+
+    /// 10 s of 10 Hz camera and radar (radar 50 ms later), a clock step of
+    /// `step_ns`, then 10 s more of both. The first `leaked` post-step
+    /// frames are written before the step's record, in the same chunk as
+    /// the last pre-step frames. Returns the finished and the truncated file.
+    fn leak_across_step(
+        options: mcap::WriteOptions,
+        clock_sync: bool,
+        step_ns: i64,
+        leaked: u64,
+    ) -> [Vec<u8>; 2] {
+        let mut writer: TestWriter =
+            mcap::Writer::with_options(Cursor::new(Vec::new()), options).unwrap();
+        if clock_sync {
+            write_clock_sync(&mut writer);
+        }
+        let camera = writer
+            .add_channel(0, "/camera/h264", "cdr", &BTreeMap::new())
+            .unwrap();
+        let radar = writer
+            .add_channel(0, "/radar/targets", "cdr", &BTreeMap::new())
+            .unwrap();
+        let mut sequence = 0;
+        let mut frame = |writer: &mut TestWriter, t: u64| {
+            write(writer, camera, &mut sequence, t);
+            write(writer, radar, &mut sequence, t + S / 20);
+        };
+        for i in 0..100 {
+            frame(&mut writer, T0 + i * S / 10);
+        }
+        let after = (T0 + 10 * S).checked_add_signed(step_ns).unwrap();
+        for j in 0..leaked {
+            frame(&mut writer, after + j * S / 10);
+        }
+        let metadata = BTreeMap::from([("step_ns".to_string(), step_ns.to_string())]);
+        writer
+            .write_metadata(&Metadata {
+                name: CLOCK_STEP_METADATA.into(),
+                metadata,
+            })
+            .unwrap();
+        for j in leaked..100 {
+            frame(&mut writer, after + j * S / 10);
+        }
+        writer.finish().unwrap();
+        let buf = writer.into_inner().into_inner();
+        let truncated = buf[..buf.len() - 8].to_vec();
+        [buf, truncated]
+    }
+
+    /// Two runs of 10 s: 9.95 s each from camera to radar, 9.9 s per topic.
+    fn assert_leak_resolved(info: &McapInfo, what: &str) {
+        assert_eq!(info.clock_steps, 1, "{what}");
+        assert!(
+            (info.duration_s - 19.9).abs() < 1e-6,
+            "{what}: duration {}",
+            info.duration_s
+        );
+        for topic in ["/camera/h264", "/radar/targets"] {
+            let t = &info.topics[topic];
+            assert_eq!(t.message_count, 200, "{what} {topic}");
+            assert!(
+                (t.video_length - 19.8).abs() < 1e-6,
+                "{what} {topic} span {}",
+                t.video_length
+            );
+            assert!(
+                (t.average_fps - 10.0).abs() < 1e-6,
+                "{what} {topic} fps {}",
+                t.average_fps
+            );
+        }
+    }
+
+    #[test]
+    fn leaked_post_step_messages_are_split_at_message_precision() {
+        let chunked = mcap::WriteOptions::new().chunk_size(Some(1024));
+        let one_chunk = mcap::WriteOptions::new().chunk_size(Some(1 << 20));
+        let hour = 3_600 * S as i64;
+        let cases = [
+            ("+2 s", chunked.clone(), false, 2 * S as i64),
+            ("-2 s", chunked.clone(), false, -2 * S as i64),
+            ("+2 s clock_sync", chunked.clone(), true, 2 * S as i64),
+            ("+STEP", chunked.clone(), false, STEP),
+            ("+STEP clock_sync", chunked.clone(), true, STEP),
+            ("-1 h clock_sync", chunked, true, -hour),
+            ("+2 s expanded", one_chunk.clone(), false, 2 * S as i64),
+            ("-2 s expanded", one_chunk, true, -2 * S as i64),
+        ];
+        for (name, options, clock_sync, step_ns) in cases {
+            let [buf, truncated] = leak_across_step(options, clock_sync, step_ns, 3);
+            assert_leak_resolved(&read_mcap_info_bytes(&buf).unwrap(), name);
+            let what = format!("{name} truncated");
+            assert_leak_resolved(&read_mcap_info_bytes(&truncated).unwrap(), &what);
         }
     }
 

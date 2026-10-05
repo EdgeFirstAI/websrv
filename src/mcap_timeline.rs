@@ -204,7 +204,23 @@ impl TimelineAccumulator {
     /// closes the current segment as a step of its own. When records are
     /// authoritative, a pause found in the jump beside the step counts toward
     /// the duration; otherwise the whole jump is excluded, as for any gap.
+    ///
+    /// Spans pushed before the step must hold only pre-step data; see
+    /// [`leak_split`] for separating post-step messages written before the
+    /// record.
     pub fn clock_step(&mut self, step: &ClockStep) {
+        self.record_step(step, false);
+    }
+
+    /// Records a clock step after a span whose messages could not be
+    /// resolved, so it may hold post-step data. When that span is at least
+    /// as long as the step, its end is moved back by the step's size, which
+    /// assumes the post-step data closes the span.
+    pub fn clock_step_after_unresolved(&mut self, step: &ClockStep) {
+        self.record_step(step, true);
+    }
+
+    fn record_step(&mut self, step: &ClockStep, trim_last: bool) {
         if let Some(gap) = self.gap {
             if let Some(paused) = gap.described_by(step, self.last) {
                 self.gap = None;
@@ -219,7 +235,7 @@ impl TimelineAccumulator {
             self.settle_pause();
         }
         self.gap = None;
-        self.close(Some(step.step_ns.unsigned_abs()));
+        self.close(trim_last.then(|| step.step_ns.unsigned_abs()));
         self.clock_steps += 1;
     }
 
@@ -294,15 +310,18 @@ impl TimelineAccumulator {
         self.gap = previous.gap;
     }
 
-    fn close(&mut self, step_abs: Option<u64>) {
+    /// Closes the open segment; its duration is its merged extent. `trim`
+    /// moves the end of the last span back by that much first, when the
+    /// span is at least that long.
+    fn close(&mut self, trim: Option<u64>) {
         let earlier = self.earlier.take();
-        let Some(last) = self.last.take() else {
+        let Some(mut last) = self.last.take() else {
             return;
         };
-        let duration_ns = match step_abs {
-            Some(step) if last.len() >= step => earlier.map_or(0, Span::len) + (last.len() - step),
-            _ => earlier.map_or(last, |e| e.merge(last)).len(),
-        };
+        if let Some(trim) = trim.filter(|&t| last.len() >= t) {
+            last.end_ns -= trim;
+        }
+        let duration_ns = earlier.map_or(last, |e| e.merge(last)).len();
         self.total_ns = self.total_ns.saturating_add(duration_ns);
         self.previous = Some(Closed {
             segment: self.segment,
@@ -314,6 +333,26 @@ impl TimelineAccumulator {
         self.next_segment += 1;
         self.segment = self.next_segment;
     }
+}
+
+/// Index of the first post-step message among `times`, `(log_time,
+/// channel)` in file order, when post-step messages were written before the
+/// step's record. The split is the consecutive pair whose `log_time`
+/// difference best matches `step_ns`: within [`STEP_GAP_NS`] of it and closer
+/// to it than to no change. `None` when no pair qualifies; ties go to the
+/// latest pair.
+pub fn leak_split(times: &[(u64, u16)], step_ns: i64) -> Option<usize> {
+    times
+        .windows(2)
+        .enumerate()
+        .filter_map(|(i, pair)| {
+            let delta = i128::from(pair[1].0) - i128::from(pair[0].0);
+            let miss = (delta - i128::from(step_ns)).unsigned_abs();
+            (miss <= u128::from(STEP_GAP_NS) && miss < delta.unsigned_abs())
+                .then_some((miss, i + 1))
+        })
+        .min_by_key(|&(miss, i)| (miss, std::cmp::Reverse(i)))
+        .map(|(_, i)| i)
 }
 
 /// A channel's `log_time` extent summed over the timeline segments it appears in.
@@ -402,6 +441,9 @@ mod tests {
             match *item {
                 Item::Span(start_ns, end_ns) => acc.push(Span { start_ns, end_ns }),
                 Item::Step(step_ns) => acc.clock_step(&ClockStep { offset: 0, step_ns }),
+                Item::UnresolvedStep(step_ns) => {
+                    acc.clock_step_after_unresolved(&ClockStep { offset: 0, step_ns });
+                }
             }
         }
         acc.finish()
@@ -410,6 +452,8 @@ mod tests {
     enum Item {
         Span(u64, u64),
         Step(i64),
+        /// A step whose preceding span's messages could not be resolved.
+        UnresolvedStep(i64),
     }
 
     fn one_second_chunks(start: u64, count: u64) -> Vec<Item> {
@@ -476,17 +520,49 @@ mod tests {
             T0 + 9 * S,
             T0 + 9 * S + S / 2 + STEP as u64 + S / 5,
         ));
-        items.push(Item::Step(STEP));
+        items.push(Item::UnresolvedStep(STEP));
         items.extend(one_second_chunks(T0 + 10 * S + STEP as u64, 10));
         let t = run(&items);
-        let expected = (9 * S - S / 10) + (S / 2 + S / 5) + (10 * S - S / 10);
-        let error = t.duration_ns.abs_diff(expected);
-        assert!(
-            error < S,
-            "duration {} expected ≈{}",
-            t.duration_ns,
-            expected
-        );
+        // The trimmed last chunk ends at T0 + 9.7 s, so the first segment
+        // is its merged extent [T0, T0 + 9.7 s].
+        assert_eq!(t.duration_ns, (9 * S + 7 * S / 10) + (10 * S - S / 10));
+    }
+
+    #[test]
+    fn chunk_level_leak_correction_keeps_the_merged_extent() {
+        // The last chunk holds 2 s of post-step time; trimming it leaves
+        // [T0 + 4 s, T0 + 6.5 s], which overlaps the earlier [T0, T0 + 5 s].
+        let overlap = [
+            Item::Span(T0, T0 + 5 * S),
+            Item::Span(T0 + 4 * S, T0 + 8 * S + S / 2),
+            Item::UnresolvedStep(2 * S as i64),
+        ];
+        assert_eq!(run(&overlap).duration_ns, 6 * S + S / 2);
+        // A 1 s gap before the last chunk is part of the segment.
+        let gap = [
+            Item::Span(T0, T0 + 5 * S),
+            Item::Span(T0 + 6 * S, T0 + 9 * S + S / 2),
+            Item::UnresolvedStep(2 * S as i64),
+        ];
+        assert_eq!(run(&gap).duration_ns, 7 * S + S / 2);
+    }
+
+    #[test]
+    fn leak_split_finds_the_step_in_file_order() {
+        let frames = |start: u64, n: u64| (0..n).map(move |i| (start + i * S / 10, 1u16));
+        let two = 2 * S as i64;
+        let leaked: Vec<_> = frames(T0, 10).chain(frames(T0 + S + 2 * S, 3)).collect();
+        assert_eq!(leak_split(&leaked, two), Some(10));
+        let back: Vec<_> = frames(T0, 10).chain(frames(T0 + S - 2 * S, 3)).collect();
+        assert_eq!(leak_split(&back, -two), Some(10));
+        let none: Vec<_> = frames(T0, 13).collect();
+        assert_eq!(leak_split(&none, two), None);
+        assert_eq!(leak_split(&leaked, -two), None, "opposite direction");
+        let big: Vec<_> = frames(T0, 10)
+            .chain(frames(T0 + S + STEP as u64, 3))
+            .collect();
+        assert_eq!(leak_split(&big, STEP), Some(10));
+        assert_eq!(leak_split(&big, two), None, "a jump far from the step");
     }
 
     #[test]

@@ -58,6 +58,15 @@ impl Span {
         self.end_ns.saturating_sub(self.start_ns)
     }
 
+    /// The span moved by `offset_ns`, saturating at the ends of the range.
+    fn shifted(self, offset_ns: i128) -> Span {
+        let shift = |t: u64| (i128::from(t) + offset_ns).clamp(0, i128::from(u64::MAX)) as u64;
+        Span {
+            start_ns: shift(self.start_ns),
+            end_ns: shift(self.end_ns),
+        }
+    }
+
     fn merge(self, other: Span) -> Span {
         Span {
             start_ns: self.start_ns.min(other.start_ns),
@@ -105,8 +114,9 @@ pub struct TimelineAccumulator {
     gap: Option<Gap>,
     /// The segment closed most recently, kept so an excursion can re-open it.
     previous: Option<Closed>,
-    /// Segments joined to an earlier one across a pause, as `(from, into)`.
-    merged: Vec<(usize, usize)>,
+    /// Segments joined to another across a pause, as `(from, into,
+    /// offset_ns)`: `from`'s spans move by `offset_ns` into `into`'s clock.
+    merged: Vec<(usize, usize, i64)>,
     /// Stray excursions dropped when the segment before them was re-opened.
     abandoned: Vec<usize>,
 }
@@ -202,8 +212,11 @@ impl TimelineAccumulator {
     /// Records a clock step. A step that describes the gap-detected jump
     /// opening the current segment confirms that jump as a step; any other
     /// closes the current segment as a step of its own. When records are
-    /// authoritative, a pause found in the jump beside the step counts toward
-    /// the duration; otherwise the whole jump is excluded, as for any gap.
+    /// authoritative, a pause found in the jump beside the step joins the
+    /// segments on either side, as an ordinary pause does, with the earlier
+    /// one moved by the step into the later one's clock, so the pause counts
+    /// toward the duration and toward each topic's span. Otherwise the whole
+    /// jump is excluded, as for any gap.
     ///
     /// Spans pushed before the step must hold only pre-step data; see
     /// [`leak_split`] for separating post-step messages written before the
@@ -227,8 +240,8 @@ impl TimelineAccumulator {
                 if gap.kind != GapKind::Step {
                     self.clock_steps += 1;
                 }
-                if self.authoritative {
-                    self.total_ns = self.total_ns.saturating_add(paused);
+                if self.authoritative && paused > 0 {
+                    self.join_across_step(step.step_ns, paused);
                 }
                 return;
             }
@@ -288,6 +301,24 @@ impl TimelineAccumulator {
         true
     }
 
+    /// Joins the previous segment to the open one across a recorded step
+    /// with `paused` of extra time beside it, moving the previous segment by
+    /// `step_ns` into the open segment's clock.
+    fn join_across_step(&mut self, step_ns: i64, paused: u64) {
+        let Some(previous) = self.previous.take() else {
+            self.total_ns = self.total_ns.saturating_add(paused);
+            return;
+        };
+        self.total_ns = self.total_ns.saturating_sub(previous.duration_ns);
+        self.merged.push((previous.segment, self.segment, step_ns));
+        let before = previous
+            .earlier
+            .map_or(previous.last, |e| e.merge(previous.last))
+            .shifted(i128::from(step_ns));
+        self.earlier = Some(self.earlier.map_or(before, |e| e.merge(before)));
+        self.gap = previous.gap;
+    }
+
     /// Joins the open segment to the previous one when a tentative pause opened it.
     fn settle_pause(&mut self) {
         let Some(Gap {
@@ -301,7 +332,7 @@ impl TimelineAccumulator {
             return;
         };
         self.total_ns = self.total_ns.saturating_sub(previous.duration_ns);
-        self.merged.push((self.segment, previous.segment));
+        self.merged.push((self.segment, previous.segment, 0));
         self.segment = previous.segment;
         let before = previous
             .earlier
@@ -382,20 +413,25 @@ impl ChannelSpans {
     }
 
     /// Sums each channel's spans, first joining the spans of each segment
-    /// in `merged` (`(from, into)` pairs) to the segment it was joined to.
-    /// Spans in `abandoned` segments are dropped; a channel seen only there
-    /// has an empty extent.
+    /// in `merged` (`(from, into, offset_ns)`) to the segment it was joined
+    /// to, moved by the offsets along the way. Spans in `abandoned` segments
+    /// are dropped; a channel seen only there has an empty extent.
     fn finish_merged(
         self,
-        merged: &[(usize, usize)],
+        merged: &[(usize, usize, i64)],
         abandoned: &[usize],
     ) -> HashMap<u16, ChannelExtent> {
-        let into: HashMap<usize, usize> = merged.iter().copied().collect();
+        let into: HashMap<usize, (usize, i64)> = merged
+            .iter()
+            .map(|&(from, into, offset)| (from, (into, offset)))
+            .collect();
         let canonical = |mut segment: usize| {
-            while let Some(&next) = into.get(&segment) {
+            let mut offset = 0i128;
+            while let Some(&(next, step)) = into.get(&segment) {
                 segment = next;
+                offset += i128::from(step);
             }
-            segment
+            (segment, offset)
         };
         let mut totals: HashMap<u16, ChannelExtent> = HashMap::new();
         let mut joined: HashMap<(usize, u16), Span> = HashMap::new();
@@ -404,8 +440,10 @@ impl ChannelSpans {
                 totals.entry(channel).or_default();
                 continue;
             }
+            let (segment, offset) = canonical(segment);
+            let span = span.shifted(offset);
             joined
-                .entry((canonical(segment), channel))
+                .entry((segment, channel))
                 .and_modify(|s| *s = s.merge(span))
                 .or_insert(span);
         }
@@ -775,10 +813,32 @@ mod tests {
         spans.push(2, 7, span(T0, T0 + S));
         spans.push(2, 9, span(T0, T0 + S));
         spans.push(3, 7, span(T0 + 5 * S, T0 + 6 * S));
-        let totals = spans.finish_merged(&[(3, 2)], &[]);
+        let totals = spans.finish_merged(&[(3, 2, 0)], &[]);
         assert_eq!(totals[&7].segments, 2);
         assert_eq!(totals[&7].span_ns, 3 * S + 6 * S);
         assert_eq!(totals[&9].segments, 1);
+    }
+
+    #[test]
+    fn channel_spans_move_by_the_offsets_along_a_join_chain() {
+        let span = |start_ns: u64, end_ns: u64| Span { start_ns, end_ns };
+        let mut spans = ChannelSpans::default();
+        spans.push(0, 7, span(T0, T0 + S));
+        spans.push(1, 7, span(T0 + 30 * S, T0 + 31 * S));
+        spans.push(
+            2,
+            7,
+            span(T0 + 40 * S + HOUR as u64, T0 + 41 * S + HOUR as u64),
+        );
+        // 1 joins 0 across a pause; 0 joins 2 across a +1 h step.
+        let totals = spans.finish_merged(&[(1, 0, 0), (0, 2, HOUR)], &[]);
+        assert_eq!(
+            totals[&7],
+            ChannelExtent {
+                span_ns: 41 * S,
+                segments: 1
+            }
+        );
     }
 
     #[test]
@@ -1031,6 +1091,51 @@ mod tests {
             );
             assert_eq!(totals[&9], ChannelExtent::default(), "strays {strays}");
         }
+    }
+
+    #[test]
+    fn pause_beside_a_recorded_step_joins_channel_spans() {
+        let point = |t: u64| Span {
+            start_ns: t,
+            end_ns: t,
+        };
+        let resume = T0 + 30 * S + STEP as u64;
+        let mut acc = TimelineAccumulator::with_authoritative_records();
+        let mut spans = ChannelSpans::default();
+        let mut feed = |acc: &mut TimelineAccumulator, channel: u16, t: u64| {
+            acc.push(point(t));
+            spans.push(acc.segment(), channel, point(t));
+        };
+        for i in 0..100 {
+            feed(&mut acc, 7, T0 + i * S / 10);
+        }
+        for i in 0..20 {
+            feed(&mut acc, 7, resume + i * S / 10);
+            feed(&mut acc, 9, resume + i * S / 10);
+        }
+        acc.clock_step(&ClockStep {
+            offset: 0,
+            step_ns: STEP,
+        });
+        for i in 20..120 {
+            feed(&mut acc, 7, resume + i * S / 10);
+            feed(&mut acc, 9, resume + i * S / 10);
+        }
+        let (timeline, totals) = acc.finish_with_spans(spans);
+        // 9.9 s, a 20.1 s pause, 11.9 s.
+        let duration = 41 * S + 9 * S / 10;
+        assert_eq!(timeline.clock_steps, 1);
+        assert_eq!(timeline.duration_ns, duration);
+        let both_sides = ChannelExtent {
+            span_ns: duration,
+            segments: 1,
+        };
+        assert_eq!(totals[&7], both_sides);
+        let one_side = ChannelExtent {
+            span_ns: 11 * S + 9 * S / 10,
+            segments: 1,
+        };
+        assert_eq!(totals[&9], one_side);
     }
 
     #[test]

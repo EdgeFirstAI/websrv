@@ -252,6 +252,11 @@ impl TimelineAccumulator {
         self.clock_steps += 1;
     }
 
+    /// End of the most recent span of the open segment.
+    pub fn last_end(&self) -> Option<u64> {
+        self.last.map(|l| l.end_ns)
+    }
+
     /// Index of the segment the next span belongs to.
     pub fn segment(&self) -> usize {
         self.segment
@@ -368,7 +373,9 @@ impl TimelineAccumulator {
 
 /// Index of the first post-step message among `times`, `(log_time,
 /// channel)` in file order, when post-step messages were written before the
-/// step's record. `after` is the first `log_time` following the record.
+/// step's record. `before` is the end of the data preceding `times`; it
+/// takes part in pairs, so a leak starting at the first message (split 0)
+/// is found. `after` is the first `log_time` following the record.
 ///
 /// There is a leak only when the data after the record continues the time
 /// base of the last message here, `e`: `|after − e| < |after − e − step_ns|`.
@@ -378,8 +385,18 @@ impl TimelineAccumulator {
 /// trailing run of messages within [`STEP_GAP_NS`] of `e` are considered, as
 /// a leak is no older than the record's write latency. `None` when there is
 /// no leak; without `after`, only the pairs decide.
-pub fn leak_split(times: &[(u64, u16)], step_ns: i64, after: Option<u64>) -> Option<usize> {
+pub fn leak_split(
+    times: &[(u64, u16)],
+    step_ns: i64,
+    before: Option<u64>,
+    after: Option<u64>,
+) -> Option<usize> {
     let e = i128::from(times.last()?.0);
+    let sentinel = usize::from(before.is_some());
+    let points: Vec<u64> = before
+        .into_iter()
+        .chain(times.iter().map(|&(t, _)| t))
+        .collect();
     let step = i128::from(step_ns);
     if let Some(after) = after.map(i128::from) {
         if (after - e).unsigned_abs() >= (after - e - step).unsigned_abs() {
@@ -387,19 +404,19 @@ pub fn leak_split(times: &[(u64, u16)], step_ns: i64, after: Option<u64>) -> Opt
         }
     }
     let near = |t: u64| (i128::from(t) - e).unsigned_abs() <= u128::from(STEP_GAP_NS);
-    let tail = times.len() - times.iter().rev().take_while(|p| near(p.0)).count();
-    times
+    let tail = points.len() - points.iter().rev().take_while(|&&t| near(t)).count();
+    points
         .windows(2)
         .enumerate()
         .skip(tail.saturating_sub(1))
         .filter_map(|(i, pair)| {
-            let delta = i128::from(pair[1].0) - i128::from(pair[0].0);
+            let delta = i128::from(pair[1]) - i128::from(pair[0]);
             let miss = (delta - step).unsigned_abs();
             (miss <= u128::from(STEP_GAP_NS) && miss < delta.unsigned_abs())
                 .then_some((miss, i + 1))
         })
         .min_by_key(|&(miss, i)| (miss, std::cmp::Reverse(i)))
-        .map(|(_, i)| i)
+        .map(|(_, i)| i - sentinel)
 }
 
 /// A channel's `log_time` extent summed over the timeline segments it appears in.
@@ -606,18 +623,22 @@ mod tests {
         let frames = |start: u64, n: u64| (0..n).map(move |i| (start + i * S / 10, 1u16));
         let two = 2 * S as i64;
         let leaked: Vec<_> = frames(T0, 10).chain(frames(T0 + S + 2 * S, 3)).collect();
-        assert_eq!(leak_split(&leaked, two, None), Some(10));
+        assert_eq!(leak_split(&leaked, two, None, None), Some(10));
         let back: Vec<_> = frames(T0, 10).chain(frames(T0 + S - 2 * S, 3)).collect();
-        assert_eq!(leak_split(&back, -two, None), Some(10));
+        assert_eq!(leak_split(&back, -two, None, None), Some(10));
         let none: Vec<_> = frames(T0, 13).collect();
-        assert_eq!(leak_split(&none, two, None), None);
-        assert_eq!(leak_split(&leaked, -two, None), None, "opposite direction");
+        assert_eq!(leak_split(&none, two, None, None), None);
+        assert_eq!(
+            leak_split(&leaked, -two, None, None),
+            None,
+            "opposite direction"
+        );
         let big: Vec<_> = frames(T0, 10)
             .chain(frames(T0 + S + STEP as u64, 3))
             .collect();
-        assert_eq!(leak_split(&big, STEP, None), Some(10));
+        assert_eq!(leak_split(&big, STEP, None, None), Some(10));
         assert_eq!(
-            leak_split(&big, two, None),
+            leak_split(&big, two, None, None),
             None,
             "a jump far from the step"
         );
@@ -625,15 +646,24 @@ mod tests {
         // A 3 s dropout and no leak: the data after the record is 2 s on.
         let dropout: Vec<_> = frames(T0, 20).chain(frames(T0 + 5 * S, 10)).collect();
         let next = T0 + 5 * S + 9 * S / 10 + 2 * S + S / 10;
-        assert_eq!(leak_split(&dropout, two, None), Some(20), "pairs alone");
-        assert_eq!(leak_split(&dropout, two, Some(next)), None);
         assert_eq!(
-            leak_split(&leaked, two, Some(T0 + S + 2 * S + 3 * S / 10)),
+            leak_split(&dropout, two, None, None),
+            Some(20),
+            "pairs alone"
+        );
+        assert_eq!(leak_split(&dropout, two, None, Some(next)), None);
+        assert_eq!(
+            leak_split(&leaked, two, None, Some(T0 + S + 2 * S + 3 * S / 10)),
             Some(10)
         );
+        // The leak starts at the first message: the pair with the end of the
+        // preceding data gives split 0.
+        let post: Vec<_> = frames(T0 + S + 2 * S, 3).collect();
+        assert_eq!(leak_split(&post, two, Some(T0 + 9 * S / 10), None), Some(0));
+        assert_eq!(leak_split(&post, two, None, None), None);
         // A dropout outside the trailing window is not a candidate.
         let old: Vec<_> = frames(T0, 10).chain(frames(T0 + 4 * S, 70)).collect();
-        assert_eq!(leak_split(&old, two, None), None);
+        assert_eq!(leak_split(&old, two, None, None), None);
     }
 
     #[test]

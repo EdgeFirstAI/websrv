@@ -593,7 +593,7 @@ fn push_across_step(
     step: &ClockStep,
     resumes: Option<u64>,
 ) {
-    let split = leak_split(times, step.step_ns, resumes).unwrap_or(times.len());
+    let split = leak_split(times, step.step_ns, acc.last_end(), resumes).unwrap_or(times.len());
     let (before, after) = times.split_at(split);
     push_points(acc, spans, before);
     acc.clock_step(step);
@@ -2012,6 +2012,19 @@ mod tests {
         step_ns: i64,
         leaked: u64,
     ) -> [Vec<u8>; 2] {
+        leak_across_step_with(options, clock_sync, step_ns, leaked, false)
+    }
+
+    /// As [`leak_across_step`]; with `own_chunk`, an unrelated Metadata
+    /// record before the leaked frames closes the pre-step chunk, so the
+    /// chunk before the step's record holds only post-step frames.
+    fn leak_across_step_with(
+        options: mcap::WriteOptions,
+        clock_sync: bool,
+        step_ns: i64,
+        leaked: u64,
+        own_chunk: bool,
+    ) -> [Vec<u8>; 2] {
         let mut writer: TestWriter =
             mcap::Writer::with_options(Cursor::new(Vec::new()), options).unwrap();
         if clock_sync {
@@ -2032,6 +2045,14 @@ mod tests {
             frame(&mut writer, T0 + i * S / 10);
         }
         let after = (T0 + 10 * S).checked_add_signed(step_ns).unwrap();
+        if own_chunk {
+            writer
+                .write_metadata(&Metadata {
+                    name: "chunk_break".into(),
+                    metadata: BTreeMap::new(),
+                })
+                .unwrap();
+        }
         for j in 0..leaked {
             frame(&mut writer, after + j * S / 10);
         }
@@ -2092,6 +2113,32 @@ mod tests {
         ];
         for (name, options, clock_sync, step_ns) in cases {
             let [buf, truncated] = leak_across_step(options, clock_sync, step_ns, 3);
+            assert_leak_resolved(&read_mcap_info_bytes(&buf).unwrap(), name);
+            let what = format!("{name} truncated");
+            assert_leak_resolved(&read_mcap_info_bytes(&truncated).unwrap(), &what);
+        }
+    }
+
+    #[test]
+    fn a_chunk_of_only_post_step_messages_is_split_at_its_start() {
+        let chunked = mcap::WriteOptions::new().chunk_size(Some(1024));
+        let cases = [
+            ("+2 s", false, 2 * S as i64),
+            ("-2 s", false, -2 * S as i64),
+            ("+2 s clock_sync", true, 2 * S as i64),
+            ("+STEP", false, STEP),
+        ];
+        for (name, clock_sync, step_ns) in cases {
+            let [buf, truncated] =
+                leak_across_step_with(chunked.clone(), clock_sync, step_ns, 3, true);
+            let summary = Summary::read(&buf).unwrap().unwrap();
+            let mut chunks = summary.chunk_indexes.clone();
+            chunks.sort_by_key(|c| c.chunk_start_offset);
+            let after = (T0 + 10 * S).checked_add_signed(step_ns).unwrap();
+            assert!(
+                chunks.iter().any(|c| c.message_start_time == after),
+                "{name}: the leaked frames start a chunk"
+            );
             assert_leak_resolved(&read_mcap_info_bytes(&buf).unwrap(), name);
             let what = format!("{name} truncated");
             assert_leak_resolved(&read_mcap_info_bytes(&truncated).unwrap(), &what);

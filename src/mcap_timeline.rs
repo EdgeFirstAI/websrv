@@ -368,17 +368,33 @@ impl TimelineAccumulator {
 
 /// Index of the first post-step message among `times`, `(log_time,
 /// channel)` in file order, when post-step messages were written before the
-/// step's record. The split is the consecutive pair whose `log_time`
-/// difference best matches `step_ns`: within [`STEP_GAP_NS`] of it and closer
-/// to it than to no change. `None` when no pair qualifies; ties go to the
-/// latest pair.
-pub fn leak_split(times: &[(u64, u16)], step_ns: i64) -> Option<usize> {
+/// step's record. `after` is the first `log_time` following the record.
+///
+/// There is a leak only when the data after the record continues the time
+/// base of the last message here, `e`: `|after − e| < |after − e − step_ns|`.
+/// The split is then the consecutive pair whose `log_time` difference best
+/// matches `step_ns`: within [`STEP_GAP_NS`] of it and closer to it than to
+/// no change, ties going to the latest pair. Only pairs ending in the
+/// trailing run of messages within [`STEP_GAP_NS`] of `e` are considered, as
+/// a leak is no older than the record's write latency. `None` when there is
+/// no leak; without `after`, only the pairs decide.
+pub fn leak_split(times: &[(u64, u16)], step_ns: i64, after: Option<u64>) -> Option<usize> {
+    let e = i128::from(times.last()?.0);
+    let step = i128::from(step_ns);
+    if let Some(after) = after.map(i128::from) {
+        if (after - e).unsigned_abs() >= (after - e - step).unsigned_abs() {
+            return None;
+        }
+    }
+    let near = |t: u64| (i128::from(t) - e).unsigned_abs() <= u128::from(STEP_GAP_NS);
+    let tail = times.len() - times.iter().rev().take_while(|p| near(p.0)).count();
     times
         .windows(2)
         .enumerate()
+        .skip(tail.saturating_sub(1))
         .filter_map(|(i, pair)| {
             let delta = i128::from(pair[1].0) - i128::from(pair[0].0);
-            let miss = (delta - i128::from(step_ns)).unsigned_abs();
+            let miss = (delta - step).unsigned_abs();
             (miss <= u128::from(STEP_GAP_NS) && miss < delta.unsigned_abs())
                 .then_some((miss, i + 1))
         })
@@ -590,17 +606,34 @@ mod tests {
         let frames = |start: u64, n: u64| (0..n).map(move |i| (start + i * S / 10, 1u16));
         let two = 2 * S as i64;
         let leaked: Vec<_> = frames(T0, 10).chain(frames(T0 + S + 2 * S, 3)).collect();
-        assert_eq!(leak_split(&leaked, two), Some(10));
+        assert_eq!(leak_split(&leaked, two, None), Some(10));
         let back: Vec<_> = frames(T0, 10).chain(frames(T0 + S - 2 * S, 3)).collect();
-        assert_eq!(leak_split(&back, -two), Some(10));
+        assert_eq!(leak_split(&back, -two, None), Some(10));
         let none: Vec<_> = frames(T0, 13).collect();
-        assert_eq!(leak_split(&none, two), None);
-        assert_eq!(leak_split(&leaked, -two), None, "opposite direction");
+        assert_eq!(leak_split(&none, two, None), None);
+        assert_eq!(leak_split(&leaked, -two, None), None, "opposite direction");
         let big: Vec<_> = frames(T0, 10)
             .chain(frames(T0 + S + STEP as u64, 3))
             .collect();
-        assert_eq!(leak_split(&big, STEP), Some(10));
-        assert_eq!(leak_split(&big, two), None, "a jump far from the step");
+        assert_eq!(leak_split(&big, STEP, None), Some(10));
+        assert_eq!(
+            leak_split(&big, two, None),
+            None,
+            "a jump far from the step"
+        );
+
+        // A 3 s dropout and no leak: the data after the record is 2 s on.
+        let dropout: Vec<_> = frames(T0, 20).chain(frames(T0 + 5 * S, 10)).collect();
+        let next = T0 + 5 * S + 9 * S / 10 + 2 * S + S / 10;
+        assert_eq!(leak_split(&dropout, two, None), Some(20), "pairs alone");
+        assert_eq!(leak_split(&dropout, two, Some(next)), None);
+        assert_eq!(
+            leak_split(&leaked, two, Some(T0 + S + 2 * S + 3 * S / 10)),
+            Some(10)
+        );
+        // A dropout outside the trailing window is not a candidate.
+        let old: Vec<_> = frames(T0, 10).chain(frames(T0 + 4 * S, 70)).collect();
+        assert_eq!(leak_split(&old, two, None), None);
     }
 
     #[test]

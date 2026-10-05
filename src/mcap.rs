@@ -468,12 +468,15 @@ fn feed_entries(
     let mut spans = ChannelSpans::default();
     // Unexpanded chunks holding each channel, per segment, in file order.
     let mut holding: HashMap<(usize, u16), Vec<&ChunkIndex>> = HashMap::new();
-    let mut entries = entries.iter().peekable();
-    while let Some(entry) = entries.next() {
+    let all = entries;
+    let mut entries = entries.iter().enumerate().peekable();
+    while let Some((index, entry)) = entries.next() {
         let next_step = match entries.peek() {
-            Some(Entry::Step(step)) => Some(*step),
+            Some((_, Entry::Step(step))) => Some(*step),
             _ => None,
         };
+        // First log time of the data after that record.
+        let resumes = || next_step.and_then(|_| first_log_time(&all[index + 2..]));
         let chunk = match entry {
             Entry::Step(step) => {
                 acc.clock_step(step);
@@ -483,7 +486,7 @@ fn feed_entries(
                 match next_step {
                     Some(step) => {
                         entries.next();
-                        push_across_step(&mut acc, &mut spans, times, &step);
+                        push_across_step(&mut acc, &mut spans, times, &step, resumes());
                     }
                     None => push_points(&mut acc, &mut spans, times),
                 }
@@ -512,7 +515,7 @@ fn feed_entries(
         match (times, next_step) {
             (Some(times), Some(step)) => {
                 entries.next();
-                push_across_step(&mut acc, &mut spans, &times, &step);
+                push_across_step(&mut acc, &mut spans, &times, &step, resumes());
             }
             (Some(times), None) => push_points(&mut acc, &mut spans, &times),
             (None, _) => {
@@ -560,15 +563,38 @@ fn push_points(acc: &mut TimelineAccumulator, spans: &mut ChannelSpans, times: &
     }
 }
 
+/// First `log_time` of the data in `entries`, up to the next record.
+fn first_log_time(entries: &[Entry]) -> Option<u64> {
+    for entry in entries {
+        match entry {
+            Entry::Step(_) => return None,
+            Entry::Messages(times) => {
+                if let Some(&(t, _)) = times.first() {
+                    return Some(t);
+                }
+            }
+            Entry::Chunk(chunk) => {
+                if !chunk.message_index_offsets.is_empty() || chunk.message_end_time != 0 {
+                    return Some(chunk.message_start_time);
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Pushes the messages written before `step`'s record, placing any that
-/// were taken after the step on the far side of it.
+/// were taken after the step on the far side of it. `resumes` is the first
+/// log time after the record.
 fn push_across_step(
     acc: &mut TimelineAccumulator,
     spans: &mut ChannelSpans,
     times: &[(u64, u16)],
     step: &ClockStep,
+    resumes: Option<u64>,
 ) {
-    let (before, after) = times.split_at(leak_split(times, step.step_ns).unwrap_or(times.len()));
+    let split = leak_split(times, step.step_ns, resumes).unwrap_or(times.len());
+    let (before, after) = times.split_at(split);
     push_points(acc, spans, before);
     acc.clock_step(step);
     push_points(acc, spans, after);
@@ -2069,6 +2095,64 @@ mod tests {
             assert_leak_resolved(&read_mcap_info_bytes(&buf).unwrap(), name);
             let what = format!("{name} truncated");
             assert_leak_resolved(&read_mcap_info_bytes(&truncated).unwrap(), &what);
+        }
+    }
+
+    /// 10 Hz camera from T0 to T0 + 9.9 s with a 3 s dropout after 5 s, a
+    /// +2 s step whose record is written before any post-step frame, then
+    /// 10 s more. Returns the finished and the truncated file.
+    fn dropout_before_record(options: mcap::WriteOptions) -> [Vec<u8>; 2] {
+        let mut writer: TestWriter =
+            mcap::Writer::with_options(Cursor::new(Vec::new()), options).unwrap();
+        let camera = writer
+            .add_channel(0, "/camera/h264", "cdr", &BTreeMap::new())
+            .unwrap();
+        let mut sequence = 0;
+        for i in (0..=50).chain(81..100) {
+            write(&mut writer, camera, &mut sequence, T0 + i * S / 10);
+        }
+        let metadata = BTreeMap::from([("step_ns".to_string(), (2 * S).to_string())]);
+        writer
+            .write_metadata(&Metadata {
+                name: CLOCK_STEP_METADATA.into(),
+                metadata,
+            })
+            .unwrap();
+        for j in 0..100 {
+            write(&mut writer, camera, &mut sequence, T0 + 12 * S + j * S / 10);
+        }
+        writer.finish().unwrap();
+        let buf = writer.into_inner().into_inner();
+        let truncated = buf[..buf.len() - 8].to_vec();
+        [buf, truncated]
+    }
+
+    #[test]
+    fn a_dropout_before_an_unleaked_record_is_not_taken_for_the_step() {
+        let one_chunk = mcap::WriteOptions::new().chunk_size(Some(1 << 20));
+        let unchunked = mcap::WriteOptions::new().use_chunks(false);
+        for (name, options) in [("one chunk", one_chunk), ("unchunked", unchunked)] {
+            for buf in dropout_before_record(options) {
+                let info = read_mcap_info_bytes(&buf).unwrap();
+                assert_eq!(info.clock_steps, 1, "{name}");
+                assert!(
+                    (info.duration_s - 19.8).abs() < 1e-6,
+                    "{name}: duration {}",
+                    info.duration_s
+                );
+                let camera = &info.topics["/camera/h264"];
+                assert_eq!(camera.message_count, 170, "{name}");
+                assert!(
+                    (camera.video_length - 19.8).abs() < 1e-6,
+                    "{name}: span {}",
+                    camera.video_length
+                );
+                assert!(
+                    (camera.average_fps - 168.0 / 19.8).abs() < 1e-9,
+                    "{name}: fps {}",
+                    camera.average_fps
+                );
+            }
         }
     }
 

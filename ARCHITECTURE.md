@@ -223,31 +223,34 @@ sequenceDiagram
 
 ### Topic Availability
 
-`GET /api/topics/status?topics=radar/targets,lidar/points` tells the web UI whether topics are publishing, so it can offer an overlay only when its data is there. It is served in both system and user mode. Zenoh cannot list remote publishers and the EdgeFirst services declare no liveliness tokens, and a publisher may run outside systemd, so availability means samples arrived recently, observed by websrv.
+`GET /api/topics/status` tells the web UI whether topics are publishing, so it can offer an overlay only when its data is there. It is served in both system and user mode. Zenoh cannot list remote publishers, the EdgeFirst services declare no liveliness tokens, and a publisher may run outside systemd, so availability means a sample was seen recently.
+
+A Zenoh subscriber receives every sample on its key, and the services publish without shared memory, so a continuous subscription would copy each topic's full stream into websrv (up to 1.7 MB point clouds at 10 Hz for `lidar/points`). websrv therefore samples instead:
+
+- At start-up and then every 10 s (`REFRESH`), a background task declares one subscriber per sampled topic, all at once. Each callback only stores the arrival time in an atomic and wakes the task, which undeclares that subscriber at the first sample or when the 2 s `SAMPLE_WINDOW` ends. No subscriber stays declared between cycles, and cycles never overlap.
+- The sampled set starts with `BUILTIN_TOPICS`, the `/api/rt` keys the web UI uses: `camera/h264` and its `tl`/`tr`/`bl`/`br` tiles, `camera/info`, `model/output`, `model/info`, `lidar/points`, `lidar/clusters`, `radar/targets`, `radar/clusters`, `fusion/lidar`, `fusion/radar`, `imu`, `gps` and `tf_static`. `camera/frame` and `radar/cube` are left out but can be requested.
+- A requested topic outside that list is added and sampled straight away, between cycles, then dropped 60 s after its last request. Built-in topics never expire. At most 64 topics are sampled; a new request evicts the least recently requested topic.
+- While an `/api/rt/<topic>` WebSocket bridge is open for a sampled topic, every sample it forwards updates the topic's last-seen time with an atomic store, and the cycle skips that topic.
+
+Rate and bandwidth metrics are planned once zero-copy shared-memory publishing makes continuous subscription cheap.
 
 Request:
 
-- `topics` is a comma-separated list of the application keys used in `/api/rt/<topic>`, mapped to Zenoh keys the same way. Blank entries and repeated names are ignored.
-- At most 16 topics per request and 256 bytes per topic.
-- `*`, `$`, `@`, `?` and `#` are rejected, so a client cannot make websrv subscribe to wildcards or the admin space. Keys must be valid Zenoh key expressions.
-- A missing, empty or invalid `topics` returns `400` with `{"error": "..."}`.
+- `topics` is optional. Without it, every sampled topic is returned, keyed by its key.
+- With it, `topics` is a comma-separated list of the application keys used in `/api/rt/<topic>`, mapped to Zenoh keys the same way. The response is keyed by the requested names. Blank entries and repeated names are ignored.
+- At most 16 topics per request and 256 bytes per topic. `*`, `$`, `@`, `?` and `#` are rejected, so a client cannot make websrv subscribe to wildcards or the admin space. Keys must be valid Zenoh key expressions.
+- An empty or invalid `topics` returns `400` with `{"error": "..."}`.
 
-Response `200 application/json`, keyed by the requested names:
+Response `200 application/json`:
 
 ```json
-{ "topics": { "radar/targets": { "available": true, "age_ms": 55 }, "lidar/points": { "available": false, "age_ms": null } } }
+{ "refresh_ms": 10000, "last_cycle_ms": 3120, "topics": { "radar/targets": { "available": true, "last_seen_ms": 3150 }, "lidar/points": { "available": false, "last_seen_ms": null } } }
 ```
 
-- `age_ms` is the milliseconds since the last sample on the key, or `null` if none has arrived since websrv began watching it.
-- `available` is `age_ms != null && age_ms <= 3000` (`AVAILABILITY_THRESHOLD`).
-- The first request for a topic starts watching it and returns `available: false, age_ms: null`; clients poll (the web UI every 2 s) and the next poll reflects reality.
-
-Server side (`src/topics.rs`):
-
-- `TopicWatches` holds one Zenoh subscriber per watched key on the shared session. Its callback stores only the arrival time in an atomic; the payload is never read, copied or forwarded. Repeated requests reuse the subscriber.
-- At most 64 keys are watched; adding one beyond that evicts the least recently queried.
-- A watch not queried for 60 s is dropped, undeclaring its subscriber. A background task sweeps every 10 s rather than cleaning up on requests, because once clients stop polling no request would arrive to trigger cleanup and an idle subscriber on a high-rate topic would keep receiving every sample.
-- Watching a key costs about as much Zenoh delivery as receiving it: every sample still reaches websrv, it is just not read. This is the same exposure as `/api/rt/<topic>`, which any client can already open for any key, without the copy and the forwarding to the browser.
+- `last_seen_ms` is the milliseconds since the topic's last sample, seen by sampling or through a bridge, or `null` if none has been seen since start-up.
+- `available` is `last_seen_ms != null && last_seen_ms <= 15000` (`AVAILABILITY_WINDOW` = `REFRESH` + `SAMPLE_WINDOW` + 3 s), so a topic stays available until it misses a full cycle.
+- `last_cycle_ms` is the milliseconds since the last completed cycle started, or `null` before the first completes. `refresh_ms` is the cycle period.
+- A newly requested topic reports `available: false, last_seen_ms: null` until it has been sampled.
 
 ## MCAP Management
 

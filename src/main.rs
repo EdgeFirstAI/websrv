@@ -39,7 +39,10 @@ use edgefirst_websrv::{
     shutdown::ShutdownCoordinator,
     storage::{check_storage_availability, StorageContext},
     studio::{list_project_labels, list_studio_projects, StudioContext},
-    topics::{topic_status_handler, TopicStatusContext, TopicWatches},
+    topics::{
+        topic_status_handler, BridgeObserver, LivenessConfig, TopicLiveness, TopicStatusContext,
+        BUILTIN_TOPICS,
+    },
     upload::{
         cancel_upload_handler, get_upload_handler, list_uploads_handler, start_upload_handler,
         UploadContext, UploadManager,
@@ -62,7 +65,7 @@ pub struct ServerContext {
     pub zenoh_session: zenoh::Session,
     pub shutdown_coordinator: ShutdownCoordinator,
     pub process: Mutex<Option<std::process::Child>>,
-    pub topic_watches: Arc<TopicWatches>,
+    pub topic_liveness: Arc<TopicLiveness>,
 }
 
 impl AuthContext for ServerContext {
@@ -125,11 +128,15 @@ impl WebSocketContext for ServerContext {
     fn shutdown_token(&self) -> Option<tokio_util::sync::CancellationToken> {
         Some(self.shutdown_coordinator.token())
     }
+
+    fn bridge_observer(&self, topic: &str) -> Option<BridgeObserver> {
+        self.topic_liveness.bridge(topic)
+    }
 }
 
 impl TopicStatusContext for ServerContext {
-    fn topic_watches(&self) -> &Arc<TopicWatches> {
-        &self.topic_watches
+    fn topic_liveness(&self) -> &Arc<TopicLiveness> {
+        &self.topic_liveness
     }
 }
 
@@ -280,7 +287,7 @@ fn common_routes(ctx: Arc<ServerContext>) -> Router {
         .route("/api/ws/uploads", get(websocket_handler_uploads))
         // WebSocket: Zenoh real-time topic bridge
         .route("/api/rt/{*topic}", get(websocket_handler::<ServerContext>))
-        // Topic availability: recent samples on Zenoh keys
+        // Topic liveliness: periodic sampling of Zenoh keys
         .route(
             "/api/topics/status",
             get(topic_status_handler::<ServerContext>),
@@ -405,8 +412,11 @@ async fn main() -> anyhow::Result<()> {
     // Create shutdown coordinator for graceful shutdown
     let shutdown_coordinator = ShutdownCoordinator::new();
 
-    let topic_watches = Arc::new(TopicWatches::default());
-    let topic_sweeper = topic_watches.spawn_sweeper(shutdown_coordinator.token());
+    let topic_liveness = Arc::new(TopicLiveness::new(
+        BUILTIN_TOPICS,
+        LivenessConfig::default(),
+    ));
+    let topic_sampler = topic_liveness.spawn(zenoh_session.clone(), shutdown_coordinator.token());
 
     // Build server context
     let ctx = Arc::new(ServerContext {
@@ -417,7 +427,7 @@ async fn main() -> anyhow::Result<()> {
         zenoh_session: zenoh_session.clone(),
         shutdown_coordinator: shutdown_coordinator.clone(),
         process: Mutex::new(None),
-        topic_watches: topic_watches.clone(),
+        topic_liveness,
     });
 
     // Build TLS config from PEM bytes.
@@ -509,8 +519,7 @@ async fn main() -> anyhow::Result<()> {
         info!("Cancelled {} active upload(s)", cancelled);
     }
 
-    topic_sweeper.abort();
-    topic_watches.clear();
+    topic_sampler.abort();
 
     info!("Closing Zenoh session...");
     if let Err(e) = zenoh_session.close().await {

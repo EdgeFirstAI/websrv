@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `GET /api/topics/status?topics=a,b` reports whether each topic is publishing: `available` is `true` when a sample arrived within the last 3 s, and `age_ms` gives the time since the last sample, or `null` before one is seen. The first request for a topic starts watching it and reports it unavailable, so clients poll. Topics are the `/api/rt/<topic>` keys; wildcards and the admin space are rejected with `400`. Watched topics not queried for 60 s are released.
+- `GET /api/topics/status` reports which topics are publishing. websrv samples the `/api/rt` topics the web UI uses at start-up and every 10 s, holding each subscriber only until its first sample or for at most 2 s, and also counts samples forwarded by open `/api/rt` bridges. Each topic reports `available` (seen within the last 15 s) and `last_seen_ms` (`null` before the first sighting), and the response gives `refresh_ms` and `last_cycle_ms`. The optional `topics=a,b` parameter limits the response to those topics and adds unknown ones to the sampled set until they go 60 s unrequested; wildcards and the admin space are rejected with `400`. Rate and bandwidth metrics are planned once zero-copy shared-memory publishing makes continuous subscription cheap.
 
 ## [4.3.0] - 2026-10-05
 

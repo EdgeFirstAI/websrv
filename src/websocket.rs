@@ -18,6 +18,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, oneshot};
 use tokio_util::sync::CancellationToken;
+
+use crate::topics::BridgeObserver;
 use yawc::{
     frame::{Frame, OpCode},
     IncomingUpgrade, Options,
@@ -100,12 +102,14 @@ impl MessageStream {
 /// * `shutdown_rx` - Per-connection shutdown signal (from WebSocket close)
 /// * `global_shutdown` - Optional global shutdown token (for server-wide shutdown)
 /// * `topic` - The Zenoh topic to subscribe to
+/// * `observer` - Records each forwarded sample as a topic sighting
 pub async fn zenoh_listener(
     video_stream: Arc<MessageStream>,
     session: zenoh::Session,
     mut shutdown_rx: oneshot::Receiver<()>,
     global_shutdown: Option<CancellationToken>,
     topic: String,
+    observer: Option<BridgeObserver>,
 ) {
     let subscriber = match session.declare_subscriber(topic.clone()).await {
         Ok(sub) => sub,
@@ -147,6 +151,9 @@ pub async fn zenoh_listener(
             sample = subscriber.recv_async() => {
                 match sample {
                     Ok(sample) => {
+                        if let Some(observer) = &observer {
+                            observer.observe();
+                        }
                         let data = sample.payload().to_bytes().to_vec();
                         video_stream.broadcast(Broadcast::Binary(data));
                     }
@@ -176,6 +183,10 @@ pub trait WebSocketContext: Send + Sync + 'static {
     /// Get the global shutdown token for graceful shutdown coordination.
     /// Returns None if graceful shutdown is not configured.
     fn shutdown_token(&self) -> Option<CancellationToken> {
+        None
+    }
+    /// Returns a sighting recorder for `topic` if its liveliness is tracked.
+    fn bridge_observer(&self, _topic: &str) -> Option<BridgeObserver> {
         None
     }
 }
@@ -262,6 +273,7 @@ pub async fn websocket_handler<T: WebSocketContext>(
 
     let zenoh_session = ctx.zenoh_session().clone();
     let global_shutdown = ctx.shutdown_token();
+    let observer = ctx.bridge_observer(&topic);
 
     let video_stream = Arc::new(MessageStream::new());
 
@@ -275,6 +287,7 @@ pub async fn websocket_handler<T: WebSocketContext>(
             shutdown_rx,
             global_shutdown,
             topic,
+            observer,
         )
         .await;
     });

@@ -92,7 +92,7 @@ async fn test_websocket_receives_zenoh_message() {
 
     match msg {
         Message::Binary(data) => {
-            assert_eq!(data.as_slice(), payload, "Payload mismatch");
+            assert_eq!(&data[..], payload, "Payload mismatch");
         }
         other => panic!("Expected binary message, got: {other:?}"),
     }

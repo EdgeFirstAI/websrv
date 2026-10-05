@@ -39,6 +39,7 @@ use edgefirst_websrv::{
     shutdown::ShutdownCoordinator,
     storage::{check_storage_availability, StorageContext},
     studio::{list_project_labels, list_studio_projects, StudioContext},
+    topics::{topic_status_handler, TopicStatusContext, TopicWatches},
     upload::{
         cancel_upload_handler, get_upload_handler, list_uploads_handler, start_upload_handler,
         UploadContext, UploadManager,
@@ -61,6 +62,7 @@ pub struct ServerContext {
     pub zenoh_session: zenoh::Session,
     pub shutdown_coordinator: ShutdownCoordinator,
     pub process: Mutex<Option<std::process::Child>>,
+    pub topic_watches: Arc<TopicWatches>,
 }
 
 impl AuthContext for ServerContext {
@@ -122,6 +124,12 @@ impl WebSocketContext for ServerContext {
 
     fn shutdown_token(&self) -> Option<tokio_util::sync::CancellationToken> {
         Some(self.shutdown_coordinator.token())
+    }
+}
+
+impl TopicStatusContext for ServerContext {
+    fn topic_watches(&self) -> &Arc<TopicWatches> {
+        &self.topic_watches
     }
 }
 
@@ -272,6 +280,11 @@ fn common_routes(ctx: Arc<ServerContext>) -> Router {
         .route("/api/ws/uploads", get(websocket_handler_uploads))
         // WebSocket: Zenoh real-time topic bridge
         .route("/api/rt/{*topic}", get(websocket_handler::<ServerContext>))
+        // Topic availability: recent samples on Zenoh keys
+        .route(
+            "/api/topics/status",
+            get(topic_status_handler::<ServerContext>),
+        )
         .with_state(ctx)
 }
 
@@ -392,6 +405,9 @@ async fn main() -> anyhow::Result<()> {
     // Create shutdown coordinator for graceful shutdown
     let shutdown_coordinator = ShutdownCoordinator::new();
 
+    let topic_watches = Arc::new(TopicWatches::default());
+    let topic_sweeper = topic_watches.spawn_sweeper(shutdown_coordinator.token());
+
     // Build server context
     let ctx = Arc::new(ServerContext {
         args: args.clone(),
@@ -401,6 +417,7 @@ async fn main() -> anyhow::Result<()> {
         zenoh_session: zenoh_session.clone(),
         shutdown_coordinator: shutdown_coordinator.clone(),
         process: Mutex::new(None),
+        topic_watches: topic_watches.clone(),
     });
 
     // Build TLS config from PEM bytes.
@@ -491,6 +508,9 @@ async fn main() -> anyhow::Result<()> {
     if cancelled > 0 {
         info!("Cancelled {} active upload(s)", cancelled);
     }
+
+    topic_sweeper.abort();
+    topic_watches.clear();
 
     info!("Closing Zenoh session...");
     if let Err(e) = zenoh_session.close().await {

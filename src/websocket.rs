@@ -206,7 +206,7 @@ fn is_precompressed_topic(topic: &str) -> bool {
 }
 
 /// Maps `/api/rt/{*topic}` path remainder to a Zenoh application key.
-fn zenoh_key_from_ws_path(topic: &str) -> String {
+pub(crate) fn zenoh_key_from_ws_path(topic: &str) -> String {
     topic
         .strip_prefix('/')
         .unwrap_or(topic)

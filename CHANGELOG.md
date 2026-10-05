@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `GET /api/topics/status?topics=a,b` reports whether each topic is publishing: `available` is `true` when a sample arrived within the last 3 s, and `age_ms` gives the time since the last sample, or `null` before one is seen. The first request for a topic starts watching it and reports it unavailable, so clients poll. Topics are the `/api/rt/<topic>` keys; wildcards and the admin space are rejected with `400`. Watched topics not queried for 60 s are released.
+
 ## [4.3.0] - 2026-10-05
 
 ### Fixed

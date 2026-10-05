@@ -221,6 +221,34 @@ sequenceDiagram
 
 **Function**: `zenoh_listener(video_stream, args, rx, topic)`
 
+### Topic Availability
+
+`GET /api/topics/status?topics=radar/targets,lidar/points` tells the web UI whether topics are publishing, so it can offer an overlay only when its data is there. It is served in both system and user mode. Zenoh cannot list remote publishers and the EdgeFirst services declare no liveliness tokens, and a publisher may run outside systemd, so availability means samples arrived recently, observed by websrv.
+
+Request:
+
+- `topics` is a comma-separated list of the application keys used in `/api/rt/<topic>`, mapped to Zenoh keys the same way. Blank entries and repeated names are ignored.
+- At most 16 topics per request and 256 bytes per topic.
+- `*`, `$`, `@`, `?` and `#` are rejected, so a client cannot make websrv subscribe to wildcards or the admin space. Keys must be valid Zenoh key expressions.
+- A missing, empty or invalid `topics` returns `400` with `{"error": "..."}`.
+
+Response `200 application/json`, keyed by the requested names:
+
+```json
+{ "topics": { "radar/targets": { "available": true, "age_ms": 55 }, "lidar/points": { "available": false, "age_ms": null } } }
+```
+
+- `age_ms` is the milliseconds since the last sample on the key, or `null` if none has arrived since websrv began watching it.
+- `available` is `age_ms != null && age_ms <= 3000` (`AVAILABILITY_THRESHOLD`).
+- The first request for a topic starts watching it and returns `available: false, age_ms: null`; clients poll (the web UI every 2 s) and the next poll reflects reality.
+
+Server side (`src/topics.rs`):
+
+- `TopicWatches` holds one Zenoh subscriber per watched key on the shared session. Its callback stores only the arrival time in an atomic; the payload is never read, copied or forwarded. Repeated requests reuse the subscriber.
+- At most 64 keys are watched; adding one beyond that evicts the least recently queried.
+- A watch not queried for 60 s is dropped, undeclaring its subscriber. A background task sweeps every 10 s rather than cleaning up on requests, because once clients stop polling no request would arrive to trigger cleanup and an idle subscriber on a high-rate topic would keep receiving every sample.
+- Watching a key costs about as much Zenoh delivery as receiving it: every sample still reaches websrv, it is just not read. This is the same exposure as `/api/rt/<topic>`, which any client can already open for any key, without the copy and the forwarding to the browser.
+
 ## MCAP Management
 
 ### File Operations
@@ -1332,6 +1360,7 @@ Intended for development, testing, or single-user installations.
 | Replay status | `systemctl is-active replay` | Check PID file |
 | Get config | Read `/etc/default/{service}` | Return `WebUISettings` JSON |
 | Set config | Write `/etc/default/{service}` | Write `/etc/default/{service}` |
+| Topic availability | `GET /api/topics/status` | `GET /api/topics/status` |
 
 ### Systemd Socket Activation
 

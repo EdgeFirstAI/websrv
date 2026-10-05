@@ -175,7 +175,10 @@ async fn startup_sampling_and_periodic_refresh() {
     assert_eq!(st.topics.len(), 2);
     let a = st.topics[&alive];
     assert!(a.available, "{a:?}");
-    assert!(a.last_seen_ms.unwrap() < 1000, "{a:?}");
+    assert!(
+        a.last_seen_ms.unwrap() <= st.last_cycle_ms.unwrap(),
+        "the sighting is no older than the start of the cycle that produced it: {st:?}"
+    );
     let s = st.topics[&silent];
     assert!(!s.available);
     assert_eq!(s.last_seen_ms, None);
@@ -342,4 +345,65 @@ async fn rejects_bad_requests() {
     }
     let listing = status(&server.base, "").await;
     assert_eq!(listing.topics.len(), 1, "rejected requests add nothing");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn extra_sampling_never_delays_the_full_cycle() {
+    let builtin = unique("builtin");
+    let config = LivenessConfig {
+        refresh: Duration::from_millis(1000),
+        sample_window: Duration::from_millis(400),
+        ..short_config()
+    };
+    let server = start_server(&[&builtin], config).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let limit = 1000 + 400 + 100;
+    let mut worst = 0;
+    let start = Instant::now();
+    let mut i = 0;
+    while start.elapsed() < Duration::from_secs(5) {
+        let fresh = unique(&format!("spam{i}"));
+        i += 1;
+        let st = status(&server.base, &format!("?topics={fresh}")).await;
+        let age = st.last_cycle_ms.expect("a cycle has completed");
+        worst = worst.max(age);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    assert!(
+        worst <= limit,
+        "last_cycle_ms reached {worst} ms; a full cycle was delayed past its deadline"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cycle_is_not_recorded_when_every_declare_fails() {
+    let session = zenoh::open(zenoh::Config::default()).await.unwrap();
+    session.close().await.unwrap();
+    let config = LivenessConfig {
+        refresh: Duration::from_millis(200),
+        sample_window: Duration::from_millis(50),
+        ..short_config()
+    };
+    let shutdown = CancellationToken::new();
+
+    let failing = Arc::new(TopicLiveness::new(
+        &["test/closed/a", "test/closed/b"],
+        config,
+    ));
+    failing.spawn(session.clone(), shutdown.clone());
+    let empty = Arc::new(TopicLiveness::new(&[], config));
+    empty.spawn(session, shutdown.clone());
+
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(
+        failing.status(None).last_cycle_ms,
+        None,
+        "no cycle counts as completed when nothing could be sampled"
+    );
+    assert!(
+        empty.status(None).last_cycle_ms.is_some(),
+        "a cycle with nothing to sample still completes"
+    );
+    shutdown.cancel();
 }

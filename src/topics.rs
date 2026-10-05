@@ -19,7 +19,7 @@ use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -425,6 +425,51 @@ impl TopicSet {
     }
 }
 
+/// Whether extra sampling can start at `now` and finish before the cycle due at `next`.
+pub fn extra_sampling_fits(now: Instant, next: Instant, window: Duration) -> bool {
+    next.checked_duration_since(now)
+        .is_some_and(|remaining| remaining >= window)
+}
+
+/// Interval between repeated warnings while sampling subscribers fail to declare.
+pub const DECLARE_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Rate limit for declare-failure warnings: the first failure, then at most
+/// one per [`DECLARE_FAILURE_LOG_INTERVAL`], and one recovery message.
+#[derive(Debug, Default)]
+pub struct DeclareFailureLog {
+    failing: bool,
+    last_warned: Option<Instant>,
+}
+
+impl DeclareFailureLog {
+    /// Records a batch with failures; returns whether to warn.
+    pub fn failed(&mut self, now: Instant) -> bool {
+        self.failing = true;
+        let due = self
+            .last_warned
+            .is_none_or(|t| now.saturating_duration_since(t) >= DECLARE_FAILURE_LOG_INTERVAL);
+        if due {
+            self.last_warned = Some(now);
+        }
+        due
+    }
+
+    /// Records a batch without failures; returns whether to report recovery.
+    pub fn succeeded(&mut self) -> bool {
+        let recovered = self.failing;
+        self.failing = false;
+        self.last_warned = None;
+        recovered
+    }
+}
+
+/// Result of sampling one batch of topics.
+struct SampleOutcome {
+    due: usize,
+    declared: usize,
+}
+
 // ============================================================================
 // Sampling
 // ============================================================================
@@ -436,6 +481,7 @@ pub struct TopicLiveness {
     /// Wakes the sampling task to cover newly requested topics.
     wake: Notify,
     active_samplers: Arc<AtomicUsize>,
+    declare_failures: Mutex<DeclareFailureLog>,
 }
 
 impl TopicLiveness {
@@ -445,6 +491,7 @@ impl TopicLiveness {
             config,
             wake: Notify::new(),
             active_samplers: Arc::new(AtomicUsize::new(0)),
+            declare_failures: Mutex::new(DeclareFailureLog::default()),
         }
     }
 
@@ -496,29 +543,62 @@ impl TopicLiveness {
     }
 
     /// Samples the due topics concurrently, each until its first sample or the window ends.
-    async fn sample(&self, session: &zenoh::Session, pending_only: bool) {
+    async fn sample(&self, session: &zenoh::Session, pending_only: bool) -> SampleOutcome {
         let due = self.lock().due(pending_only);
-        if due.is_empty() {
-            return;
+        let count = due.len();
+        if count == 0 {
+            return SampleOutcome {
+                due: 0,
+                declared: 0,
+            };
         }
-        debug!("Sampling {} topics", due.len());
+        debug!("Sampling {count} topics");
         let window = self.config.sample_window;
-        futures::future::join_all(due.into_iter().map(|(key, observer)| {
+        let results = futures::future::join_all(due.into_iter().map(|(key, observer)| {
             sample_one(session, key, observer, window, self.active_samplers.clone())
         }))
         .await;
+        let failures: Vec<String> = results.into_iter().filter_map(Result::err).collect();
+        let mut log = self
+            .declare_failures
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match failures.first() {
+            Some(first) => {
+                if log.failed(Instant::now()) {
+                    warn!(
+                        "Failed to declare {} of {count} sampling subscribers ({first}); \
+                         repeats are logged at most once a minute",
+                        failures.len()
+                    );
+                }
+            }
+            None => {
+                if log.succeeded() {
+                    info!("Sampling subscribers declare again");
+                }
+            }
+        }
+        SampleOutcome {
+            due: count,
+            declared: count - failures.len(),
+        }
     }
 
-    /// Runs one full cycle and records its start.
+    /// Runs one full cycle and records its start, unless every topic failed to declare.
     pub async fn run_cycle(&self, session: &zenoh::Session) {
         let started = Instant::now();
         self.lock().expire(started);
-        self.sample(session, false).await;
-        self.lock().cycle_completed(started);
+        let outcome = self.sample(session, false).await;
+        if outcome.due == 0 || outcome.declared > 0 {
+            self.lock().cycle_completed(started);
+        }
     }
 
     /// Spawns the sampling task: a cycle at once, then every `refresh`, with
-    /// newly requested topics sampled between cycles. Cycles never overlap.
+    /// newly requested topics sampled between cycles when that sampling can
+    /// end before the next cycle is due; otherwise the next cycle covers them.
+    /// Cycles never overlap and are never delayed by extra sampling.
     pub fn spawn(
         self: &Arc<Self>,
         session: zenoh::Session,
@@ -535,10 +615,21 @@ impl TopicLiveness {
                 let next = started + this.config.refresh;
                 loop {
                     tokio::select! {
+                        biased;
                         _ = shutdown.cancelled() => return,
                         _ = tokio::time::sleep_until(next) => break,
                         _ = this.wake.notified() => {
+                            let fits = extra_sampling_fits(
+                                Instant::now(),
+                                next.into_std(),
+                                this.config.sample_window,
+                            );
+                            if !fits {
+                                debug!("Newly requested topics wait for the next cycle");
+                                continue;
+                            }
                             tokio::select! {
+                                biased;
                                 _ = shutdown.cancelled() => return,
                                 _ = this.sample(&session, true) => {}
                             }
@@ -551,14 +642,15 @@ impl TopicLiveness {
 }
 
 /// Declares a subscriber on `key` that records the arrival time of samples,
-/// and undeclares it at the first sample or when `window` ends.
+/// and undeclares it at the first sample or when `window` ends. Returns a
+/// description of the error if the subscriber could not be declared.
 async fn sample_one(
     session: &zenoh::Session,
     key: String,
     observer: Arc<TopicObserver>,
     window: Duration,
     active: Arc<AtomicUsize>,
-) {
+) -> Result<(), String> {
     let first = Arc::new(Notify::new());
     let fired = Arc::new(AtomicBool::new(false));
     let callback = {
@@ -573,10 +665,7 @@ async fn sample_one(
     };
     let subscriber = match session.declare_subscriber(&key).callback(callback).await {
         Ok(s) => s,
-        Err(e) => {
-            warn!("Failed to sample topic {key}: {e}");
-            return;
-        }
+        Err(e) => return Err(format!("{key}: {e}")),
     };
     active.fetch_add(1, Ordering::Relaxed);
     let _ = tokio::time::timeout(window, first.notified()).await;
@@ -585,6 +674,7 @@ async fn sample_one(
     }
     active.fetch_sub(1, Ordering::Relaxed);
     observer.mark_sampled();
+    Ok(())
 }
 
 // ============================================================================
@@ -929,5 +1019,40 @@ mod tests {
         })
         .unwrap();
         assert_eq!(before_first_cycle["last_cycle_ms"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn extra_sampling_only_starts_when_it_ends_before_the_cycle_deadline() {
+        let t0 = Instant::now();
+        let window = Duration::from_secs(2);
+        let next = t0 + Duration::from_secs(10);
+        assert!(extra_sampling_fits(t0, next, window));
+        assert!(extra_sampling_fits(next - window, next, window));
+        assert!(!extra_sampling_fits(
+            next - window + Duration::from_millis(1),
+            next,
+            window
+        ));
+        assert!(!extra_sampling_fits(next, next, window));
+        assert!(!extra_sampling_fits(
+            next + Duration::from_secs(1),
+            next,
+            window
+        ));
+    }
+
+    #[test]
+    fn declare_failures_warn_first_then_once_per_interval_then_recover() {
+        let t0 = Instant::now();
+        let mut log = DeclareFailureLog::default();
+        assert!(!log.succeeded(), "no recovery without a prior failure");
+        assert!(log.failed(t0));
+        assert!(!log.failed(t0 + Duration::from_secs(10)));
+        assert!(!log.failed(t0 + DECLARE_FAILURE_LOG_INTERVAL - Duration::from_millis(1)));
+        assert!(log.failed(t0 + DECLARE_FAILURE_LOG_INTERVAL));
+        assert!(!log.failed(t0 + DECLARE_FAILURE_LOG_INTERVAL + Duration::from_secs(1)));
+        assert!(log.succeeded());
+        assert!(!log.succeeded(), "recovery is reported once");
+        assert!(log.failed(t0 + DECLARE_FAILURE_LOG_INTERVAL + Duration::from_secs(2)));
     }
 }

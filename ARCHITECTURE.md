@@ -221,6 +221,37 @@ sequenceDiagram
 
 **Function**: `zenoh_listener(video_stream, args, rx, topic)`
 
+### Topic Availability
+
+`GET /api/topics/status` tells the web UI whether topics are publishing, so it can offer an overlay only when its data is there. It is served in both system and user mode. Zenoh cannot list remote publishers, the EdgeFirst services declare no liveliness tokens, and a publisher may run outside systemd, so availability means a sample was seen recently.
+
+A Zenoh subscriber receives every sample on its key, and the services publish without shared memory, so a continuous subscription would copy each topic's full stream into websrv (up to 1.7 MB point clouds at 10 Hz for `lidar/points`). websrv therefore samples instead:
+
+- At start-up and then every 10 s (`REFRESH`), a background task declares one subscriber per sampled topic, all at once. Each callback only stores the arrival time in an atomic and wakes the task, which undeclares that subscriber at the first sample or when the 2 s `SAMPLE_WINDOW` ends. No subscriber stays declared between cycles, and cycles never overlap. A cycle counts as completed for `last_cycle_ms` only if at least one subscriber could be declared, or if there was nothing to sample. Declare failures are logged on the first occurrence and then at most once a minute, with an info message on recovery.
+- The sampled set starts with `BUILTIN_TOPICS`, the `/api/rt` keys the web UI uses: `camera/h264` and its `tl`/`tr`/`bl`/`br` tiles, `camera/info`, `model/output`, `model/info`, `lidar/points`, `lidar/clusters`, `radar/targets`, `radar/clusters`, `fusion/lidar`, `fusion/radar`, `imu`, `gps` and `tf_static`. `camera/frame` and `radar/cube` are left out but can be requested.
+- A requested topic outside that list is added and sampled straight away, between cycles, if that sampling can finish before the next cycle is due; otherwise the next cycle covers it, so a full cycle is never delayed. It is dropped 60 s after its last request. Built-in topics never expire. At most 64 topics are sampled; a new request evicts the least recently requested topic.
+- While an `/api/rt/<topic>` WebSocket bridge is open for a sampled topic, every sample it forwards updates the topic's last-seen time with an atomic store, and the cycle skips that topic.
+
+Rate and bandwidth metrics are planned once zero-copy shared-memory publishing makes continuous subscription cheap.
+
+Request:
+
+- `topics` is optional. Without it, every sampled topic is returned, keyed by its key.
+- With it, `topics` is a comma-separated list of the application keys used in `/api/rt/<topic>`, mapped to Zenoh keys the same way. The response is keyed by the requested names. Blank entries and repeated names are ignored.
+- At most 16 topics per request and 256 bytes per topic. `*`, `$`, `@`, `?` and `#` are rejected, so a client cannot make websrv subscribe to wildcards or the admin space. Keys must be valid Zenoh key expressions.
+- An empty or invalid `topics` returns `400` with `{"error": "..."}`.
+
+Response `200 application/json`:
+
+```json
+{ "refresh_ms": 10000, "last_cycle_ms": 3120, "topics": { "radar/targets": { "available": true, "last_seen_ms": 3150 }, "lidar/points": { "available": false, "last_seen_ms": null } } }
+```
+
+- `last_seen_ms` is the milliseconds since the topic's last sample, seen by sampling or through a bridge, or `null` if none has been seen since start-up.
+- `available` is `last_seen_ms != null && last_seen_ms <= 15000` (`AVAILABILITY_WINDOW` = `REFRESH` + `SAMPLE_WINDOW` + 3 s), so a topic stays available until it misses a full cycle.
+- `last_cycle_ms` is the milliseconds since the last completed cycle started, or `null` before the first completes. `refresh_ms` is the cycle period.
+- A newly requested topic reports `available: false, last_seen_ms: null` until it has been sampled.
+
 ## MCAP Management
 
 ### File Operations
@@ -1332,6 +1363,7 @@ Intended for development, testing, or single-user installations.
 | Replay status | `systemctl is-active replay` | Check PID file |
 | Get config | Read `/etc/default/{service}` | Return `WebUISettings` JSON |
 | Set config | Write `/etc/default/{service}` | Write `/etc/default/{service}` |
+| Topic availability | `GET /api/topics/status` | `GET /api/topics/status` |
 
 ### Systemd Socket Activation
 

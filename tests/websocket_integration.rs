@@ -14,6 +14,7 @@ use axum::Router;
 use edgefirst_websrv::websocket::{websocket_handler, MessageStream, WebSocketContext};
 use futures::StreamExt;
 use tokio::net::TcpListener;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 
@@ -139,17 +140,18 @@ async fn test_websocket_closes_when_subscriber_ends() {
     // Ends the connection's Zenoh listener while the socket stays open.
     ctx.shutdown.cancel();
 
-    let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let ending = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
             match ws.next().await {
-                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
-                Some(Ok(_)) => {}
+                Some(Ok(Message::Ping(_) | Message::Pong(_))) => {}
+                other => return other,
             }
         }
     })
-    .await;
-    assert!(
-        closed.is_ok(),
-        "WebSocket stayed open after its Zenoh subscriber ended"
-    );
+    .await
+    .expect("WebSocket stayed open after its Zenoh subscriber ended");
+    match ending {
+        Some(Ok(Message::Close(Some(frame)))) => assert_eq!(frame.code, CloseCode::Away),
+        other => panic!("expected a Close frame with code 1001, got {other:?}"),
+    }
 }

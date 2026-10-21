@@ -21,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::topics::BridgeObserver;
 use yawc::{
+    close::CloseCode,
     frame::{Frame, OpCode},
     IncomingUpgrade, Options,
 };
@@ -200,7 +201,7 @@ pub trait WebSocketContext: Send + Sync + 'static {
 pub struct WsParams {
     /// Enable permessage-deflate compression (default: true).
     /// Set to `false` for pre-compressed streams (e.g. H.264) to skip deflate.
-    /// Note: topics containing "h264" or "jpeg" auto-disable compression
+    /// Note: topics matched by `is_incompressible_topic` never use compression
     /// regardless of this parameter.
     #[serde(default = "default_true")]
     pub compress: bool,
@@ -210,10 +211,13 @@ fn default_true() -> bool {
     true
 }
 
-/// Returns true if the topic carries pre-compressed data (H.264 video or JPEG
-/// images) where permessage-deflate would waste CPU without shrinking the payload.
-fn is_precompressed_topic(topic: &str) -> bool {
-    topic.contains("h264") || topic.contains("jpeg")
+/// Returns true if permessage-deflate would cost more CPU than it saves on
+/// the topic: H.264 video and JPEG images are already compressed, and LiDAR
+/// point clouds (float coordinates, hundreds of KB per frame at 10 Hz) shrink
+/// by about 15% while deflating them on the device cannot keep up with the
+/// frame rate.
+fn is_incompressible_topic(topic: &str) -> bool {
+    topic.contains("h264") || topic.contains("jpeg") || topic.contains("lidar")
 }
 
 /// Maps `/api/rt/{*topic}` path remainder to a Zenoh application key.
@@ -247,7 +251,7 @@ pub async fn websocket_handler<T: WebSocketContext>(
     // `camera/h264` is the application key; the session namespace adds
     // `{hostname}/` on the wire.
     let topic = zenoh_key_from_ws_path(&topic);
-    let use_compression = params.compress && !is_precompressed_topic(&topic);
+    let use_compression = params.compress && !is_incompressible_topic(&topic);
     let options = if use_compression {
         Options::default().with_compression_level(yawc::CompressionLevel::fast())
     } else {
@@ -275,14 +279,17 @@ pub async fn websocket_handler<T: WebSocketContext>(
     let global_shutdown = ctx.shutdown_token();
     let observer = ctx.bridge_observer(&topic);
 
+    // The listener holds the only sender, so the receiver sees `Closed` when
+    // the listener ends and the connection is closed for the client to
+    // reconnect with a new subscriber.
     let video_stream = Arc::new(MessageStream::new());
+    let mut rx = video_stream.subscribe();
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-    let video_stream_clone = video_stream.clone();
     tokio::spawn(async move {
         zenoh_listener(
-            video_stream_clone,
+            video_stream,
             zenoh_session,
             shutdown_rx,
             global_shutdown,
@@ -301,7 +308,6 @@ pub async fn websocket_handler<T: WebSocketContext>(
             }
         };
         let (mut sink, mut stream) = ws.split();
-        let mut rx = video_stream.subscribe();
         let mut ping_interval = tokio::time::interval(PING_INTERVAL);
         ping_interval.tick().await; // consume immediate first tick
 
@@ -326,8 +332,10 @@ pub async fn websocket_handler<T: WebSocketContext>(
                         Err(broadcast::error::RecvError::Lagged(n)) => {
                             warn!("WebSocket subscriber lagged by {n} messages, skipping to latest");
                         }
-                        Err(_) => {
-                            debug!("Broadcast channel closed");
+                        Err(broadcast::error::RecvError::Closed) => {
+                            warn!("Zenoh subscriber ended, closing WebSocket");
+                            let close = Frame::close(CloseCode::Away, b"subscriber ended");
+                            let _ = tokio::time::timeout(SEND_TIMEOUT, sink.send(close)).await;
                             break;
                         }
                     }
@@ -458,6 +466,17 @@ mod tests {
         assert_eq!(zenoh_key_from_ws_path("camera/h264"), "camera/h264");
         assert_eq!(zenoh_key_from_ws_path("/tf_static"), "tf_static");
         assert!(!zenoh_key_from_ws_path("/camera/h264").starts_with("rt/"));
+    }
+
+    #[test]
+    fn incompressible_topics_skip_deflate() {
+        assert!(is_incompressible_topic("camera/h264"));
+        assert!(is_incompressible_topic("camera/jpeg"));
+        assert!(is_incompressible_topic("lidar/points"));
+        assert!(is_incompressible_topic("lidar/clusters"));
+        assert!(is_incompressible_topic("fusion/lidar"));
+        assert!(!is_incompressible_topic("radar/targets"));
+        assert!(!is_incompressible_topic("model/info"));
     }
 
     #[test]

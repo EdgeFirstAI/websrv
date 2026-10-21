@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.4.1] - 2026-10-21
+
+### Fixed
+
+- LiDAR point cloud topics (`lidar/points`, `lidar/clusters`, `fusion/lidar`, any topic whose name contains `lidar`) are served without permessage-deflate, like H.264 and JPEG. Deflate shrank an Ouster cloud by only about 15% but took close to the whole 100 ms frame period on the device, so browsers received fewer than 10 clouds per second and fell further behind until the camera page dropped its LiDAR overlay.
+- A `/api/rt` WebSocket closes (code 1001) when its Zenoh subscriber ends, so the client reconnects with a new subscriber instead of staying connected to a socket that no longer receives data.
+
 ## [4.4.0] - 2026-10-05
 
 ### Added
@@ -272,6 +279,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added security policy and vulnerability reporting process
 - Sanitized authentication error messages to prevent information leakage
 
-[Unreleased]: https://github.com/EdgeFirstAI/websrv/compare/v4.4.0...HEAD
+[Unreleased]: https://github.com/EdgeFirstAI/websrv/compare/v4.4.1...HEAD
+[4.4.1]: https://github.com/EdgeFirstAI/websrv/compare/v4.4.0...v4.4.1
 [4.4.0]: https://github.com/EdgeFirstAI/websrv/compare/v4.3.0...v4.4.0
 [4.3.0]: https://github.com/EdgeFirstAI/websrv/compare/v4.2.0...v4.3.0

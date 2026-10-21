@@ -101,3 +101,55 @@ async fn test_websocket_receives_zenoh_message() {
     let _ = ws.close(None).await;
     ctx.shutdown.cancel();
 }
+
+/// When the Zenoh subscriber behind a connection ends, the server closes the
+/// WebSocket so the client reconnects instead of waiting on a silent socket.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_websocket_closes_when_subscriber_ends() {
+    let zenoh_session = zenoh::open(zenoh::Config::default())
+        .await
+        .expect("Failed to open Zenoh session");
+
+    let ctx = Arc::new(TestContext {
+        err_stream: Arc::new(MessageStream::new()),
+        zenoh_session: zenoh_session.clone(),
+        shutdown: CancellationToken::new(),
+    });
+
+    let app = Router::new()
+        .route("/api/rt/{*topic}", get(websocket_handler::<TestContext>))
+        .with_state(ctx.clone());
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind");
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let url = format!("ws://{addr}/api/rt/test/ending");
+    let (mut ws, _response) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("Failed to connect WebSocket");
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Ends the connection's Zenoh listener while the socket stays open.
+    ctx.shutdown.cancel();
+
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match ws.next().await {
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                Some(Ok(_)) => {}
+            }
+        }
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "WebSocket stayed open after its Zenoh subscriber ended"
+    );
+}

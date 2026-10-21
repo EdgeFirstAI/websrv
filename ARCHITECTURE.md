@@ -1284,6 +1284,7 @@ sequenceDiagram
 - tokio::sync::broadcast channels for fan-out to subscribers
 - Per-client send timeouts and ping/pong keepalive
 - Backpressure handling via `RecvError::Lagged` on receiver side
+- A connection's Zenoh listener holds the only sender of its broadcast channel, so when the listener ends (declare failure, receive error, shutdown) the receiver sees `Closed` and the server sends a Close frame (1001) for the client to reconnect with a new subscriber
 
 **Concurrency**:
 - 8-worker Tokio runtime (`worker_threads = 8`)
@@ -1505,11 +1506,14 @@ edgefirst-websrv --http-port 8080 --https-port 8443
 ### WebSocket Compression
 
 Permessage-deflate compression is enabled by default on all WebSocket connections.
-Pre-compressed topics (H.264 video, JPEG images) are automatically detected by
-the server and served without compression — deflating already-compressed data
-wastes CPU without reducing payload size.
+Topics where deflate costs more than it saves are detected by the server and
+served without compression: H.264 video and JPEG images are already compressed,
+and LiDAR point clouds (float coordinates, about 620 KB per Ouster frame at
+10 Hz) shrink by only about 15% while deflating them on the i.MX 8M Plus takes
+close to the whole frame period, so a client falls further behind every second.
 
-Auto-detection is based on the topic name containing `h264` or `jpeg`. Clients
+Auto-detection is based on the topic name containing `h264`, `jpeg` or `lidar`
+(which covers `lidar/points`, `lidar/clusters` and `fusion/lidar`). Clients
 can also explicitly disable compression with the `?compress=false` query parameter.
 
 ### Deployment Checklist
